@@ -1,0 +1,42 @@
+# Project-local OMP policy for this repository.
+modelRoleStorage: project
+defaultThinkingLevel: high
+
+modelRoles:
+  default: openai-codex/gpt-5.6-sol:high
+  worker: openai-codex/gpt-5.6-luna:high
+
+retry:
+  enabled: true
+  modelFallback: true
+  fallbackRevertPolicy: cooldown-expiry
+  fallbackChains:
+    default:
+      - anthropic/claude-opus-5-5:high
+    worker:
+      - google-antigravity/gemini-3.8-flash:high
+
+task:
+  enableEffort: true
+  maxEffort: high
+  maxConcurrency: 8
+  maxRecursionDepth: 2
+  eager: always
+  batch: true
+  speculativeLaunch: true
+  isolation:
+    enabled: true
+    apply: false
+    merge: branch
+
+# OMP's isolation backend is independent of the bot's Docker setup.
+isolation:
+  backend: auto
+
+worktree:
+  clone: true
+
+todo:
+  enabled: true
+  eager: always
+  reminders: true

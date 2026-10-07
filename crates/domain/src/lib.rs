@@ -1,0 +1,1 @@
+//! Business concepts and invariants.

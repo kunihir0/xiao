@@ -1,0 +1,24 @@
+name: Bug
+description: Reproducible behavior defect
+title: "bug: "
+labels: []
+body:
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal deterministic steps/logs/test case without secrets.
+    validations:
+      required: true

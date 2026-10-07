@@ -1,0 +1,1 @@
+//! Poise/Serenity Discord adapter.

@@ -1,0 +1,29 @@
+name: Feature slice
+description: Independently mergeable product or platform work
+title: ""
+labels: []
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: What observable capability should exist?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Use concrete, testable criteria.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies / blockers
+      description: Link issues/ADRs or write none.
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Unit/integration/migration/operational checks expected.

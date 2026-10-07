@@ -1,0 +1,23 @@
+{
+  extends: ["config:recommended"],
+  dependencyDashboard: true,
+  rangeStrategy: "bump",
+  minimumReleaseAge: "3 days",
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["before 5am on monday"],
+  },
+  packageRules: [
+    {
+      description: "Keep GitHub Actions pinned to immutable commit SHAs",
+      matchManagers: ["github-actions"],
+      pinDigests: true,
+    },
+    {
+      description: "Group Rust patch/minor updates",
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["minor", "patch", "digest"],
+      groupName: "rust dependencies",
+    },
+  ],
+}

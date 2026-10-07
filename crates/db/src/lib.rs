@@ -1,0 +1,1 @@
+//! PostgreSQL/Diesel persistence adapter.
