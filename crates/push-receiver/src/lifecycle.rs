@@ -237,7 +237,6 @@ pub fn start_connected(
                     }
                 }
             };
-            attempts = 0;
             let _ = task_readiness.send(Readiness::Ready);
             let mut heartbeat = tokio::time::interval(session.heartbeat_interval());
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

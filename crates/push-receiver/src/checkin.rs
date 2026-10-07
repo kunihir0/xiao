@@ -263,6 +263,7 @@ mod tests {
             .collect::<Vec<_>>();
         let result = parse_checkin_response(&bytes);
         assert!(result.is_ok());
+        let registration = include_str!("../fixtures/registration_response.txt").trim();
         assert_eq!(
             parse_registration_response(registration)
                 .ok()

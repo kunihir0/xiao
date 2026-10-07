@@ -1,4 +1,3 @@
-
 use prost::Message;
 
 use crate::{Error, Notification, Result, checkin::CheckinCredentials, proto};

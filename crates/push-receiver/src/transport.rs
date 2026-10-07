@@ -1,8 +1,12 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::BytesMut;
+use p256::{
+    SecretKey,
+    elliptic_curve::{Generate, sec1::ToSec1Point},
+};
 use prost::Message;
-use p256::{SecretKey, elliptic_curve::sec1::ToSec1Point};
 use rand::{RngExt, rng};
 use reqwest::{Client, Response};
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
@@ -15,11 +19,18 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use uuid::Uuid;
 
 use crate::{
-    Error, Notification, Result, WebPushKeyMaterial, proto,
+    Error, Notification, Result,
     checkin::{
         CheckinCredentials, build_checkin_request, parse_checkin_response,
         parse_registration_response,
     },
+    codec::{FrameTag, McsCodec, McsFrame},
+    crypto::WebPushKeyMaterial,
+    mcs::{
+        LoginParameters, decode_data_message_with_metadata, decode_login_response,
+        encode_heartbeat_ack, encode_heartbeat_ping, encode_login, encode_stream_ack,
+    },
+    proto,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -28,11 +39,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_ACK_THRESHOLD: usize = 10;
 const SERVER_KEY: &[u8] = &[
-    0x04, 0x33, 0x94, 0xf7, 0xdf, 0xa1, 0xeb, 0xb1, 0xdc, 0x03, 0xa2, 0x5e, 0x15, 0x71,
-    0xdb, 0x48, 0xd3, 0x2e, 0xed, 0xed, 0xb2, 0x34, 0xdb, 0xb7, 0x47, 0x3a, 0x0c, 0x8f,
-    0xc4, 0xcc, 0xe1, 0x6f, 0x3c, 0x8c, 0x84, 0xdf, 0xab, 0xb6, 0x66, 0x3e, 0xf2, 0x0c,
-    0xd4, 0x8b, 0xfe, 0xe3, 0xf9, 0x76, 0x2f, 0x14, 0x1c, 0x63, 0x08, 0x6a, 0x6f, 0x2d,
-    0xb1, 0x1a, 0x95, 0xb0, 0xce, 0x37, 0xc0, 0x9c, 0x6e,
+    0x04, 0x33, 0x94, 0xf7, 0xdf, 0xa1, 0xeb, 0xb1, 0xdc, 0x03, 0xa2, 0x5e, 0x15, 0x71, 0xdb, 0x48,
+    0xd3, 0x2e, 0xed, 0xed, 0xb2, 0x34, 0xdb, 0xb7, 0x47, 0x3a, 0x0c, 0x8f, 0xc4, 0xcc, 0xe1, 0x6f,
+    0x3c, 0x8c, 0x84, 0xdf, 0xab, 0xb6, 0x66, 0x3e, 0xf2, 0x0c, 0xd4, 0x8b, 0xfe, 0xe3, 0xf9, 0x76,
+    0x2f, 0x14, 0x1c, 0x63, 0x08, 0x6a, 0x6f, 0x2d, 0xb1, 0x1a, 0x95, 0xb0, 0xce, 0x37, 0xc0, 0x9c,
+    0x6e,
 ];
 
 async fn bounded_body(mut response: Response, maximum: usize) -> Result<Vec<u8>> {
@@ -41,7 +52,10 @@ async fn bounded_body(mut response: Response, maximum: usize) -> Result<Vec<u8>>
         .is_some_and(|length| length > maximum as u64)
     {
         return Err(Error::FrameTooLarge {
-            actual: response.content_length().unwrap_or(u64::MAX).min(usize::MAX as u64) as usize,
+            actual: response
+                .content_length()
+                .unwrap_or(u64::MAX)
+                .min(usize::MAX as u64) as usize,
             max: maximum,
         });
     }
@@ -235,8 +249,9 @@ impl FcmConnector {
             .error_for_status()
             .map_err(|error| Error::Http(error.to_string()))?;
         let body = bounded_body(subscription, 16 * 1024).await?;
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .map_err(|error| Error::InvalidRegistration(format!("invalid FCM response: {error}")))?;
+        serde_json::from_slice::<serde_json::Value>(&body).map_err(|error| {
+            Error::InvalidRegistration(format!("invalid FCM response: {error}"))
+        })?;
         *self.web_push_keys.lock().await = Some(key_material.material);
         *cached = Some(result.credentials);
         Ok(result.credentials)
@@ -250,7 +265,7 @@ struct WebPushKeys {
 }
 
 fn generate_web_push_keys() -> WebPushKeys {
-    let secret = SecretKey::random(&mut rng());
+    let secret = SecretKey::generate();
     let private_key = secret.to_bytes();
     let public_key = URL_SAFE_NO_PAD.encode(secret.public_key().to_sec1_point(false).as_bytes());
     let mut auth_secret = [0u8; 16];
@@ -386,8 +401,8 @@ struct LoginResponseConfig {
 }
 
 fn proto_login_response(payload: &[u8]) -> Result<LoginResponseConfig> {
-    let response = proto::LoginResponse::decode(payload)
-        .map_err(|error| Error::Decode(error.to_string()))?;
+    let response =
+        proto::LoginResponse::decode(payload).map_err(|error| Error::Decode(error.to_string()))?;
     let config = decode_login_response(payload)?;
     Ok(LoginResponseConfig {
         heartbeat: Duration::from_millis(config.heartbeat_millis),
@@ -407,24 +422,30 @@ impl McsSession for TlsMcsSession {
                         if let Some(stream_id) = data.stream_id {
                             self.last_stream_id_received = stream_id;
                         } else if self.last_stream_id_received > 0 {
-                            self.last_stream_id_received = self.last_stream_id_received.saturating_add(1);
+                            self.last_stream_id_received =
+                                self.last_stream_id_received.saturating_add(1);
                         }
                         if data.notification.persistent_id.is_some() {
-                            self.unacknowledged_messages = self.unacknowledged_messages.saturating_add(1);
+                            self.unacknowledged_messages =
+                                self.unacknowledged_messages.saturating_add(1);
                         }
                         if data.immediate_ack
                             || self.unacknowledged_messages >= STREAM_ACK_THRESHOLD
                         {
                             let payload = encode_stream_ack(self.last_stream_id_received)?;
-                            self.send_frame(McsFrame::new(FrameTag::Iq, payload)).await?;
+                            self.send_frame(McsFrame::new(FrameTag::Iq, payload))
+                                .await?;
                             self.unacknowledged_messages = 0;
                         }
                         return Ok(SessionEvent::Notification(data.notification));
                     }
                     FrameEvent::HeartbeatPing => {
-                        let payload = encode_heartbeat_ack((self.last_stream_id_received > 0)
-                            .then_some(self.last_stream_id_received))?;
-                        self.send_frame(McsFrame::new(FrameTag::HeartbeatAck, payload)).await?;
+                        let payload = encode_heartbeat_ack(
+                            (self.last_stream_id_received > 0)
+                                .then_some(self.last_stream_id_received),
+                        )?;
+                        self.send_frame(McsFrame::new(FrameTag::HeartbeatAck, payload))
+                            .await?;
                     }
                     FrameEvent::Close => return Ok(SessionEvent::Closed),
                     FrameEvent::Login => {}
@@ -434,8 +455,9 @@ impl McsSession for TlsMcsSession {
     }
     fn send_heartbeat<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let payload = encode_heartbeat_ping((self.last_stream_id_received > 0)
-                .then_some(self.last_stream_id_received))?;
+            let payload = encode_heartbeat_ping(
+                (self.last_stream_id_received > 0).then_some(self.last_stream_id_received),
+            )?;
             self.send_frame(McsFrame::new(FrameTag::HeartbeatPing, payload))
                 .await
         })

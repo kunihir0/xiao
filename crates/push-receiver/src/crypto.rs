@@ -75,17 +75,12 @@ pub fn decrypt_web_push(
     let shared = diffie_hellman(private.to_nonzero_scalar(), public.as_affine());
     let ua_public = private.public_key().to_sec1_point(false);
     let as_public = public.to_sec1_point(false);
-    let mut key_info =
-        Vec::with_capacity(14 + ua_public.as_bytes().len() + as_public.as_bytes().len());
-    key_info.extend_from_slice(b"WebPush: info\0");
-    key_info.extend_from_slice(ua_public.as_bytes());
-    key_info.extend_from_slice(as_public.as_bytes());
     let mut ikm = [0u8; 32];
     Hkdf::<Sha256>::new(
         Some(&material.auth_secret),
         shared.raw_secret_bytes().as_slice(),
     )
-    .expand(&key_info, &mut ikm)
+    .expand(b"Content-Encoding: auth\0", &mut ikm)
     .map_err(|_| Error::DecryptionFailed)?;
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), &ikm);
     let mut context =
@@ -194,16 +189,31 @@ mod tests {
         let peer = "BNoRDbb84JGm8g5Z5CFxurSqsXWJ11ItfXEWYVLE85Y7CYkDjXsIEc4aqxYaQ1G8BqkXCJ6DPpDrWtdWj_mugHU";
         let salt = "lngarbyKfMoi9Z75xYXmkg";
         assert_eq!(
-            decrypt_web_push(&material, &format!("dh={peer}"), &format!("salt={salt}"), &ciphertext)
-                .ok(),
+            decrypt_web_push(
+                &material,
+                &format!("dh={peer}"),
+                &format!("salt={salt}"),
+                &ciphertext
+            )
+            .ok(),
             Some(b"I am the walrus".to_vec())
         );
         assert!(matches!(
-            decrypt_web_push(&material, &format!("dh={peer}"), &format!("salt={salt}"), &malformed),
+            decrypt_web_push(
+                &material,
+                &format!("dh={peer}"),
+                &format!("salt={salt}"),
+                &malformed
+            ),
             Err(Error::InvalidPadding)
         ));
         assert!(matches!(
-            decrypt_web_push(&material, &format!("dh={peer}"), &format!("salt={salt}"), &all_padding),
+            decrypt_web_push(
+                &material,
+                &format!("dh={peer}"),
+                &format!("salt={salt}"),
+                &all_padding
+            ),
             Err(Error::InvalidPadding)
         ));
     }

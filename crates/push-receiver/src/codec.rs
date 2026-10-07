@@ -320,18 +320,29 @@ mod tests {
         let data_fixture = parse(include_str!("../fixtures/data_message_frame.hex"));
         let mut data_bytes = BytesMut::from(data_fixture.as_slice());
         assert_eq!(
-            data.decode_frame(&mut data_bytes).ok().flatten().map(|frame| frame.tag),
+            data.decode_frame(&mut data_bytes)
+                .ok()
+                .flatten()
+                .map(|frame| frame.tag),
             Some(FrameTag::DataMessage)
         );
         let mut heartbeat = McsCodec::server();
         let heartbeat_fixture = parse(include_str!("../fixtures/heartbeat_frames.hex"));
         let mut heartbeat_bytes = BytesMut::from(heartbeat_fixture.as_slice());
         assert_eq!(
-            heartbeat.decode_frame(&mut heartbeat_bytes).ok().flatten().map(|frame| frame.tag),
+            heartbeat
+                .decode_frame(&mut heartbeat_bytes)
+                .ok()
+                .flatten()
+                .map(|frame| frame.tag),
             Some(FrameTag::HeartbeatPing)
         );
         assert_eq!(
-            heartbeat.decode_frame(&mut heartbeat_bytes).ok().flatten().map(|frame| frame.tag),
+            heartbeat
+                .decode_frame(&mut heartbeat_bytes)
+                .ok()
+                .flatten()
+                .map(|frame| frame.tag),
             Some(FrameTag::HeartbeatAck)
         );
     }
@@ -344,9 +355,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let mut varint = McsCodec::new();
-        let mut varint_bytes = BytesMut::from(
-            parse(include_str!("../fixtures/malformed_varint.hex")).as_slice(),
-        );
+        let mut varint_bytes =
+            BytesMut::from(parse(include_str!("../fixtures/malformed_varint.hex")).as_slice());
         assert!(matches!(
             varint.decode_frame(&mut varint_bytes),
             Err(Error::InvalidVarint)

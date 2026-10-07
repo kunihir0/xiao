@@ -13,8 +13,7 @@ pub struct RetryPolicy {
     max_attempts: u32,
 }
 impl RetryPolicy {
-    #[must_use]
-    pub const fn new(initial: Duration, maximum: Duration, jitter_percent: u8) -> Self {
+    pub fn new(initial: Duration, maximum: Duration, jitter_percent: u8) -> Self {
         let maximum = if maximum > MAX_RETRY_DELAY {
             MAX_RETRY_DELAY
         } else {
@@ -32,8 +31,7 @@ impl RetryPolicy {
             max_attempts: 5,
         }
     }
-    #[must_use]
-    pub const fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
         self.max_attempts = max_attempts.min(MAX_RETRY_ATTEMPTS);
         self
     }
