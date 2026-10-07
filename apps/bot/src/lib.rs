@@ -15,16 +15,32 @@ pub trait ShutdownSignal: Send + 'static {
     fn wait(self) -> Pin<Box<dyn Future<Output = Result<(), SignalError>> + Send>>;
 }
 
-/// A production signal listener backed by Tokio's Ctrl-C handler.
+/// A production signal listener backed by Tokio's interrupt and termination handlers.
 #[derive(Debug, Default)]
 pub struct CtrlCSignal;
 
 impl ShutdownSignal for CtrlCSignal {
     fn wait(self) -> Pin<Box<dyn Future<Output = Result<(), SignalError>> + Send>> {
         Box::pin(async {
-            tokio::signal::ctrl_c()
-                .await
-                .map_err(|error| SignalError::Failed(Box::new(error)))
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+
+                let mut interrupt = signal(SignalKind::interrupt())
+                    .map_err(|error| SignalError::Failed(Box::new(error)))?;
+                let mut terminate = signal(SignalKind::terminate())
+                    .map_err(|error| SignalError::Failed(Box::new(error)))?;
+                tokio::select! {
+                    event = interrupt.recv() => event.map(|_| ()).ok_or(SignalError::Closed),
+                    event = terminate.recv() => event.map(|_| ()).ok_or(SignalError::Closed),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .map_err(|error| SignalError::Failed(Box::new(error)))
+            }
         })
     }
 }
