@@ -235,10 +235,8 @@ where
         let had_tasks = !tasks.is_empty();
 
         loop {
-            if tasks.is_empty() {
-                if had_tasks || signal_done || failure.is_some() {
-                    break;
-                }
+            if tasks.is_empty() && (had_tasks || signal_done || failure.is_some()) {
+                break;
             }
 
             tokio::select! {
@@ -294,13 +292,13 @@ where
             joined_tasks += 1;
             match joined {
                 Ok((_id, task)) => {
-                    if failure.is_none() {
-                        if let Err(source) = task.result {
-                            failure = Some(CompositionError::Component {
-                                name: task.name,
-                                source,
-                            });
-                        }
+                    if failure.is_none()
+                        && let Err(source) = task.result
+                    {
+                        failure = Some(CompositionError::Component {
+                            name: task.name,
+                            source,
+                        });
                     }
                 }
                 Err(error) => {
