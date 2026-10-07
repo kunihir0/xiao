@@ -25,7 +25,7 @@ jobs:
   build:
     name: multiarch oci build check
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up QEMU
@@ -40,6 +40,8 @@ jobs:
             --file deploy/production/Dockerfile \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
             --label 'org.opencontainers.image.source=https://github.com/kunihir0/xiao' \
+            --cache-from type=gha,scope=xiao-oci \
+            --cache-to type=gha,mode=max,scope=xiao-oci \
             --output type=oci,dest=xiao-oci.tar \
             .
       - name: Inspect image metadata and record digests
