@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 tokio = { version = "1.53.2", features = ["sync"] }
-deadpool = "0.13.1"
+deadpool = { version = "0.13.1", features = ["rt_tokio_1"] }
 diesel = { version = "2.3.13", features = ["postgres"] }
 diesel-async = { version = "0.9.2", features = ["postgres", "migrations", "deadpool"] }
 diesel_migrations = "2.3.2"

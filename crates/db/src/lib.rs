@@ -17,7 +17,6 @@ use tokio::sync::Mutex;
 const MIGRATIONS: diesel_migrations::EmbeddedMigrations = embed_migrations!("../../migrations");
 
 const DEFAULT_MAX_CONNECTIONS: usize = 8;
-type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type PoolManager = AsyncDieselConnectionManager<AsyncPgConnection>;
 type DatabasePool = Pool<AsyncPgConnection>;
 
@@ -71,32 +70,31 @@ pub enum DbError {
     /// The caller supplied an invalid adapter configuration.
     #[error("invalid database configuration: {reason}")]
     InvalidConfiguration { reason: &'static str },
-    /// The pool could not be constructed.
     #[error("database pool construction failed")]
-    PoolConstruction(#[source] BoxError),
+    PoolConstruction,
     /// A connection could not be acquired from the pool.
     #[error("database connection acquisition failed")]
-    ConnectionAcquisition(#[source] BoxError),
+    ConnectionAcquisition,
     /// A connection could not establish a PostgreSQL session.
     #[error("database connection failed")]
-    Connection(#[source] BoxError),
+    Connection,
     /// Embedded migrations could not be applied.
     #[error("database migrations failed")]
-    Migration(#[source] BoxError),
+    Migration,
     /// The readiness ping failed.
     #[error("database readiness ping failed")]
-    Ping(#[source] BoxError),
+    Ping,
 }
 
 impl Debug for DbError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         let kind = match self {
             Self::InvalidConfiguration { .. } => "InvalidConfiguration",
-            Self::PoolConstruction(_) => "PoolConstruction",
-            Self::ConnectionAcquisition(_) => "ConnectionAcquisition",
-            Self::Connection(_) => "Connection",
-            Self::Migration(_) => "Migration",
-            Self::Ping(_) => "Ping",
+            Self::PoolConstruction => "PoolConstruction",
+            Self::ConnectionAcquisition => "ConnectionAcquisition",
+            Self::Connection => "Connection",
+            Self::Migration => "Migration",
+            Self::Ping => "Ping",
         };
         formatter.debug_tuple("DbError").field(&kind).finish()
     }
@@ -152,8 +150,9 @@ impl Db {
         };
         let pool = Pool::builder(manager)
             .config(pool_config)
+            .runtime(deadpool::Runtime::Tokio1)
             .build()
-            .map_err(|error| DbError::PoolConstruction(Box::new(error)))?;
+            .map_err(|_| DbError::PoolConstruction)?;
 
         let database = Self {
             pool,
@@ -168,6 +167,10 @@ impl Db {
     /// Applies all embedded pending migrations and records migration readiness.
     pub async fn run_migrations(&self) -> Result<MigrationReport, DbError> {
         let _lifecycle = self.lifecycle.lock().await;
+        self.run_migrations_locked().await
+    }
+
+    async fn run_migrations_locked(&self) -> Result<MigrationReport, DbError> {
         self.ready.store(false, Ordering::Release);
         self.migrations_complete.store(false, Ordering::Release);
 
@@ -175,11 +178,11 @@ impl Db {
             .pool
             .get()
             .await
-            .map_err(|error| DbError::ConnectionAcquisition(Box::new(error)))?;
+            .map_err(|_| DbError::ConnectionAcquisition)?;
         let mut harness = AsyncMigrationHarness::new(connection);
         let applied = harness
             .run_pending_migrations(MIGRATIONS)
-            .map_err(DbError::Migration)?
+            .map_err(|_| DbError::Migration)?
             .len();
 
         self.migrations_complete.store(true, Ordering::Release);
@@ -190,16 +193,20 @@ impl Db {
     /// completed successfully.
     pub async fn ping(&self) -> Result<(), DbError> {
         let _lifecycle = self.lifecycle.lock().await;
-        let mut connection = self.pool.get().await.map_err(|error| {
+        self.ping_locked().await
+    }
+
+    async fn ping_locked(&self) -> Result<(), DbError> {
+        let mut connection = self.pool.get().await.map_err(|_| {
             self.ready.store(false, Ordering::Release);
-            DbError::ConnectionAcquisition(Box::new(error))
+            DbError::ConnectionAcquisition
         })?;
         sql_query("SELECT 1")
             .execute(&mut connection)
             .await
-            .map_err(|error| {
+            .map_err(|_| {
                 self.ready.store(false, Ordering::Release);
-                DbError::Ping(Box::new(error))
+                DbError::Ping
             })?;
 
         if AtomicBool::load(&self.migrations_complete, Ordering::Acquire) {
@@ -210,8 +217,9 @@ impl Db {
 
     /// Runs migrations and the readiness ping as one startup operation.
     pub async fn initialize(&self) -> Result<MigrationReport, DbError> {
-        let report = self.run_migrations().await?;
-        self.ping().await?;
+        let _lifecycle = self.lifecycle.lock().await;
+        let report = self.run_migrations_locked().await?;
+        self.ping_locked().await?;
         Ok(report)
     }
 
@@ -225,13 +233,14 @@ impl Db {
             .get()
             .await
             .map(|_| ())
-            .map_err(|error| DbError::Connection(Box::new(error)))
+            .map_err(|_| DbError::Connection)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and a real PostgreSQL service"]
@@ -247,7 +256,7 @@ mod tests {
             .map_err(|error| Box::new(error) as BoxError)?;
 
         let result = database.ping().await;
-        if !matches!(result, Err(DbError::ConnectionAcquisition(_))) {
+        if !matches!(result, Err(DbError::ConnectionAcquisition)) {
             return Err("pool exhaustion did not return ConnectionAcquisition".into());
         }
         Ok(())
