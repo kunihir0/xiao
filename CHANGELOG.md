@@ -8,6 +8,12 @@ All notable externally meaningful changes are documented here. Releases follow S
 
 ## Unreleased
 
+- Added a digest-pinned multi-architecture production OCI artifact with a
+  non-root runtime, bounded Compose resources, runtime-only secret injection,
+  process-state health semantics, and SIGTERM propagation.
+- Added deploy/rollback, migration compatibility, backup/restore rehearsal,
+  database outage, Discord gateway/rate-limit, Rust+/push reconnect, credential
+  rotation, alert triage, incident evidence, and release smoke runbooks.
 - Established CI checks, Renovate update policy, and documented the GitHub
   Free-plan branch-policy limitation.
 - Added the owned Poise/Serenity Discord boundary with a slash-only `/ping`,

@@ -8,7 +8,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
-    pids_limit: 128
+    # The pids limit is defined in deploy.resources for Compose/Swarm parity.
+    # pids_limit must not also be set: Compose rejects conflicting forms.
     security_opt:
       - no-new-privileges:true
     environment:
@@ -23,6 +24,7 @@ services:
         limits:
           cpus: "1.0"
           memory: 512M
+          pids: 128
         reservations:
           cpus: "0.25"
           memory: 128M

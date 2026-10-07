@@ -1,5 +1,9 @@
 # Operations
 
+This directory contains the deployment contract and recovery procedures for the
+Discord bot. The service has no HTTP health endpoint. Use the container process
+health check together with internal readiness, structured logs, dependency
+metrics, and command-level probes.
 
 ## Repository policy
 
@@ -11,26 +15,32 @@ MUST continue to run for both pull requests and pushes to `main`.
 This repository is currently on a GitHub Free plan. GitHub Free does not
 provide the ruleset or branch-protection controls needed to enforce required
 checks, prohibit direct or force pushes, or require resolved review
-conversations. That is an external hosting limitation, not a repository
-policy decision: CI remains strict, and maintainers MUST NOT treat this
-documentation as evidence that GitHub is enforcing those rules.
+conversations. That is an external hosting limitation, not a repository policy
+decision: CI remains strict, and maintainers MUST NOT treat this documentation
+as evidence that GitHub is enforcing those checks.
 
-Renovate is configured in `renovate.json5` to update Cargo dependencies and
-immutable GitHub Actions pins. Renovate's pull requests still require the
-same CI and review treatment as any other change.
-
-## Releases
-
-Release automation is intentionally not enabled yet. The previous
-`release-plz.toml` was only configuration without a runnable workflow, and a
-safe end-to-end release flow requires permissions and review policy that are
-not available through the repository's current `GITHUB_TOKEN` setup. Releases
-therefore remain an explicit maintainer operation; when release automation is
-introduced, it MUST define its permissions, review boundary, tag behavior,
-and rollback path before being enabled.
+Renovate updates Cargo dependencies and immutable GitHub Actions pins. Renovate
+pull requests still require the same CI and review treatment as any other
+change.
 
 ## Runbooks
 
-Runbooks are added with the capability they operate. Before production launch, cover at minimum: deploy/rollback, failed migration, database restore test, Discord outage/reconnect, bot token rotation, rate-limit incident, and recovery from a bad release.
+- [Production deployment](../../deploy/production/README.md)
+- [Deployment, migration, and rollback](deploy-rollback.md)
+- [Backup and restore rehearsal](database-restore.md)
+- [Discord gateway and Rust+/push recovery](discord-and-push.md)
+- [Credential rotation](credential-rotation.md)
+- [Alert triage and incident evidence](alert-triage.md)
+- [Deployment smoke procedure](smoke.md)
 
-A backup policy is incomplete until restore is exercised. A release is incomplete if its database change prevents the documented application rollback path.
+A backup policy is incomplete until restore is exercised. A release is
+incomplete if its database change prevents the documented application rollback
+path. Every release record MUST include the immutable artifact digest, source
+commit, migration compatibility decision, six CI gates, and deployment smoke
+evidence.
+
+## Releases
+
+Release automation is intentionally not enabled yet. Releases remain an
+explicit maintainer operation until a reviewed workflow defines permissions,
+review boundary, tag behavior, artifact attestation, and rollback path.
