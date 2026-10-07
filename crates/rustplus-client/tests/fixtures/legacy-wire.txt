@@ -7,3 +7,8 @@ response_success = 0a 04 08 01 22 00
 malformed_truncated = 0a 04 08
 # Independent camera ray sample (2x2 frame, first ray token)
 camera_2x2_single_ray = ff 00 00 00
+# Independent camera broadcast event (AppMessage broadcast with one ray)
+event_camera = 12 14 52 12 0d 00 00 80 3f 10 00 1a 04 ff 00 00 00 25 00 00 80 3f
+# Malformed protobuf varint and length-delimited payloads
+malformed_varint = 0a 80
+malformed_length = 0a 7f 08

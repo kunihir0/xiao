@@ -27,17 +27,32 @@ mod tests {
     use super::*;
     use prost::Message;
 
+    fn fixture(name: &str) -> Vec<u8> {
+        include_str!("../tests/fixtures/legacy-wire.txt")
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(" = ")?;
+                (key == name).then(|| {
+                    value
+                        .split_whitespace()
+                        .map(|byte| u8::from_str_radix(byte, 16).expect("hex fixture"))
+                        .collect()
+                })
+            })
+            .expect("fixture entry")
+    }
+
     #[test]
     fn request_fixture_matches_legacy_wire_bytes() {
         let request = crate::client::to_proto_request(1, 42, 7, Request::Info);
         let mut encoded = Vec::new();
         request.encode(&mut encoded).expect("fixture encoding");
-        assert_eq!(encoded, [0x08, 0x01, 0x10, 0x2a, 0x18, 0x07, 0x42, 0x00]);
+        assert_eq!(encoded, fixture("request_info"));
     }
 
     #[test]
     fn response_fixture_decodes_known_success() {
-        let message = proto::AppMessage::decode([0x0a, 0x04, 0x08, 0x01, 0x22, 0x00].as_slice())
+        let message = proto::AppMessage::decode(fixture("response_success").as_slice())
             .expect("fixture decode");
         let response = message.response.expect("response");
         assert_eq!(response.seq, 1);
@@ -45,8 +60,26 @@ mod tests {
     }
 
     #[test]
-    fn malformed_wire_is_typed_error() {
-        assert!(proto::AppMessage::decode([0x0a, 0x04, 0x08].as_slice()).is_err());
+    fn malformed_fixtures_return_typed_errors() {
+        for name in ["malformed_truncated", "malformed_varint", "malformed_length"] {
+            assert!(proto::AppMessage::decode(fixture(name).as_slice()).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn camera_event_fixture_preserves_payload() {
+        let message = proto::AppMessage::decode(fixture("event_camera").as_slice())
+            .expect("event fixture decode");
+        let event = crate::client::convert_event(message.broadcast).expect("camera event");
+        assert_eq!(
+            event,
+            Event::CameraRays(CameraRays {
+                vertical_fov: 1.0,
+                sample_offset: 0,
+                ray_data: vec![255, 0, 0, 0],
+                distance: 1.0,
+            })
+        );
     }
 
     #[test]
