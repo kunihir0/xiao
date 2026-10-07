@@ -4,14 +4,14 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
 fn database_url() -> Option<String> {
-    std::env::var("DATABASE_URL").ok().filter(|url| !url.trim().is_empty())
+    std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
 }
 
 fn schema_url(base_url: &str, schema: &str) -> String {
     let separator = if base_url.contains('?') { '&' } else { '?' };
-    format!(
-        "{base_url}{separator}options=-c%20search_path%3D{schema}%2Cpublic"
-    )
+    format!("{base_url}{separator}options=-c%20search_path%3D{schema}%2Cpublic")
 }
 
 async fn create_schema(base_url: &str, schema: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -45,8 +45,8 @@ async fn invalid_connection_fails_without_leaking_url() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
-async fn applies_pending_migrations_idempotently_and_sets_readiness(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn applies_pending_migrations_idempotently_and_sets_readiness()
+-> Result<(), Box<dyn std::error::Error>> {
     let Some(base_url) = database_url() else {
         return Ok(());
     };

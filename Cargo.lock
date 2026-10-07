@@ -47,6 +47,7 @@ dependencies = [
 name = "bot"
 version = "0.1.0"
 dependencies = [
+ "bot-config",
  "bot-db",
  "bot-telemetry",
  "tokio",

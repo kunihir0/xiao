@@ -13,12 +13,12 @@ use diesel_async::{AsyncMigrationHarness, AsyncPgConnection, RunQueryDsl};
 use diesel_migrations::{MigrationHarness, embed_migrations};
 use thiserror::Error;
 
-embed_migrations!("../../migrations");
+const MIGRATIONS: diesel_migrations::EmbeddedMigrations = embed_migrations!("../../migrations");
 
 const DEFAULT_MAX_CONNECTIONS: usize = 8;
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type PoolManager = AsyncDieselConnectionManager<AsyncPgConnection>;
-type DatabasePool = Pool<PoolManager>;
+type DatabasePool = Pool<AsyncPgConnection>;
 
 /// Configuration required to connect to PostgreSQL.
 #[derive(Clone)]
@@ -125,8 +125,11 @@ impl Debug for Db {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Db")
-            .field("migrations_complete", &self.migrations_complete.load(Ordering::Acquire))
-            .field("ready", &self.ready.load(Ordering::Acquire))
+            .field(
+                "migrations_complete",
+                &AtomicBool::load(&self.migrations_complete, Ordering::Acquire),
+            )
+            .field("ready", &AtomicBool::load(&self.ready, Ordering::Acquire))
             .finish()
     }
 }
@@ -159,13 +162,15 @@ impl Db {
         self.ready.store(false, Ordering::Release);
         self.migrations_complete.store(false, Ordering::Release);
 
-        let connection = self.pool.get().await.map_err(|error| {
-            DbError::ConnectionAcquisition(Box::new(error))
-        })?;
+        let connection = self
+            .pool
+            .get()
+            .await
+            .map_err(|error| DbError::ConnectionAcquisition(Box::new(error)))?;
         let mut harness = AsyncMigrationHarness::new(connection);
         let applied = harness
-            .run_pending_migrations(embedded_migrations::MIGRATIONS)
-            .map_err(|error| DbError::Migration(Box::new(error)))?
+            .run_pending_migrations(MIGRATIONS)
+            .map_err(DbError::Migration)?
             .len();
 
         self.migrations_complete.store(true, Ordering::Release);
@@ -187,7 +192,7 @@ impl Db {
                 DbError::Ping(Box::new(error))
             })?;
 
-        if self.migrations_complete.load(Ordering::Acquire) {
+        if AtomicBool::load(&self.migrations_complete, Ordering::Acquire) {
             self.ready.store(true, Ordering::Release);
         }
         Ok(())
@@ -202,7 +207,7 @@ impl Db {
 
     /// Returns whether migrations and the readiness ping have both succeeded.
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        AtomicBool::load(&self.ready, Ordering::Acquire)
     }
 
     async fn acquire_connection(&self) -> Result<(), DbError> {
