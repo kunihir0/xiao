@@ -142,22 +142,34 @@ dependencies = [
 name = "bot"
 version = "0.1.0"
 dependencies = [
+ "bot-application",
  "bot-config",
  "bot-db",
  "bot-discord",
  "bot-telemetry",
+ "push-receiver",
+ "rustplus-adapter",
+ "rustplus-client",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
 name = "bot-application"
 version = "0.1.0"
+dependencies = [
+ "bot-domain",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "bot-config"
 version = "0.1.0"
 dependencies = [
+ "bot-domain",
  "url",
 ]
 
@@ -201,6 +213,11 @@ dependencies = [
 [[package]]
 name = "bot-test-support"
 version = "0.1.0"
+dependencies = [
+ "bot-application",
+ "bot-domain",
+ "tokio",
+]
 
 [[package]]
 name = "bumpalo"
@@ -2212,6 +2229,17 @@ dependencies = [
 [[package]]
 name = "rustplus-adapter"
 version = "0.1.0"
+dependencies = [
+ "bot-application",
+ "bot-domain",
+ "push-receiver",
+ "rustplus-client",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "rustplus-client"

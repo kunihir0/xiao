@@ -10,4 +10,5 @@ publish = false
 workspace = true
 
 [dependencies]
+bot-domain = { version = "0.1.0", path = "../domain" }
 url.workspace = true

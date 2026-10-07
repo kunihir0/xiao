@@ -12,6 +12,19 @@ pub struct Config {
     discord_token: String,
     database_url: String,
     telemetry: TelemetryConfig,
+    rustplus: Option<RustPlusConfig>,
+}
+
+/// Optional Rust+ push receiver configuration.
+#[derive(Clone)]
+pub struct RustPlusConfig {
+    fcm_sender_id: String,
+}
+
+impl RustPlusConfig {
+    pub fn fcm_sender_id(&self) -> &str {
+        &self.fcm_sender_id
+    }
 }
 
 impl Config {
@@ -51,11 +64,20 @@ impl Config {
                 value: "TELEMETRY_FORMAT",
             })?;
 
+        let rustplus = optional(&mut lookup, "RUSTPLUS_FCM_SENDER_ID")?
+            .map(|fcm_sender_id| RustPlusConfig { fcm_sender_id });
+
         Ok(Self {
             discord_token,
             database_url,
             telemetry: TelemetryConfig { filter, format },
+            rustplus,
         })
+    }
+
+    /// Returns the optional Rust+ push receiver settings.
+    pub fn rustplus(&self) -> Option<&RustPlusConfig> {
+        self.rustplus.as_ref()
     }
 
     /// Returns the Discord credential for the Discord adapter.
@@ -81,6 +103,16 @@ impl Debug for Config {
             .field("discord_token", &REDACTED)
             .field("database_url", &REDACTED)
             .field("telemetry", &self.telemetry)
+            .field("rustplus", &self.rustplus.as_ref().map(|_| REDACTED))
+            .finish()
+    }
+}
+
+impl Debug for RustPlusConfig {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RustPlusConfig")
+            .field("fcm_sender_id", &REDACTED)
             .finish()
     }
 }
