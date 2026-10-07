@@ -179,6 +179,9 @@ jobs:
             fi
             sleep 1
           done
+          # Log postgres-tls status and verify connectivity
+          docker logs postgres-tls
+          docker exec postgres-tls psql -U bot -d bot_tls -c 'SHOW ssl;'
       - name: Run database tests including TLS verify-full tests
         env:
           DATABASE_TLS_URL: postgres://bot:bot@localhost:5433/bot_tls
