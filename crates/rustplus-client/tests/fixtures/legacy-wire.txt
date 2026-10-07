@@ -5,3 +5,13 @@ request_info = 08 01 10 2a 18 07 42 00
 response_success = 0a 04 08 01 22 00
 # Truncated AppMessage (must return Decode error, never panic)
 malformed_truncated = 0a 04 08
+# Independent marker monitor response (seq=3, one player marker)
+monitor_markers = 0a 1e 08 03 6a 1a 0a 18 0a 16 08 2a 10 01 1d 00 00 20 41 25 00 00 a0 40 5a 04 4a 6f 65
+# Independent camera ray broadcast (one raw sample token)
+camera_event = 12 0f 52 0d 0d cd cc cc 3d 10 00 1a 01 ff 25 00 00 80 3f
+# Independent team-change event with player id
+team_event = 12 04 22 02 08 2a
+# Malformed varint and impossible length cases
+malformed_varint = 08 80
+malformed_length = 0a ff ff ff 7f
+malformed_dimension = 0a 08 08 01 12 06 08 ff ff ff ff

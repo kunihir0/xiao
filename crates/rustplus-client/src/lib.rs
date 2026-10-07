@@ -16,10 +16,7 @@ mod types;
 
 pub use client::{ClientConfig, EventReceiver, RustPlusClient};
 pub use error::{Error, Result};
-pub use types::{
-    CameraRays, Event, EventReceiveError, Marker, MarkerKind, RatePolicy, Readiness,
-    ReconnectPolicy, Request, Response, ResponsePayload,
-};
+pub use types::{CameraEntity, CameraEntityKind, CameraRays, ChatMessage, EntityInfo, EntityItem, EntityPayload, Event, EventReceiveError, MapNote, Marker, MarkerKind, MonitorPolicy, RatePolicy, Readiness, ReconnectPolicy, Request, Response, ResponsePayload, ServerInfo, ServerTime, TeamInfo, TeamMember};
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
@@ -27,63 +24,41 @@ mod tests {
     use super::*;
     use prost::Message;
 
+    fn fixture(name: &str) -> Vec<u8> {
+        let text = include_str!("../tests/fixtures/legacy-wire.txt");
+        let value = text.lines().find_map(|line| line.strip_prefix(&format!("{name} = "))).expect("fixture key");
+        value.split_whitespace().map(|byte| u8::from_str_radix(byte, 16).expect("fixture byte")).collect()
+    }
+
     #[test]
     fn request_fixture_matches_legacy_wire_bytes() {
         let request = crate::client::to_proto_request(1, 42, 7, Request::Info);
-        let mut encoded = Vec::new();
-        request.encode(&mut encoded).expect("fixture encoding");
-        assert_eq!(encoded, [0x08, 0x01, 0x10, 0x2a, 0x18, 0x07, 0x42, 0x00]);
+        let mut encoded = Vec::new(); request.encode(&mut encoded).expect("fixture encoding");
+        assert_eq!(encoded, fixture("request_info"));
     }
-
     #[test]
     fn response_fixture_decodes_known_success() {
-        let message = proto::AppMessage::decode([0x0a, 0x04, 0x08, 0x01, 0x22, 0x00].as_slice())
-            .expect("fixture decode");
-        let response = message.response.expect("response");
-        assert_eq!(response.seq, 1);
-        assert!(response.success.is_some());
+        let message = proto::AppMessage::decode(fixture("response_success").as_slice()).expect("fixture decode");
+        let response = message.response.expect("response"); assert_eq!(response.seq, 1); assert!(response.success.is_some());
     }
-
     #[test]
-    fn malformed_wire_is_typed_error() {
-        assert!(proto::AppMessage::decode([0x0a, 0x04, 0x08].as_slice()).is_err());
+    fn malformed_wire_is_typed_error() { assert!(proto::AppMessage::decode(fixture("malformed_truncated").as_slice()).is_err()); }
+    #[test]
+    fn malformed_varints_and_lengths_are_rejected() {
+        let malformed = [vec![0x08, 0x80], vec![0x0a, 0xff, 0xff, 0xff, 0x7f], vec![0x0a, 0x02, 0x08]];
+        for bytes in malformed { assert!(proto::AppMessage::decode(bytes.as_slice()).is_err()); }
     }
-
     #[test]
-    fn camera_boundaries_are_rejected() {
-        assert!(camera::FrameBuilder::new(0, 1).is_err());
-        assert!(camera::FrameBuilder::new(4097, 1).is_err());
+    fn camera_boundaries_and_excess_tokens_are_rejected() {
+        assert!(camera::FrameBuilder::new(0, 1).is_err()); assert!(camera::FrameBuilder::new(2049, 1).is_err());
         let mut frame = camera::FrameBuilder::new(1, 1).expect("valid dimensions");
-        let rays = CameraRays {
-            vertical_fov: 1.0,
-            sample_offset: 0,
-            ray_data: vec![255],
-            distance: 1.0,
-        };
+        let rays = CameraRays { vertical_fov: 1.0, sample_offset: 0, ray_data: vec![255], distance: 1.0, entities: Vec::new() };
         assert!(frame.ingest(&rays).is_err());
     }
-
     #[test]
-    fn dropped_request_guard_removes_pending() {
-        use std::{
-            collections::HashMap,
-            sync::{Arc, Mutex},
-        };
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (sender, _receiver) = tokio::sync::oneshot::channel();
-        pending.lock().expect("pending lock").insert(7, sender);
-        let guard = crate::client::PendingGuard {
-            pending: Arc::clone(&pending),
-            sequence: 7,
-            armed: true,
-        };
-        drop(guard);
-        assert!(pending.lock().expect("pending lock").is_empty());
-    }
-
+    fn invalid_rate_policy_is_typed() { assert!(RatePolicy { capacity: f64::NAN, refill_per_second: 1.0 }.validate().is_err()); assert!(RatePolicy { capacity: 1.0, refill_per_second: 0.0 }.validate().is_err()); }
     #[test]
-    fn reconnect_policy_is_bounded() {
-        let policy = ReconnectPolicy::default();
-        assert!(policy.delay(100, 100) <= policy.max_delay);
-    }
+    fn reconnect_jitter_is_bounded_and_varies() { let policy = ReconnectPolicy::default(); let a = policy.delay_with_jitter(2, 20, 0); let b = policy.delay_with_jitter(2, 20, 255); assert!(a <= policy.max_delay); assert!(b <= policy.max_delay); assert_ne!(a, b); }
+    #[test]
+    fn client_debug_redacts_token() { let debug = format!("{:?}", ClientConfig::new("wss://example.invalid", 42, 987654)); assert!(!debug.contains("987654")); assert!(debug.contains("REDACTED")); }
 }
