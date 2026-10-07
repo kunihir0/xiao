@@ -324,17 +324,37 @@ impl RustPlusClient {
         let ws_config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_FRAME));
-        let stream = match connect_async_with_config(
-            self.inner.config.endpoint.as_str(),
-            Some(ws_config),
-            false,
-        )
-        .await
-        {
-            Ok((stream, _)) => stream,
-            Err(_) => {
+        let disconnect_signal = self
+            .inner
+            .disconnect_signal
+            .lock()
+            .ok()
+            .map(|signal| signal.clone());
+        let stream = tokio::select! {
+            result = connect_async_with_config(
+                self.inner.config.endpoint.as_str(),
+                Some(ws_config),
+                false,
+            ) => match result {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    self.inner.readiness.send_replace(Readiness::Disconnected);
+                    return Err(Error::Transport);
+                }
+            },
+            _ = self.inner.owner_cancel.cancelled() => {
                 self.inner.readiness.send_replace(Readiness::Disconnected);
-                return Err(Error::Transport);
+                return Err(Error::ShuttingDown);
+            },
+            _ = async {
+                if let Some(signal) = disconnect_signal {
+                    signal.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                self.inner.readiness.send_replace(Readiness::Disconnected);
+                return Err(Error::ShuttingDown);
             }
         };
         let generation = self
@@ -572,6 +592,17 @@ impl RustPlusClient {
             })
             .map_err(|_| Error::SequenceExhausted)?;
         let sequence = previous.checked_add(1).ok_or(Error::SequenceExhausted)?;
+        if to_proto_request(
+            sequence,
+            self.inner.config.player_id,
+            self.inner.config.player_token,
+            request.clone(),
+        )
+        .encoded_len()
+            > MAX_FRAME
+        {
+            return Err(Error::RequestTooLarge);
+        }
         let key = (generation, sequence);
         let (tx, rx) = oneshot::channel();
         {

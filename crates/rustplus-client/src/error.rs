@@ -30,6 +30,8 @@ pub enum Error {
     InvalidEndpoint,
     #[error("invalid configuration: {0}")]
     InvalidConfig(&'static str),
+    #[error("request payload exceeds the protocol limit")]
+    RequestTooLarge,
     #[error("shutdown timed out after {0:?}")]
     ShutdownTimeout(Duration),
     #[error("invalid camera payload: {0}")]

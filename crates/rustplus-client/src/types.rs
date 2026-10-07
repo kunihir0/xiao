@@ -359,6 +359,25 @@ impl Default for ReconnectPolicy {
     }
 }
 impl ReconnectPolicy {
+    pub const MIN_DELAY: Duration = Duration::from_millis(1);
+
+    pub fn validate(self) -> Result<(), &'static str> {
+        if self.max_attempts > 100 {
+            return Err("reconnect attempts are outside the supported bound");
+        }
+        if self.initial_delay < Self::MIN_DELAY
+            || self.max_delay < Self::MIN_DELAY
+            || self.initial_delay > self.max_delay
+        {
+            return Err("reconnect delays must be at least one millisecond and ordered");
+        }
+        if self.jitter_percent > 100 {
+            return Err("reconnect jitter is outside the supported bound");
+        }
+        Ok(())
+    }
+
+impl ReconnectPolicy {
     #[must_use]
     pub fn delay(&self, attempt: u32, jitter_percent: u8) -> Duration {
         self.delay_with_jitter(attempt, jitter_percent, 0)
@@ -369,9 +388,9 @@ impl ReconnectPolicy {
         let multiplier = 1u128 << exponent;
         let base = self
             .initial_delay
-            .as_millis()
+            .as_nanos()
             .saturating_mul(multiplier)
-            .min(self.max_delay.as_millis());
+            .min(self.max_delay.as_nanos());
         let jitter = u128::from(jitter_percent.min(self.jitter_percent));
         let spread = base.saturating_mul(jitter) / 100;
         let offset = if spread == 0 {
@@ -379,11 +398,11 @@ impl ReconnectPolicy {
         } else {
             (u128::from(sample) * (spread.saturating_mul(2).saturating_add(1))) / 255
         };
-        Duration::from_millis(
-            base.saturating_sub(spread)
-                .saturating_add(offset)
-                .min(self.max_delay.as_millis()) as u64,
-        )
+        let nanos = base
+            .saturating_sub(spread)
+            .saturating_add(offset)
+            .min(self.max_delay.as_nanos());
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 }
 
