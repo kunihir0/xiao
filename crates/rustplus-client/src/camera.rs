@@ -277,6 +277,7 @@ impl IndexGenerator {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -298,6 +299,7 @@ mod tests {
                 sample_offset: 0,
                 ray_data,
                 distance: 1.0,
+                entities: Vec::new(),
             })
             .expect("valid ray fixture");
         assert_eq!(decoded, 1);

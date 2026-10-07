@@ -222,15 +222,15 @@ impl Drop for RustPlusClient {
     fn drop(&mut self) {
         if self.inner.owner_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.inner.owner_cancel.cancel();
-            if let Ok(guard) = self.inner.cancellation.lock() {
-                if let Some((_, token)) = guard.as_ref() {
-                    token.cancel();
-                }
+            if let Ok(guard) = self.inner.cancellation.lock()
+                && let Some((_, token)) = guard.as_ref()
+            {
+                token.cancel();
             }
-            if let Ok(mut task) = self.inner.supervisor.lock() {
-                if let Some(handle) = task.take() {
-                    handle.abort();
-                }
+            if let Ok(mut task) = self.inner.supervisor.lock()
+                && let Some(handle) = task.take()
+            {
+                handle.abort();
             }
             fail_pending(&self.inner.pending, Error::ShuttingDown);
         }
@@ -321,20 +321,20 @@ impl RustPlusClient {
             tokio::select! { result = &mut reader => { supervisor_token.cancel(); let _ = result; let _ = (&mut writer).await; }, result = &mut writer => { supervisor_token.cancel(); let _ = result; let _ = (&mut reader).await; } };
             // Both child tasks are joined before state is cleared.
             fail_pending(&pending_cleanup, Error::Disconnected);
-            if let Some(inner) = weak.upgrade() {
-                if inner.generation.load(Ordering::Acquire) == generation {
-                    if let Ok(mut sender) = inner.outbound.lock() {
-                        if sender.as_ref().is_some_and(|(g, _)| *g == generation) {
-                            *sender = None;
-                        }
-                    }
-                    if let Ok(mut token) = inner.cancellation.lock() {
-                        if token.as_ref().is_some_and(|(g, _)| *g == generation) {
-                            *token = None;
-                        }
-                    }
-                    let _ = readiness.send(Readiness::Disconnected);
+            if let Some(inner) = weak.upgrade()
+                && inner.generation.load(Ordering::Acquire) == generation
+            {
+                if let Ok(mut sender) = inner.outbound.lock()
+                    && sender.as_ref().is_some_and(|(g, _)| *g == generation)
+                {
+                    *sender = None;
                 }
+                if let Ok(mut token) = inner.cancellation.lock()
+                    && token.as_ref().is_some_and(|(g, _)| *g == generation)
+                {
+                    *token = None;
+                }
+                let _ = readiness.send(Readiness::Disconnected);
             }
         });
         if let Ok(mut task) = self.inner.supervisor.lock() {
@@ -556,7 +556,25 @@ where
     S: futures_util::Stream<Item = std::result::Result<WsMessage, WsError>> + Unpin,
 {
     loop {
-        tokio::select! { _ = cancellation.cancelled() => return Ok(()), message = read.next() => match message { Some(Ok(WsMessage::Binary(data))) => { let message = proto::AppMessage::decode(data.as_ref()).map_err(|_| Error::Decode)?; if let Some(response) = message.response { let converted = convert_response(&response); if let Some(waiter) = pending.lock().ok().and_then(|mut p| p.remove(&(generation, response.seq))) { let _ = waiter.send(converted); } } if let Some(event) = convert_event(message.broadcast) { let _ = events.send(event); } }, Some(Ok(WsMessage::Close(_))) | None => return Ok(()), Some(Ok(_)) => {}, Some(Err(_)) => return Err(Error::Transport) } }
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            message = read.next() => match message {
+                Some(Ok(WsMessage::Binary(data))) => {
+                    let message = proto::AppMessage::decode(data.as_ref()).map_err(|_| Error::Decode)?;
+                    if let Some(response) = message.response {
+                        let converted = convert_response(&response);
+                        if let Some(waiter) = pending.lock().ok().and_then(|mut p| p.remove(&(generation, response.seq))) {
+                            let _ = waiter.send(converted);
+                        }
+                    } else if let Some(event) = convert_event(message.broadcast) {
+                        let _ = events.send(event);
+                    }
+                }
+                Some(Ok(WsMessage::Close(_))) | None => return Ok(()),
+                Some(Ok(_)) => {}
+                Some(Err(_)) => return Err(Error::Transport),
+            }
+        }
     }
 }
 async fn writer_loop<S>(
@@ -756,7 +774,7 @@ fn clan_chat(raw: &proto::AppClanMessage) -> ChatMessage {
         time: raw.time.try_into().unwrap_or_default(),
     }
 }
-fn convert_response(raw: &proto::AppResponse) -> Result<Response> {
+pub(crate) fn convert_response(raw: &proto::AppResponse) -> Result<Response> {
     let payload = if let Some(error) = &raw.error {
         ResponsePayload::ApiError(error.error.clone())
     } else if raw.info.is_some() {
@@ -858,7 +876,7 @@ fn convert_response(raw: &proto::AppResponse) -> Result<Response> {
         payload,
     })
 }
-fn convert_event(raw: Option<proto::AppBroadcast>) -> Option<Event> {
+pub(crate) fn convert_event(raw: Option<proto::AppBroadcast>) -> Option<Event> {
     let raw = raw?;
     if let Some(value) = raw.team_changed {
         Some(Event::TeamChanged {
