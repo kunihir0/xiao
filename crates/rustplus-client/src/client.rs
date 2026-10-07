@@ -2,10 +2,10 @@ use crate::{
     error::{Error, Result},
     proto,
     types::{
-        CameraEntity, CameraEntityKind, ChatMessage, EntityInfo, EntityItem, EntityPayload, Event,
-        EventReceiveError, MapNote, Marker, MarkerKind, MonitorPolicy, RatePolicy, Readiness,
-        ReconnectPolicy, Request, Response, ResponsePayload, ServerInfo, ServerTime, TeamInfo,
-        TeamMember,
+        CameraEntity, CameraEntityKind, ChatMessage, ClanInfo, ClanInvite, ClanMember, ClanRole,
+        EntityInfo, EntityItem, EntityPayload, Event, EventReceiveError, MapNote, Marker,
+        MarkerKind, MonitorPolicy, Monument, PlayerToken, RatePolicy, Readiness, ReconnectPolicy,
+        Request, Response, ResponsePayload, SellOrder, ServerInfo, ServerTime, TeamInfo, TeamMember,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -37,6 +37,11 @@ use url::Url;
 const DEFAULT_QUEUE: usize = 64;
 const DEFAULT_EVENTS: usize = 128;
 const DEFAULT_PENDING: usize = 128;
+const MAX_QUEUE: usize = 4096;
+const MAX_EVENTS: usize = 8192;
+const MAX_PENDING: usize = 8192;
+const MAX_RECONNECT_ATTEMPTS: u32 = 100;
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 const MAX_FRAME: usize = 2 * 1024 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -108,17 +113,26 @@ impl ClientConfig {
         if self.request_timeout.is_zero() {
             return Err(Error::InvalidConfig("request timeout must be positive"));
         }
-        if self.queue_capacity == 0 || self.event_capacity == 0 || self.max_pending == 0 {
+        if self.queue_capacity == 0
+            || self.queue_capacity > MAX_QUEUE
+            || self.event_capacity == 0
+            || self.event_capacity > MAX_EVENTS
+            || self.max_pending == 0
+            || self.max_pending > MAX_PENDING
+        {
             return Err(Error::InvalidConfig(
-                "queue, event, and pending capacities must be positive",
+                "queue, event, and pending capacities are outside the supported bounds",
             ));
         }
         self.rate_policy.validate().map_err(Error::InvalidConfig)?;
-        if self.reconnect.initial_delay.is_zero()
+        if self.reconnect.max_attempts > MAX_RECONNECT_ATTEMPTS
+            || self.reconnect.initial_delay.is_zero()
             || self.reconnect.max_delay.is_zero()
             || self.reconnect.initial_delay > self.reconnect.max_delay
+            || self.reconnect.max_delay > MAX_RECONNECT_DELAY
+            || self.reconnect.jitter_percent > 100
         {
-            return Err(Error::InvalidConfig("reconnect delays are invalid"));
+            return Err(Error::InvalidConfig("reconnect policy is outside the supported bounds"));
         }
         Ok(())
     }
@@ -155,7 +169,7 @@ struct Outbound {
 #[derive(Debug)]
 struct RateLimiter {
     policy: RatePolicy,
-    tokens: f64,
+    tokens: u32,
     last: Instant,
 }
 impl RateLimiter {
@@ -166,19 +180,29 @@ impl RateLimiter {
             last: Instant::now(),
         }
     }
-    async fn wait(&mut self, cost: f64, cancellation: &CancellationToken) -> Result<()> {
+    async fn wait(&mut self, cost: u32, cancellation: &CancellationToken) -> Result<()> {
         let cost = cost.min(self.policy.capacity);
         loop {
-            let elapsed = self.last.elapsed().as_secs_f64();
+            let elapsed = self.last.elapsed();
             self.last = Instant::now();
-            self.tokens =
-                (self.tokens + elapsed * self.policy.refill_per_second).min(self.policy.capacity);
+            let refill = elapsed.as_nanos() / self.policy.refill_interval.as_nanos();
+            self.tokens = self
+                .tokens
+                .saturating_add(u32::try_from(refill).unwrap_or(u32::MAX))
+                .min(self.policy.capacity);
             if self.tokens >= cost {
                 self.tokens -= cost;
                 return Ok(());
             }
-            let wait_for = (cost - self.tokens) / self.policy.refill_per_second;
-            tokio::select! { _ = cancellation.cancelled() => return Err(Error::ShuttingDown), _ = sleep(Duration::from_secs_f64(wait_for)) => {} }
+            let needed = u128::from(cost - self.tokens);
+            let wait_nanos = needed.saturating_mul(self.policy.refill_interval.as_nanos());
+            let wait_for = Duration::from_nanos(
+                u64::try_from(wait_nanos.min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
+            );
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(Error::ShuttingDown),
+                _ = sleep(wait_for) => {}
+            }
         }
     }
 }
@@ -192,7 +216,9 @@ struct Inner {
     events: broadcast::Sender<Event>,
     readiness: watch::Sender<Readiness>,
     cancellation: Mutex<Option<(u64, CancellationToken)>>,
-    supervisor: Mutex<Option<JoinHandle<()>>>,
+    supervisor: Mutex<Option<JoinHandle<Result<()>>>>,
+    child_error: Mutex<Option<Error>>,
+    disconnect_signal: Mutex<CancellationToken>,
     lifecycle: AsyncMutex<()>,
     rate: AsyncMutex<RateLimiter>,
     owner_cancel: CancellationToken,
@@ -232,6 +258,10 @@ impl Drop for RustPlusClient {
             {
                 handle.abort();
             }
+            if let Ok(mut sender) = self.inner.outbound.lock() {
+                *sender = None;
+            }
+            self.inner.readiness.send_replace(Readiness::Disconnected);
             fail_pending(&self.inner.pending, Error::ShuttingDown);
         }
     }
@@ -240,11 +270,18 @@ impl Drop for RustPlusClient {
 impl RustPlusClient {
     #[must_use]
     pub fn new(config: ClientConfig) -> Self {
-        let (events, _) = broadcast::channel(config.event_capacity.max(1));
+        let event_capacity = config.event_capacity.clamp(1, MAX_EVENTS);
+        let rate_policy = config.rate_policy;
+        let rate_policy = rate_policy
+            .validate()
+            .is_ok()
+            .then_some(rate_policy)
+            .unwrap_or_default();
+        let (events, _) = broadcast::channel(event_capacity);
         let (readiness, _) = watch::channel(Readiness::Disconnected);
         Self {
             inner: Arc::new(Inner {
-                rate: AsyncMutex::new(RateLimiter::new(config.rate_policy)),
+                rate: AsyncMutex::new(RateLimiter::new(rate_policy)),
                 config,
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 sequence: AtomicU32::new(0),
@@ -254,6 +291,8 @@ impl RustPlusClient {
                 readiness,
                 cancellation: Mutex::new(None),
                 supervisor: Mutex::new(None),
+                child_error: Mutex::new(None),
+                disconnect_signal: Mutex::new(CancellationToken::new()),
                 lifecycle: AsyncMutex::new(()),
                 owner_cancel: CancellationToken::new(),
                 owner_count: std::sync::atomic::AtomicUsize::new(1),
@@ -269,6 +308,12 @@ impl RustPlusClient {
     async fn connect_locked(&self) -> Result<()> {
         self.inner.config.validate()?;
         self.inner.stopped.store(false, Ordering::Release);
+        if let Ok(mut child_error) = self.inner.child_error.lock() {
+            *child_error = None;
+        }
+        if let Ok(mut signal) = self.inner.disconnect_signal.lock() {
+            *signal = CancellationToken::new();
+        }
         if self.is_ready() {
             return Ok(());
         }
@@ -276,15 +321,24 @@ impl RustPlusClient {
         let ws_config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_FRAME));
-        let stream =
-            connect_async_with_config(self.inner.config.endpoint.as_str(), Some(ws_config), false)
-                .await
-                .map_err(|_| Error::Transport)?
-                .0;
+        let stream = match connect_async_with_config(
+            self.inner.config.endpoint.as_str(),
+            Some(ws_config),
+            false,
+        )
+        .await
+        {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                self.inner.readiness.send_replace(Readiness::Disconnected);
+                return Err(Error::Transport);
+            }
+        };
         let generation = self
             .inner
             .generation
-            .fetch_add(1, Ordering::AcqRel)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            .map_err(|_| Error::SequenceExhausted)?
             .checked_add(1)
             .ok_or(Error::SequenceExhausted)?;
         let (write, read) = stream.split();
@@ -298,18 +352,21 @@ impl RustPlusClient {
         let reader = tokio::spawn(async move {
             reader_loop(read, pending, events, reader_token, generation).await
         });
-        let writer =
-            tokio::spawn(async move { writer_loop(write, outbound_rx, writer_token).await });
+        let writer = tokio::spawn(async move { writer_loop(write, outbound_rx, writer_token).await });
         if let Ok(mut sender) = self.inner.outbound.lock() {
             *sender = Some((generation, outbound_tx));
         } else {
             cancellation.cancel();
+            reader.abort();
+            writer.abort();
             return Err(Error::ShuttingDown);
         }
         if let Ok(mut token) = self.inner.cancellation.lock() {
             *token = Some((generation, cancellation.clone()));
         } else {
             cancellation.cancel();
+            reader.abort();
+            writer.abort();
             return Err(Error::ShuttingDown);
         }
         let weak = Arc::downgrade(&self.inner);
@@ -318,27 +375,42 @@ impl RustPlusClient {
         let supervisor = tokio::spawn(async move {
             tokio::pin!(reader);
             tokio::pin!(writer);
-            tokio::select! {
-                _result = &mut reader => { supervisor_token.cancel(); let _ = (&mut writer).await; },
-                _result = &mut writer => { supervisor_token.cancel(); let _ = (&mut reader).await; },
+            let (first, second) = tokio::select! {
+                result = &mut reader => { supervisor_token.cancel(); (result, (&mut writer).await) },
+                result = &mut writer => { supervisor_token.cancel(); (result, (&mut reader).await) },
             };
-            // Both child tasks are joined before state is cleared.
-            fail_pending(&pending_cleanup, Error::Disconnected);
-            if let Some(inner) = weak.upgrade()
-                && inner.generation.load(Ordering::Acquire) == generation
-            {
-                if let Ok(mut sender) = inner.outbound.lock()
-                    && sender.as_ref().is_some_and(|(g, _)| *g == generation)
+            let first = first.unwrap_or(Err(Error::ShuttingDown));
+            let second = second.unwrap_or(Err(Error::ShuttingDown));
+            let error = first.err().or_else(|| second.err());
+            fail_pending_generation(
+                &pending_cleanup,
+                generation,
+                error.clone().unwrap_or(Error::Disconnected),
+            );
+            if let Some(inner) = weak.upgrade() {
+                let current_generation =
+                    inner.generation.load(Ordering::Acquire) == generation;
+                if current_generation
+                    && let Some(error) = &error
+                    && let Ok(mut child_error) = inner.child_error.lock()
                 {
-                    *sender = None;
+                    *child_error = Some(error.clone());
                 }
-                if let Ok(mut token) = inner.cancellation.lock()
-                    && token.as_ref().is_some_and(|(g, _)| *g == generation)
-                {
-                    *token = None;
+                if current_generation {
+                    if let Ok(mut sender) = inner.outbound.lock()
+                        && sender.as_ref().is_some_and(|(g, _)| *g == generation)
+                    {
+                        *sender = None;
+                    }
+                    if let Ok(mut token) = inner.cancellation.lock()
+                        && token.as_ref().is_some_and(|(g, _)| *g == generation)
+                    {
+                        *token = None;
+                    }
+                    readiness.send_replace(Readiness::Disconnected);
                 }
-                readiness.send_replace(Readiness::Disconnected);
             }
+            error.map_or(Ok(()), Err)
         });
         if let Ok(mut task) = self.inner.supervisor.lock() {
             *task = Some(supervisor);
@@ -346,35 +418,57 @@ impl RustPlusClient {
             cancellation.cancel();
             return Err(Error::ShuttingDown);
         }
+        if let Err(error) = self.send_request_inner(Request::Info, false).await {
+            cancellation.cancel();
+            self.abort_supervisor().await;
+            self.inner.readiness.send_replace(Readiness::Disconnected);
+            return Err(error);
+        }
         self.inner.readiness.send_replace(Readiness::Ready);
         Ok(())
     }
 
     pub async fn disconnect(&self) -> Result<()> {
         self.inner.stopped.store(true, Ordering::Release);
+        if let Ok(signal) = self.inner.disconnect_signal.lock() {
+            signal.cancel();
+        }
         let _transition = self.inner.lifecycle.lock().await;
         self.inner.readiness.send_replace(Readiness::Closing);
-        let token = self
+        let generation = self
             .inner
             .cancellation
             .lock()
             .ok()
-            .and_then(|mut t| t.take().map(|(_, token)| token));
-        if let Some(token) = token {
-            token.cancel();
-        }
-        let task = self
+            .and_then(|mut token| token.take().map(|(generation, token)| {
+                token.cancel();
+                generation
+            }));
+        let mut task = self
             .inner
             .supervisor
             .lock()
             .ok()
             .and_then(|mut task| task.take());
-        if let Some(task) = task {
-            match timeout(SHUTDOWN_TIMEOUT, task).await {
-                Ok(Ok(())) => {}
+        if let Some(mut task_handle) = task.take() {
+            match timeout(SHUTDOWN_TIMEOUT, &mut task_handle).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => return Err(error),
                 Ok(Err(_)) => return Err(Error::ShuttingDown),
                 Err(_) => {
-                    fail_pending(&self.inner.pending, Error::ShuttingDown);
+                    task_handle.abort();
+                    let _ = timeout(SHUTDOWN_TIMEOUT, &mut task_handle).await;
+                    if let Some(generation) = generation {
+                        fail_pending_generation(
+                            &self.inner.pending,
+                            generation,
+                            Error::ShuttingDown,
+                        );
+                    }
+                    if let Ok(mut sender) = self.inner.outbound.lock() {
+                        *sender = None;
+                    }
+                    self.inner.readiness.send_replace(Readiness::Disconnected);
                     return Err(Error::ShutdownTimeout(SHUTDOWN_TIMEOUT));
                 }
             }
@@ -382,9 +476,27 @@ impl RustPlusClient {
         if let Ok(mut sender) = self.inner.outbound.lock() {
             *sender = None;
         }
-        fail_pending(&self.inner.pending, Error::Disconnected);
+        if let Some(generation) = generation {
+            fail_pending_generation(&self.inner.pending, generation, Error::Disconnected);
+        }
         self.inner.readiness.send_replace(Readiness::Disconnected);
         Ok(())
+    }
+
+    async fn abort_supervisor(&self) {
+        let task = self
+            .inner
+            .supervisor
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(mut task) = task {
+            task.abort();
+            let _ = timeout(SHUTDOWN_TIMEOUT, &mut task).await;
+        }
+        if let Ok(mut sender) = self.inner.outbound.lock() {
+            *sender = None;
+        }
     }
     #[must_use]
     pub fn readiness(&self) -> Readiness {
@@ -406,7 +518,11 @@ impl RustPlusClient {
     }
 
     pub async fn send_request(&self, request: Request) -> Result<Response> {
-        if !self.is_ready() {
+        self.send_request_inner(request, true).await
+    }
+
+    async fn send_request_inner(&self, request: Request, require_ready: bool) -> Result<Response> {
+        if require_ready && !self.is_ready() {
             return Err(Error::Disconnected);
         }
         let cancellation = self
@@ -417,10 +533,9 @@ impl RustPlusClient {
             .and_then(|guard| guard.as_ref().map(|(_, token)| token.clone()))
             .ok_or(Error::Disconnected)?;
         let cost = match request {
-            Request::Map => 5.0,
-            Request::TeamMessage(_) => 2.0,
-            Request::CameraInput { .. } => 0.01,
-            _ => 1.0,
+            Request::Map => 5,
+            Request::TeamMessage(_) => 2,
+            _ => 1,
         };
         timeout(
             self.inner.config.request_timeout,
@@ -459,17 +574,18 @@ impl RustPlusClient {
             key,
             armed: true,
         };
-        sender
-            .try_send(Outbound {
-                sequence,
-                player_id: self.inner.config.player_id,
-                player_token: self.inner.config.player_token,
-                request,
-            })
-            .map_err(|error| match error {
+        if let Err(error) = sender.try_send(Outbound {
+            sequence,
+            player_id: self.inner.config.player_id,
+            player_token: self.inner.config.player_token,
+            request,
+        }) {
+            let error = match error {
                 mpsc::error::TrySendError::Full(_) => Error::QueueFull,
                 mpsc::error::TrySendError::Closed(_) => Error::Disconnected,
-            })?;
+            };
+            return Err(error);
+        }
         let response = timeout(self.inner.config.request_timeout, rx)
             .await
             .map_err(|_| Error::Timeout(self.inner.config.request_timeout))?
@@ -487,8 +603,12 @@ impl RustPlusClient {
 
     pub async fn connect_with_reconnect(&self) -> Result<()> {
         let policy = self.inner.config.reconnect;
+        self.inner.config.validate()?;
+        let mut last_error = Error::Disconnected;
         for attempt in 0..=policy.max_attempts {
-            if self.inner.stopped.load(Ordering::Acquire) {
+            if self.inner.stopped.load(Ordering::Acquire)
+                || self.inner.owner_cancel.is_cancelled()
+            {
                 return Ok(());
             }
             match self.connect().await {
@@ -496,25 +616,54 @@ impl RustPlusClient {
                     let mut readiness = self.subscribe_readiness();
                     loop {
                         if *readiness.borrow() == Readiness::Disconnected {
+                            if let Ok(mut child_error) = self.inner.child_error.lock()
+                                && let Some(error) = child_error.take()
+                            {
+                                last_error = error;
+                            }
                             break;
                         }
-                        tokio::select! { _ = self.inner.owner_cancel.cancelled() => return Ok(()), changed = readiness.changed() => { if changed.is_err() { return Ok(()); } } }
+                        tokio::select! {
+                            _ = self.inner.owner_cancel.cancelled() => return Ok(()),
+                            changed = readiness.changed() => {
+                                if changed.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
                     if self.inner.stopped.load(Ordering::Acquire) {
                         return Ok(());
                     }
                 }
-                Err(_error) if attempt < policy.max_attempts => {
-                    let mut rng = rand::rng();
-                    let sample = rng.random::<u8>();
-                    let delay = policy.delay_with_jitter(attempt, policy.jitter_percent, sample);
-                    tokio::select! { _ = self.inner.owner_cancel.cancelled() => return Ok(()), _ = sleep(delay) => {} }
-                    continue;
+                Err(error) => {
+                    last_error = error;
                 }
-                Err(error) => return Err(error),
+            }
+            if attempt == policy.max_attempts {
+                return Err(last_error);
+            }
+            let sample = rand::rng().random::<u8>();
+            let delay = policy.delay_with_jitter(attempt, policy.jitter_percent, sample);
+            let disconnect_signal = self
+                .inner
+                .disconnect_signal
+                .lock()
+                .ok()
+                .map(|signal| signal.clone());
+            tokio::select! {
+                _ = self.inner.owner_cancel.cancelled() => return Ok(()),
+                _ = async {
+                    if let Some(signal) = disconnect_signal {
+                        signal.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => return Ok(()),
+                _ = sleep(delay) => {},
             }
         }
-        Err(Error::Disconnected)
+        Err(last_error)
     }
 
     pub async fn poll_markers(&self) -> Result<Vec<Marker>> {
@@ -593,6 +742,21 @@ where
         tokio::select! { _ = cancellation.cancelled() => { let _ = timeout(SHUTDOWN_TIMEOUT, write.send(WsMessage::Close(None))).await; return Ok(()); }, item = outbound.recv() => match item { Some(item) => { let request = to_proto_request(item.sequence, item.player_id, item.player_token, item.request); let mut bytes = Vec::new(); request.encode(&mut bytes).map_err(|_| Error::Encode)?; write.send(WsMessage::Binary(bytes.into())).await.map_err(|_| Error::Transport)?; }, None => return Ok(()) } }
     }
 }
+fn fail_pending_generation(pending: &Mutex<PendingMap>, generation: u64, error: Error) {
+    if let Ok(mut pending) = pending.lock() {
+        let keys: Vec<_> = pending
+            .keys()
+            .copied()
+            .filter(|(pending_generation, _)| *pending_generation == generation)
+            .collect();
+        for key in keys {
+            if let Some(waiter) = pending.remove(&key) {
+                let _ = waiter.send(Err(error.clone_for_pending()));
+            }
+        }
+    }
+}
+
 fn fail_pending(pending: &Mutex<PendingMap>, error: Error) {
     if let Ok(mut pending) = pending.lock() {
         for (_, waiter) in pending.drain() {
@@ -766,7 +930,7 @@ fn chat(raw: &proto::AppTeamMessage) -> ChatMessage {
         name: raw.name.clone(),
         message: raw.message.clone(),
         color: raw.color.clone(),
-        time: u64::from(raw.time),
+        time: Some(u64::from(raw.time)),
     }
 }
 fn clan_chat(raw: &proto::AppClanMessage) -> ChatMessage {
@@ -775,8 +939,70 @@ fn clan_chat(raw: &proto::AppClanMessage) -> ChatMessage {
         name: raw.name.clone(),
         message: raw.message.clone(),
         color: String::new(),
-        time: raw.time.try_into().unwrap_or_default(),
+        time: u64::try_from(raw.time).ok(),
     }
+}
+
+fn valid_timestamp(value: i64) -> Option<i64> {
+    (value > 0).then_some(value)
+}
+
+fn clan_info(raw: &proto::ClanInfo) -> ClanInfo {
+    ClanInfo {
+        clan_id: raw.clan_id,
+        name: raw.name.clone(),
+        created: valid_timestamp(raw.created),
+        creator: raw.creator,
+        motd: raw.motd.clone(),
+        motd_timestamp: raw.motd_timestamp.and_then(valid_timestamp),
+        motd_author: raw.motd_author,
+        logo: raw.logo.clone(),
+        color: raw.color,
+        roles: raw
+            .roles
+            .iter()
+            .map(|role| ClanRole {
+                role_id: role.role_id,
+                rank: role.rank,
+                name: role.name.clone(),
+                can_set_motd: role.can_set_motd,
+                can_set_logo: role.can_set_logo,
+                can_invite: role.can_invite,
+                can_kick: role.can_kick,
+                can_promote: role.can_promote,
+                can_demote: role.can_demote,
+                can_set_player_notes: role.can_set_player_notes,
+                can_access_logs: role.can_access_logs,
+            })
+            .collect(),
+        members: raw
+            .members
+            .iter()
+            .map(|member| ClanMember {
+                steam_id: member.steam_id,
+                role_id: member.role_id,
+                joined: valid_timestamp(member.joined),
+                last_seen: valid_timestamp(member.last_seen),
+                notes: member.notes.clone(),
+                online: member.online,
+            })
+            .collect(),
+        invites: raw
+            .invites
+            .iter()
+            .map(|invite| ClanInvite {
+                steam_id: invite.steam_id,
+                recruiter: invite.recruiter,
+                timestamp: valid_timestamp(invite.timestamp),
+            })
+            .collect(),
+        max_member_count: raw.max_member_count,
+    }
+}
+
+fn color(raw: Option<&proto::Vector4>) -> Option<[f32; 4]> {
+    let raw = raw?;
+    Some([raw.x?, raw.y?, raw.z?, raw.w?])
 }
 pub(crate) fn convert_response(raw: &proto::AppResponse) -> Result<Response> {
     let payload = if let Some(error) = &raw.error {
@@ -813,6 +1039,17 @@ pub(crate) fn convert_response(raw: &proto::AppResponse) -> Result<Response> {
             width: map.width,
             height: map.height,
             image: map.jpg_image.clone(),
+            ocean_margin: map.ocean_margin,
+            monuments: map
+                .monuments
+                .iter()
+                .map(|monument| Monument {
+                    token: monument.token.clone(),
+                    x: monument.x,
+                    y: monument.y,
+                })
+                .collect(),
+            background: map.background.clone(),
         }
     } else if let Some(value) = &raw.team_info {
         ResponsePayload::TeamInfoData(payload_team(value))
@@ -848,26 +1085,45 @@ pub(crate) fn convert_response(raw: &proto::AppResponse) -> Result<Response> {
                     steam_id: m.steam_id,
                     rotation: m.rotation,
                     radius: m.radius,
+                    color1: color(m.color1.as_ref()),
+                    color2: color(m.color2.as_ref()),
+                    alpha: m.alpha,
                     name: m.name.clone(),
                     out_of_stock: m.out_of_stock,
+                    sell_orders: m
+                        .sell_orders
+                        .iter()
+                        .map(|order| SellOrder {
+                            item_id: order.item_id,
+                            quantity: order.quantity,
+                            currency_id: order.currency_id,
+                            cost_per_item: order.cost_per_item,
+                            amount_in_stock: order.amount_in_stock,
+                            item_is_blueprint: order.item_is_blueprint,
+                            currency_is_blueprint: order.currency_is_blueprint,
+                            item_condition: order.item_condition,
+                            item_condition_max: order.item_condition_max,
+                        })
+                        .collect(),
                 })
                 .collect(),
         )
     } else if let Some(value) = &raw.clan_info {
-        let mut bytes = Vec::new();
-        value.clan_info.as_ref().map(|info| info.encode(&mut bytes));
-        ResponsePayload::ClanInfoData(bytes)
+        let info = value.clan_info.as_ref().ok_or(Error::Decode)?;
+        ResponsePayload::ClanInfoData(clan_info(info))
     } else if let Some(value) = &raw.clan_chat {
         ResponsePayload::ClanChatData(value.messages.iter().map(clan_chat).collect())
     } else if let Some(auth) = &raw.nexus_auth {
         ResponsePayload::NexusAuth {
             server_id: auth.server_id.clone(),
-            player_token: auth.player_token,
+            player_token: PlayerToken::new(auth.player_token),
         }
     } else if let Some(camera) = &raw.camera_subscribe_info {
         ResponsePayload::CameraInfo {
             width: camera.width,
             height: camera.height,
+            near_plane: camera.near_plane,
+            far_plane: camera.far_plane,
             control_flags: camera.control_flags,
         }
     } else if raw.success.is_some() {
@@ -897,10 +1153,8 @@ pub(crate) fn convert_event(raw: Option<proto::AppBroadcast>) -> Option<Event> {
             payload: payload_entity(&value.payload),
         })
     } else if let Some(value) = raw.clan_changed {
-        let mut bytes = Vec::new();
-        value.clan_info.as_ref().map(|info| info.encode(&mut bytes));
         Some(Event::ClanChanged {
-            clan_info: (!bytes.is_empty()).then_some(bytes),
+            clan_info: value.clan_info.as_ref().map(clan_info),
         })
     } else if let Some(value) = raw.clan_message {
         Some(Event::ClanMessage {

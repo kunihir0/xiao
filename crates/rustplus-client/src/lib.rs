@@ -17,17 +17,17 @@ mod types;
 pub use client::{ClientConfig, EventReceiver, RustPlusClient};
 pub use error::{Error, Result};
 pub use types::{
-    CameraEntity, CameraEntityKind, CameraRays, ChatMessage, EntityInfo, EntityItem, EntityPayload,
-    Event, EventReceiveError, MapNote, Marker, MarkerKind, MonitorPolicy, RatePolicy, Readiness,
-    ReconnectPolicy, Request, Response, ResponsePayload, ServerInfo, ServerTime, TeamInfo,
-    TeamMember,
+    CameraEntity, CameraEntityKind, CameraRays, ChatMessage, ClanInfo, ClanInvite, ClanMember,
+    ClanRole, EntityInfo, EntityItem, EntityPayload, Event, EventReceiveError, MapNote, Marker,
+    MarkerKind, MonitorPolicy, Monument, PlayerToken, RatePolicy, Readiness, ReconnectPolicy,
+    Request, Response, ResponsePayload, SellOrder, ServerInfo, ServerTime, TeamInfo, TeamMember,
 };
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::*;
     use prost::Message;
+    use std::time::Duration;
 
     fn fixture(name: &str) -> Vec<u8> {
         let text = include_str!("../tests/fixtures/legacy-wire.txt");
@@ -82,13 +82,11 @@ mod tests {
     }
     #[test]
     fn malformed_varints_and_lengths_are_rejected() {
-        let malformed = [
-            vec![0x08, 0x80],
-            vec![0x0a, 0xff, 0xff, 0xff, 0x7f],
-            vec![0x0a, 0x02, 0x08],
-        ];
-        for bytes in malformed {
-            assert!(proto::AppMessage::decode(bytes.as_slice()).is_err());
+        for name in ["malformed_varint", "malformed_length", "malformed_dimension"] {
+            assert!(
+                proto::AppMessage::decode(fixture(name).as_slice()).is_err(),
+                "{name} fixture must be rejected"
+            );
         }
     }
     #[test]
@@ -131,16 +129,32 @@ mod tests {
     fn invalid_rate_policy_is_typed() {
         assert!(
             RatePolicy {
-                capacity: f64::NAN,
-                refill_per_second: 1.0
+                capacity: 0,
+                refill_interval: Duration::from_secs(1),
             }
             .validate()
             .is_err()
         );
         assert!(
             RatePolicy {
-                capacity: 1.0,
-                refill_per_second: 0.0
+                capacity: 1,
+                refill_interval: Duration::ZERO,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RatePolicy {
+                capacity: RatePolicy::MAX_CAPACITY + 1,
+                refill_interval: Duration::from_secs(1),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RatePolicy {
+                capacity: 1,
+                refill_interval: RatePolicy::MAX_REFILL_INTERVAL + Duration::from_nanos(1),
             }
             .validate()
             .is_err()
@@ -154,6 +168,23 @@ mod tests {
         assert!(a <= policy.max_delay);
         assert!(b <= policy.max_delay);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn response_secret_debug_is_redacted() {
+        let payload = ResponsePayload::NexusAuth {
+            server_id: "server".to_owned(),
+            player_token: PlayerToken::new(987654),
+        };
+        let debug = format!("{payload:?}");
+        assert!(!debug.contains("987654"));
+        assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn invalid_clan_timestamps_are_optional_not_epoch() {
+        assert_eq!(crate::client::valid_timestamp(-1), None);
+        assert_eq!(crate::client::valid_timestamp(0), None);
     }
     #[test]
     fn client_debug_redacts_token() {

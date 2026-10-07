@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    fmt,
+    time::Duration,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraRays {
@@ -121,7 +124,7 @@ pub struct ChatMessage {
     pub name: String,
     pub message: String,
     pub color: String,
-    pub time: u64,
+    pub time: Option<u64>,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityPayload {
@@ -156,6 +159,9 @@ pub enum ResponsePayload {
         width: u32,
         height: u32,
         image: Vec<u8>,
+        ocean_margin: i32,
+        monuments: Vec<Monument>,
+        background: Option<String>,
     },
     TeamInfo,
     TeamInfoData(TeamInfo),
@@ -166,18 +172,97 @@ pub enum ResponsePayload {
     Flag(bool),
     MapMarkers(Vec<Marker>),
     ClanInfo,
-    ClanInfoData(Vec<u8>),
+    ClanInfoData(ClanInfo),
     ClanChat,
     ClanChatData(Vec<ChatMessage>),
     NexusAuth {
         server_id: String,
-        player_token: i32,
+        player_token: PlayerToken,
     },
     CameraInfo {
         width: i32,
         height: i32,
+        near_plane: f32,
+        far_plane: f32,
         control_flags: i32,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Monument {
+    pub token: String,
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PlayerToken(i32);
+
+impl PlayerToken {
+    #[must_use]
+    pub const fn new(value: i32) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn value(self) -> i32 {
+        self.0
+    }
+}
+
+impl fmt::Debug for PlayerToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClanInfo {
+    pub clan_id: i64,
+    pub name: String,
+    pub created: Option<i64>,
+    pub creator: u64,
+    pub motd: Option<String>,
+    pub motd_timestamp: Option<i64>,
+    pub motd_author: Option<u64>,
+    pub logo: Option<Vec<u8>>,
+    pub color: Option<i32>,
+    pub roles: Vec<ClanRole>,
+    pub members: Vec<ClanMember>,
+    pub invites: Vec<ClanInvite>,
+    pub max_member_count: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClanRole {
+    pub role_id: i32,
+    pub rank: i32,
+    pub name: String,
+    pub can_set_motd: bool,
+    pub can_set_logo: bool,
+    pub can_invite: bool,
+    pub can_kick: bool,
+    pub can_promote: bool,
+    pub can_demote: bool,
+    pub can_set_player_notes: bool,
+    pub can_access_logs: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClanMember {
+    pub steam_id: u64,
+    pub role_id: i32,
+    pub joined: Option<i64>,
+    pub last_seen: Option<i64>,
+    pub notes: Option<String>,
+    pub online: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClanInvite {
+    pub steam_id: u64,
+    pub recruiter: u64,
+    pub timestamp: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,8 +274,25 @@ pub struct Marker {
     pub steam_id: Option<u64>,
     pub rotation: Option<f32>,
     pub radius: Option<f32>,
+    pub color1: Option<[f32; 4]>,
+    pub color2: Option<[f32; 4]>,
+    pub alpha: Option<f32>,
     pub name: Option<String>,
     pub out_of_stock: Option<bool>,
+    pub sell_orders: Vec<SellOrder>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SellOrder {
+    pub item_id: i32,
+    pub quantity: i32,
+    pub currency_id: i32,
+    pub cost_per_item: i32,
+    pub amount_in_stock: i32,
+    pub item_is_blueprint: bool,
+    pub currency_is_blueprint: bool,
+    pub item_condition: Option<f32>,
+    pub item_condition_max: Option<f32>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkerKind {
@@ -219,7 +321,7 @@ pub enum Event {
         payload: EntityPayload,
     },
     ClanChanged {
-        clan_info: Option<Vec<u8>>,
+        clan_info: Option<ClanInfo>,
     },
     ClanMessage {
         clan_id: i64,
@@ -288,26 +390,29 @@ impl ReconnectPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RatePolicy {
-    pub capacity: f64,
-    pub refill_per_second: f64,
+    pub capacity: u32,
+    pub refill_interval: Duration,
 }
 impl Default for RatePolicy {
     fn default() -> Self {
         Self {
-            capacity: 10.0,
-            refill_per_second: 1.0,
+            capacity: 10,
+            refill_interval: Duration::from_secs(1),
         }
     }
 }
 impl RatePolicy {
+    pub const MAX_CAPACITY: u32 = 100_000;
+    pub const MAX_REFILL_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
     pub fn validate(self) -> Result<(), &'static str> {
-        if !self.capacity.is_finite() || self.capacity <= 0.0 {
-            return Err("rate capacity must be finite and positive");
+        if self.capacity == 0 || self.capacity > Self::MAX_CAPACITY {
+            return Err("rate capacity is outside the supported bound");
         }
-        if !self.refill_per_second.is_finite() || self.refill_per_second <= 0.0 {
-            return Err("rate refill must be finite and positive");
+        if self.refill_interval.is_zero() || self.refill_interval > Self::MAX_REFILL_INTERVAL {
+            return Err("rate refill interval is outside the supported bound");
         }
         Ok(())
     }

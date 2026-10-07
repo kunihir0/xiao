@@ -21,10 +21,12 @@ verification. Plain `ws://` is rejected; the explicit
 endpoints and is intended for local transport tests. `ClientConfig` debug output
 redacts `player_token`.
 
-Rate policy values must be finite and positive. Queue capacity and independent
-pending-request capacity are bounded. Request keys include a monotonically
-increasing connection generation, and sequence exhaustion/collisions are
-rejected; late responses from old sessions cannot satisfy new waiters.
+Rate policy uses bounded integer token capacity and a bounded `Duration` refill
+interval; invalid values are rejected before transport queues are allocated.
+Queue capacity and independent pending-request capacity are bounded. Request
+keys include a monotonically increasing connection generation, and sequence
+exhaustion/collisions are rejected; late responses from old sessions cannot
+satisfy new waiters.
 
 ## Lifecycle and backpressure
 
