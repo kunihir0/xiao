@@ -146,7 +146,6 @@ fn parse_u32(value: U64Like, field: &'static str) -> Result<u32, ParseError> {
     u32::try_from(parse_u64(value, field)?).map_err(|_| ParseError::Numeric(field))
 }
 fn validate_address(host: String, port: u16) -> Result<ServerAddress, ParseError> {
-    let host = host.trim().to_owned();
     if host.is_empty()
         || host
             .chars()
@@ -224,5 +223,133 @@ mod tests {
         };
         assert!(!error.to_string().contains(body));
         Ok(())
+    }
+
+    fn notification(body: &str) -> push_receiver::Notification {
+        let mut notification =
+            push_receiver::Notification::new(Vec::new(), Some("delivery-2".to_owned()));
+        notification.app_data.push(push_receiver::AppData {
+            key: "payload".to_owned(),
+            value: body.to_owned(),
+        });
+        notification
+    }
+
+    fn server_body(host: &str, port: &str, player_id: &str, token: &str) -> String {
+        format!(
+            r#"{{"ip":{host},"port":{port},"playerId":{player_id},"playerToken":{token},"type":"server"}}"#
+        )
+    }
+
+    #[test]
+    fn chooses_the_first_valid_body_after_unrelated_data() -> Result<(), ParseError> {
+        let mut notification = push_receiver::Notification::new(Vec::new(), None);
+        notification.app_data.extend([
+            push_receiver::AppData {
+                key: "title".to_owned(),
+                value: "not a pairing".to_owned(),
+            },
+            push_receiver::AppData {
+                key: "metadata".to_owned(),
+                value: r#"{"unrelated":true}"#.to_owned(),
+            },
+            push_receiver::AppData {
+                key: "pairing".to_owned(),
+                value: server_body(r#""first.example""#, "28015", "42", "-7"),
+            },
+            push_receiver::AppData {
+                key: "pairing".to_owned(),
+                value: server_body(r#""second.example""#, "28016", "43", "-8"),
+            },
+        ]);
+        let pairing = parse_notification(&notification, &ParseConfig::default())?
+            .ok_or(ParseError::Missing("pairing"))?;
+        assert_eq!(pairing.address().host(), "first.example");
+        assert_eq!(pairing.address().port(), 28015);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_port_and_token_values_outside_their_domains() {
+        for (field, body) in [
+            ("port", server_body(r#""example.com""#, "0", "42", "7")),
+            ("port", server_body(r#""example.com""#, "-1", "42", "7")),
+            ("port", server_body(r#""example.com""#, "65536", "42", "7")),
+            (
+                "port",
+                server_body(r#""example.com""#, "18446744073709551616", "42", "7"),
+            ),
+            (
+                "playerToken",
+                server_body(r#""example.com""#, "28015", "42", "2147483648"),
+            ),
+            (
+                "playerToken",
+                server_body(r#""example.com""#, "28015", "42", "-2147483649"),
+            ),
+        ] {
+            let result = parse_notification(&notification(&body), &ParseConfig::default());
+            assert!(
+                matches!(
+                    result,
+                    Err(ParseError::Invalid(_))
+                        | Err(ParseError::Numeric(_))
+                        | Err(ParseError::Malformed)
+                ),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_zero_player_id() {
+        let body = server_body(r#""example.com""#, "28015", "0", "7");
+        assert!(matches!(
+            parse_notification(&notification(&body), &ParseConfig::default()),
+            Err(ParseError::Domain("playerId"))
+        ));
+    }
+
+    #[test]
+    fn rejects_scheme_path_control_and_malformed_ipv6_hosts() {
+        for host in [
+            r#""https://example.com""#,
+            r#""example.com/path""#,
+            r#""example.com\u0000""#,
+            r#""  example.com""#,
+            r#""[2001:db8::1""#,
+            r#""2001:db8:::1""#,
+        ] {
+            let body = server_body(host, "28015", "42", "7");
+            assert!(matches!(
+                parse_notification(&notification(&body), &ParseConfig::default()),
+                Err(ParseError::Invalid("ip")) | Err(ParseError::Domain("ip"))
+            ));
+        }
+    }
+
+    #[test]
+    fn oversized_body_is_rejected_before_deserialization() {
+        let body = server_body(r#""example.com""#, "28015", "42", "7");
+        let config = ParseConfig {
+            max_value_bytes: body.len() - 1,
+            ..ParseConfig::default()
+        };
+        assert_eq!(
+            parse_notification(&notification(&body), &config),
+            Err(ParseError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn token_never_appears_in_error_debug_or_display() {
+        let secret = "2147483648";
+        let body = server_body(r#""example.com""#, "28015", "42", secret);
+        let result = parse_notification(&notification(&body), &ParseConfig::default());
+        assert!(result.is_err());
+        if let Err(error) = result {
+            assert!(!format!("{error:?}").contains(secret));
+            assert!(!error.to_string().contains(secret));
+        }
     }
 }

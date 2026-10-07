@@ -60,3 +60,38 @@ impl PairingSource for PushPairingSource {
         })
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn synthetic_receiver_notification_becomes_typed_pairing() {
+        let (sender, receiver_source) = push_receiver::ReceiverSource::channel(1).expect("channel");
+        let receiver = push_receiver::start(receiver_source, 1, 8);
+        let mut source = PushPairingSource::new(receiver, ParseConfig::default());
+        let mut notification =
+            push_receiver::Notification::new(Vec::new(), Some("delivery-typed".to_owned()));
+        notification.app_data.push(push_receiver::AppData {
+            key: "pairing".to_owned(),
+            value:
+                r#"{"ip":"127.0.0.1","port":28015,"playerId":42,"playerToken":7,"type":"server"}"#
+                    .to_owned(),
+        });
+        sender.send(Ok(notification)).await.expect("notification");
+
+        let pairing = source
+            .next()
+            .await
+            .expect("source result")
+            .expect("pairing");
+        assert_eq!(pairing.address().host(), "127.0.0.1");
+        assert_eq!(pairing.address().port(), 28015);
+        assert_eq!(
+            pairing.delivery_id().map(|delivery| delivery.as_str()),
+            Some("delivery-typed")
+        );
+        source.shutdown().await.expect("source shutdown");
+    }
+}

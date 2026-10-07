@@ -36,6 +36,8 @@ impl SessionConnector for RustPlusSessionConnector {
                 pairing.credentials().player_token().value(),
             );
             config.reconnect = reconnect;
+            #[cfg(test)]
+            let config = config.allow_insecure_for_tests();
             let client = rustplus_client::RustPlusClient::new(config).map_err(map_client_error)?;
             let mut readiness = client.subscribe_readiness();
             let events = client.subscribe_events();
@@ -173,7 +175,8 @@ fn endpoint(pairing: &Pairing) -> Result<String, AdapterError> {
     } else {
         host.to_owned()
     };
-    Ok(format!("wss://{host}:{}", pairing.address().port()))
+    let scheme = if cfg!(test) { "ws" } else { "wss" };
+    Ok(format!("{scheme}://{host}:{}", pairing.address().port()))
 }
 
 fn map_readiness(readiness: rustplus_client::Readiness, driver_alive: bool) -> SessionReadiness {
@@ -197,5 +200,157 @@ fn map_client_error(error: rustplus_client::Error) -> SessionError {
         }
         rustplus_client::Error::Api(_) => SessionError::InvalidCredentials,
         _ => SessionError::Protocol,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use bot_application::{SessionConnector, SessionEvent, SessionReadiness};
+    use bot_domain::{Pairing, PlayerCredentials, PlayerId, PlayerToken, ServerAddress};
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    fn fixture(name: &str) -> Vec<u8> {
+        include_str!("../../rustplus-client/tests/fixtures/legacy-wire.txt")
+            .lines()
+            .find_map(|line| {
+                let (key, bytes) = line.split_once(" = ")?;
+                (key == name).then(|| {
+                    bytes
+                        .split_whitespace()
+                        .map(|byte| u8::from_str_radix(byte, 16).expect("fixture byte"))
+                        .collect()
+                })
+            })
+            .expect("fixture entry")
+    }
+
+    fn pairing(port: u16) -> Pairing {
+        Pairing::new(
+            ServerAddress::new("127.0.0.1", port).expect("address"),
+            PlayerCredentials::new(PlayerId::new(42).expect("player"), PlayerToken::new(7)),
+            None,
+            None,
+        )
+    }
+
+    async fn server(
+        connections: usize,
+        close_after_info: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
+        let endpoint = format!("ws://{}/", listener.local_addr().expect("address"));
+        let task = tokio::spawn(async move {
+            for _ in 0..connections {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut socket) = accept_async(stream).await else {
+                    return;
+                };
+                let Some(Ok(Message::Binary(data))) = socket.next().await else {
+                    return;
+                };
+                let mut response = fixture("response_success");
+                if let Some(sequence) = data.get(1) {
+                    response[3] = *sequence;
+                }
+                let _ = socket.send(Message::Binary(response.into())).await;
+                if close_after_info {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    let _ = socket.close(None).await;
+                } else {
+                    while socket.next().await.is_some() {}
+                }
+            }
+        });
+        (endpoint, task)
+    }
+
+    fn policy(max_attempts: u32) -> rustplus_client::ReconnectPolicy {
+        rustplus_client::ReconnectPolicy {
+            max_attempts,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter_percent: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn reaches_ready_after_info_and_shutdown_joins() {
+        let (endpoint, server_task) = server(1, false).await;
+        let port = endpoint
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.trim_end_matches('/').parse().ok())
+            .expect("port");
+        let connector = RustPlusSessionConnector::new(policy(0)).expect("connector");
+        let mut handle = connector.connect(&pairing(port)).await.expect("connected");
+        assert_eq!(handle.readiness(), SessionReadiness::Ready);
+        tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+            .await
+            .expect("shutdown bound")
+            .expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server join bound")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn connection_drop_reports_reconnecting() {
+        let (endpoint, server_task) = server(1, true).await;
+        let port = endpoint
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.trim_end_matches('/').parse().ok())
+            .expect("port");
+        let connector = RustPlusSessionConnector::new(policy(1)).expect("connector");
+        let mut handle = connector.connect(&pairing(port)).await.expect("connected");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+                .await
+                .expect("event bound")
+                .expect("event"),
+            Some(SessionEvent::Reconnecting)
+        );
+        tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+            .await
+            .expect("shutdown bound")
+            .expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server join bound")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn reconnect_exhaustion_reports_terminal_event() {
+        let (endpoint, server_task) = server(1, true).await;
+        let port = endpoint
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.trim_end_matches('/').parse().ok())
+            .expect("port");
+        let connector = RustPlusSessionConnector::new(policy(0)).expect("connector");
+        let mut handle = connector.connect(&pairing(port)).await.expect("connected");
+        let first = tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("event bound")
+            .expect("event");
+        let event = if matches!(first, Some(SessionEvent::Terminated { .. })) {
+            first
+        } else {
+            tokio::time::timeout(Duration::from_secs(1), handle.next_event())
+                .await
+                .expect("terminal bound")
+                .expect("terminal event")
+        };
+        assert!(matches!(event, Some(SessionEvent::Terminated { .. })));
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server join bound")
+            .expect("server task");
     }
 }

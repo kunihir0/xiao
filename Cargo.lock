@@ -160,6 +160,7 @@ name = "bot-application"
 version = "0.1.0"
 dependencies = [
  "bot-domain",
+ "bot-test-support",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -2232,12 +2233,14 @@ version = "0.1.0"
 dependencies = [
  "bot-application",
  "bot-domain",
+ "futures-util",
  "push-receiver",
  "rustplus-client",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tokio-util",
 ]
 

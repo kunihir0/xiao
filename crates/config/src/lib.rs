@@ -309,4 +309,43 @@ mod tests {
             assert_eq!(output.matches("[REDACTED]").count(), 2);
         }
     }
+
+    #[test]
+    fn absent_rustplus_configuration_is_disabled() {
+        let result = config(&[
+            ("DISCORD_TOKEN", "token"),
+            ("DATABASE_URL", "postgres://localhost/bot"),
+        ]);
+        assert!(result.is_ok());
+        if let Ok(config) = result {
+            assert!(config.rustplus().is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_rustplus_configuration_is_typed_and_redacted() {
+        let result = config(&[
+            ("DISCORD_TOKEN", "token"),
+            ("DATABASE_URL", "postgres://localhost/bot"),
+            ("RUSTPLUS_FCM_SENDER_ID", " "),
+        ]);
+        assert!(matches!(
+            result,
+            Err(ConfigError::Empty {
+                variable: "RUSTPLUS_FCM_SENDER_ID"
+            })
+        ));
+
+        let result = config(&[
+            ("DISCORD_TOKEN", "token"),
+            ("DATABASE_URL", "postgres://localhost/bot"),
+            ("RUSTPLUS_FCM_SENDER_ID", "sender-secret"),
+        ]);
+        assert!(result.is_ok());
+        if let Ok(config) = result {
+            let debug = format!("{config:?}");
+            assert!(!debug.contains("sender-secret"));
+            assert_eq!(debug.matches("[REDACTED]").count(), 3);
+        }
+    }
 }
