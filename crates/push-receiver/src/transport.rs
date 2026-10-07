@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
-use reqwest::Client;
+use reqwest::{Client, Response};
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -23,7 +23,33 @@ use crate::{
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
+async fn bounded_body(mut response: Response, maximum: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(Error::FrameTooLarge {
+            actual: response.content_length().unwrap_or(u64::MAX) as usize,
+            max: maximum,
+        });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| Error::Http(error.to_string()))?
+    {
+        let actual = body.len().saturating_add(chunk.len());
+        if actual > maximum {
+            return Err(Error::FrameTooLarge {
+                actual,
+                max: maximum,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 /// A connected, authenticated MCS session. Implementations own their socket and
 /// must not spawn work outside the returned futures.
 pub trait McsSession: Send {
@@ -123,10 +149,7 @@ impl FcmConnector {
             .map_err(|error| Error::Http(error.to_string()))?
             .error_for_status()
             .map_err(|error| Error::Http(error.to_string()))?;
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| Error::Http(error.to_string()))?;
+        let body = bounded_body(response, crate::MAX_FRAME_SIZE).await?;
         let result = parse_checkin_response(&body)?;
         let form = [
             ("app", "org.chromium.linux".to_owned()),
@@ -148,10 +171,8 @@ impl FcmConnector {
             .map_err(|error| Error::Http(error.to_string()))?
             .error_for_status()
             .map_err(|error| Error::Http(error.to_string()))?;
-        let registration_body = registration
-            .text()
-            .await
-            .map_err(|error| Error::Http(error.to_string()))?;
+        let registration_body = String::from_utf8(bounded_body(registration, 4096).await?)
+            .map_err(|_| Error::InvalidRegistration("registration response is not UTF-8".into()))?;
         parse_registration_response(&registration_body)?;
         self.credentials = Some(result.credentials);
         Ok(result.credentials)
