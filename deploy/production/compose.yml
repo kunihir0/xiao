@@ -1,0 +1,41 @@
+# Production application only. PostgreSQL is provisioned and backed up separately.
+# Set XIAO_IMAGE to an immutable registry reference (tag plus digest), never :latest.
+services:
+  bot:
+    image: "${XIAO_IMAGE:?set XIAO_IMAGE to an immutable image digest}"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DISCORD_TOKEN: "${DISCORD_TOKEN:?set DISCORD_TOKEN through the deployment secret manager}"
+      DATABASE_URL: "${DATABASE_URL:?set DATABASE_URL through the deployment secret manager}"
+      RUST_LOG: "${RUST_LOG:-info}"
+      TELEMETRY_FORMAT: "${TELEMETRY_FORMAT:-json}"
+      RUSTPLUS_FCM_SENDER_ID: "${RUSTPLUS_FCM_SENDER_ID:-}"
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      # There is deliberately no HTTP health server. PID 1 is healthy while alive;
+      # migration/readiness failures make the process exit and trigger a restart.
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
