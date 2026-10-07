@@ -73,6 +73,7 @@ pub struct ClientConfig {
     pub event_capacity: usize,
     pub rate_policy: RatePolicy,
     pub reconnect: ReconnectPolicy,
+    #[cfg(feature = "insecure-test-transport")]
     insecure_test_transport: bool,
 }
 impl std::fmt::Debug for ClientConfig {
@@ -103,9 +104,11 @@ impl ClientConfig {
             event_capacity: DEFAULT_EVENTS,
             rate_policy: RatePolicy::default(),
             reconnect: ReconnectPolicy::default(),
+            #[cfg(feature = "insecure-test-transport")]
             insecure_test_transport: false,
         }
     }
+    #[cfg(feature = "insecure-test-transport")]
     #[must_use]
     pub fn allow_insecure_for_tests(mut self) -> Self {
         self.insecure_test_transport = true;
@@ -114,8 +117,18 @@ impl ClientConfig {
     fn validate(&self) -> Result<()> {
         let endpoint = Url::parse(&self.endpoint).map_err(|_| Error::InvalidEndpoint)?;
         let secure = endpoint.scheme() == "wss";
+        let allow_insecure = {
+            #[cfg(feature = "insecure-test-transport")]
+            {
+                self.insecure_test_transport
+            }
+            #[cfg(not(feature = "insecure-test-transport"))]
+            {
+                false
+            }
+        };
         if !secure
-            && !(self.insecure_test_transport
+            && !(allow_insecure
                 && endpoint.scheme() == "ws"
                 && endpoint.host_str().is_some_and(|host| {
                     host == "localhost" || host == "127.0.0.1" || host == "::1"

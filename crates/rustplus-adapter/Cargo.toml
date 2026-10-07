@@ -18,7 +18,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
 tokio-util = { workspace = true, features = ["rt"] }
+url.workspace = true
 
 [dev-dependencies]
 futures-util = "0.3.34"
+rustplus-client = { path = "../rustplus-client", features = ["insecure-test-transport"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }

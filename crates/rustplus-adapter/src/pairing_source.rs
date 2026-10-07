@@ -75,9 +75,8 @@ mod tests {
             push_receiver::Notification::new(Vec::new(), Some("delivery-typed".to_owned()));
         notification.app_data.push(push_receiver::AppData {
             key: "pairing".to_owned(),
-            value:
-                r#"{"ip":"127.0.0.1","port":28015,"playerId":42,"playerToken":7,"type":"server"}"#
-                    .to_owned(),
+            value: r#"{"ip":"8.8.8.8","port":28015,"playerId":42,"playerToken":7,"type":"server"}"#
+                .to_owned(),
         });
         sender.send(Ok(notification)).await.expect("notification");
 
@@ -86,7 +85,7 @@ mod tests {
             .await
             .expect("source result")
             .expect("pairing");
-        assert_eq!(pairing.address().host(), "127.0.0.1");
+        assert_eq!(pairing.address().host(), "8.8.8.8");
         assert_eq!(pairing.address().port(), 28015);
         assert_eq!(
             pairing.delivery_id().map(|delivery| delivery.as_str()),

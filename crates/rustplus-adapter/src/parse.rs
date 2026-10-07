@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use bot_domain::{
     DeliveryId, EntityId, EntityPairing, Pairing, PlayerCredentials, PlayerId, PlayerToken,
@@ -146,30 +146,86 @@ fn parse_u32(value: U64Like, field: &'static str) -> Result<u32, ParseError> {
     u32::try_from(parse_u64(value, field)?).map_err(|_| ParseError::Numeric(field))
 }
 fn validate_address(host: String, port: u16) -> Result<ServerAddress, ParseError> {
+    let address = parse_public_ip(&host)?;
+    ServerAddress::new(address.to_string(), port).map_err(|_| ParseError::Domain("ip"))
+}
+
+pub(crate) fn parse_public_ip(host: &str) -> Result<IpAddr, ParseError> {
     if host.is_empty()
-        || host
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
-        || host.contains("//")
-        || host.contains('/')
-        || host.contains('?')
-        || host.contains('#')
+        || host.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '@' | '/' | '\\' | '?' | '#' | '%')
+        })
     {
         return Err(ParseError::Invalid("ip"));
     }
-    if host.contains(':')
-        && host
-            .parse::<IpAddr>()
-            .map_or(true, |address| !address.is_ipv6())
-    {
-        return Err(ParseError::Invalid("ip"));
+    let literal = host
+        .strip_prefix('[')
+        .map_or(host, |value| value.strip_suffix(']').unwrap_or(""));
+    if literal.is_empty() || host.starts_with('[') != host.ends_with(']') {
+        return Err(ParseError::HostNotIpLiteral);
     }
-    ServerAddress::new(host, port).map_err(|_| ParseError::Domain("ip"))
+    let address = literal
+        .parse::<IpAddr>()
+        .map_err(|_| ParseError::HostNotIpLiteral)?;
+    if host.starts_with('[') && !address.is_ipv6() {
+        return Err(ParseError::HostNotIpLiteral);
+    }
+    if is_special_use(address) {
+        return Err(ParseError::SpecialUseIp);
+    }
+    Ok(address)
+}
+
+fn is_special_use(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_special_v4(address),
+        IpAddr::V6(address) => {
+            let octets = address.octets();
+            let mapped = address.to_ipv4();
+            let compatible = octets[..12] == [0; 12];
+            let six_to_four = address.segments()[0] == 0x2002;
+            let teredo = address.segments()[0] == 0x2001 && address.segments()[1] == 0;
+            address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || (address.segments()[0] & 0xfe00) == 0xfc00
+                || (address.segments()[0] & 0xffc0) == 0xfe80
+                || (u128::from(address) >> 96) == u128::from(0x2001_0db8_u32)
+                || mapped.is_some_and(is_special_v4)
+                || (compatible
+                    && is_special_v4(Ipv4Addr::from(octets[12..].try_into().unwrap_or([0; 4]))))
+                || (six_to_four
+                    && is_special_v4(Ipv4Addr::from([octets[2], octets[3], octets[4], octets[5]])))
+                || (teredo
+                    && is_special_v4(Ipv4Addr::from([
+                        !octets[12],
+                        !octets[13],
+                        !octets[14],
+                        !octets[15],
+                    ])))
+        }
+    }
+}
+
+fn is_special_v4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address == Ipv4Addr::BROADCAST
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_notification;
+    use super::{parse_notification, parse_public_ip};
     use crate::{ParseConfig, ParseError};
 
     #[test]
@@ -178,13 +234,13 @@ mod tests {
             push_receiver::Notification::new(Vec::new(), Some("delivery-1".to_owned()));
         notification.app_data.push(push_receiver::AppData {
             key: "not-body".to_owned(),
-            value: r#"{"ip":"::1","port":"1234","playerId":42,"playerToken":"-7","type":"server"}"#
+            value: r#"{"ip":"[2001:4860:4860::8888]","port":"1234","playerId":42,"playerToken":"-7","type":"server"}"#
                 .to_owned(),
         });
         let Some(pairing) = parse_notification(&notification, &ParseConfig::default())? else {
             return Err(ParseError::Invalid("pairing"));
         };
-        assert_eq!(pairing.address().host(), "::1");
+        assert_eq!(pairing.address().host(), "2001:4860:4860::8888");
         assert_eq!(pairing.address().port(), 1234);
         assert_eq!(pairing.credentials().player_id().value(), 42);
         assert_eq!(pairing.credentials().player_token().value(), -7);
@@ -212,7 +268,7 @@ mod tests {
     #[test]
     fn rejects_out_of_range_secret_without_exposing_body() -> Result<(), ParseError> {
         let mut notification = push_receiver::Notification::new(Vec::new(), None);
-        let body = r#"{"ip":"host","port":1234,"playerId":1,"playerToken":999999999999}"#;
+        let body = r#"{"ip":"8.8.8.8","port":1234,"playerId":1,"playerToken":999999999999}"#;
         notification.app_data.push(push_receiver::AppData {
             key: "x".to_owned(),
             value: body.to_owned(),
@@ -255,16 +311,16 @@ mod tests {
             },
             push_receiver::AppData {
                 key: "pairing".to_owned(),
-                value: server_body(r#""first.example""#, "28015", "42", "-7"),
+                value: server_body(r#""8.8.8.8""#, "28015", "42", "-7"),
             },
             push_receiver::AppData {
                 key: "pairing".to_owned(),
-                value: server_body(r#""second.example""#, "28016", "43", "-8"),
+                value: server_body(r#""1.1.1.1""#, "28016", "43", "-8"),
             },
         ]);
         let pairing = parse_notification(&notification, &ParseConfig::default())?
             .ok_or(ParseError::Missing("pairing"))?;
-        assert_eq!(pairing.address().host(), "first.example");
+        assert_eq!(pairing.address().host(), "8.8.8.8");
         assert_eq!(pairing.address().port(), 28015);
         Ok(())
     }
@@ -272,20 +328,20 @@ mod tests {
     #[test]
     fn rejects_port_and_token_values_outside_their_domains() {
         for (field, body) in [
-            ("port", server_body(r#""example.com""#, "0", "42", "7")),
-            ("port", server_body(r#""example.com""#, "-1", "42", "7")),
-            ("port", server_body(r#""example.com""#, "65536", "42", "7")),
+            ("port", server_body(r#""8.8.8.8""#, "0", "42", "7")),
+            ("port", server_body(r#""8.8.8.8""#, "-1", "42", "7")),
+            ("port", server_body(r#""8.8.8.8""#, "65536", "42", "7")),
             (
                 "port",
-                server_body(r#""example.com""#, "18446744073709551616", "42", "7"),
+                server_body(r#""8.8.8.8""#, "18446744073709551616", "42", "7"),
             ),
             (
                 "playerToken",
-                server_body(r#""example.com""#, "28015", "42", "2147483648"),
+                server_body(r#""8.8.8.8""#, "28015", "42", "2147483648"),
             ),
             (
                 "playerToken",
-                server_body(r#""example.com""#, "28015", "42", "-2147483649"),
+                server_body(r#""8.8.8.8""#, "28015", "42", "-2147483649"),
             ),
         ] {
             let result = parse_notification(&notification(&body), &ParseConfig::default());
@@ -303,7 +359,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_player_id() {
-        let body = server_body(r#""example.com""#, "28015", "0", "7");
+        let body = server_body(r#""8.8.8.8""#, "28015", "0", "7");
         assert!(matches!(
             parse_notification(&notification(&body), &ParseConfig::default()),
             Err(ParseError::Domain("playerId"))
@@ -323,14 +379,19 @@ mod tests {
             let body = server_body(host, "28015", "42", "7");
             assert!(matches!(
                 parse_notification(&notification(&body), &ParseConfig::default()),
-                Err(ParseError::Invalid("ip")) | Err(ParseError::Domain("ip"))
+                Err(ParseError::Invalid(_))
+                    | Err(ParseError::Domain(_))
+                    | Err(ParseError::HostNotIpLiteral)
+                    | Err(ParseError::SpecialUseIp)
+                    | Err(ParseError::Numeric(_))
+                    | Err(ParseError::Malformed)
             ));
         }
     }
 
     #[test]
     fn oversized_body_is_rejected_before_deserialization() {
-        let body = server_body(r#""example.com""#, "28015", "42", "7");
+        let body = server_body(r#""8.8.8.8""#, "28015", "42", "7");
         let config = ParseConfig {
             max_value_bytes: body.len() - 1,
             ..ParseConfig::default()
@@ -344,12 +405,55 @@ mod tests {
     #[test]
     fn token_never_appears_in_error_debug_or_display() {
         let secret = "2147483648";
-        let body = server_body(r#""example.com""#, "28015", "42", secret);
+        let body = server_body(r#""8.8.8.8""#, "28015", "42", secret);
         let result = parse_notification(&notification(&body), &ParseConfig::default());
         assert!(result.is_err());
         if let Err(error) = result {
             assert!(!format!("{error:?}").contains(secret));
             assert!(!error.to_string().contains(secret));
         }
+    }
+
+    #[test]
+    fn accepts_public_literals_and_rejects_special_or_hostname_hosts() {
+        for host in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+            "::ffff:10.0.0.1",
+            "2002:0a00:0001::1",
+        ] {
+            assert_eq!(
+                parse_public_ip(host),
+                Err(ParseError::SpecialUseIp),
+                "{host}"
+            );
+        }
+        for host in ["example.com", "8.8.8.8@evil", "8.8.8.8/path", "8.8.8.8%25"] {
+            assert!(
+                matches!(
+                    parse_public_ip(host),
+                    Err(ParseError::HostNotIpLiteral | ParseError::Invalid("ip"))
+                ),
+                "{host}"
+            );
+        }
+        assert!(parse_public_ip("8.8.8.8").is_ok());
+        assert!(parse_public_ip("2001:4860:4860::8888").is_ok());
+        assert!(parse_public_ip("[2001:4860:4860::8888]").is_ok());
     }
 }

@@ -8,6 +8,8 @@ pub enum ParseError {
     Invalid(&'static str),
     Numeric(&'static str),
     Domain(&'static str),
+    HostNotIpLiteral,
+    SpecialUseIp,
 }
 impl fmt::Display for ParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -18,6 +20,10 @@ impl fmt::Display for ParseError {
             Self::Invalid(field) => write!(formatter, "pairing field {field} is invalid"),
             Self::Numeric(field) => write!(formatter, "pairing field {field} is out of range"),
             Self::Domain(field) => write!(formatter, "pairing field {field} violates domain rules"),
+            Self::HostNotIpLiteral => formatter.write_str("pairing host is not an IP literal"),
+            Self::SpecialUseIp => {
+                formatter.write_str("pairing host uses a special-purpose IP range")
+            }
         }
     }
 }

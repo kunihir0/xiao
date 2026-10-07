@@ -4,10 +4,11 @@ use bot_application::{
     BoxFuture, SessionConnector, SessionError, SessionEvent, SessionHandle, SessionReadiness,
 };
 use bot_domain::Pairing;
-use tokio::{task::JoinHandle, time::timeout};
-use tokio_util::sync::CancellationToken;
+use tokio::time::timeout;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+use url::Url;
 
-use crate::AdapterError;
+use crate::{AdapterError, parse::parse_public_ip};
 
 pub struct RustPlusSessionConnector {
     reconnect: rustplus_client::ReconnectPolicy,
@@ -42,8 +43,9 @@ impl SessionConnector for RustPlusSessionConnector {
             let mut readiness = client.subscribe_readiness();
             let events = client.subscribe_events();
             let driver_client = client.clone();
-            let mut driver =
-                tokio::spawn(async move { driver_client.connect_with_reconnect().await });
+            let mut driver = AbortOnDropHandle::new(tokio::spawn(async move {
+                driver_client.connect_with_reconnect().await
+            }));
             loop {
                 if *readiness.borrow() == rustplus_client::Readiness::Ready {
                     return Ok(Box::new(RustPlusSessionHandle {
@@ -79,7 +81,7 @@ pub struct RustPlusSessionHandle {
     client: rustplus_client::RustPlusClient,
     readiness: tokio::sync::watch::Receiver<rustplus_client::Readiness>,
     events: rustplus_client::EventReceiver,
-    driver: Option<JoinHandle<rustplus_client::Result<()>>>,
+    driver: Option<AbortOnDropHandle<rustplus_client::Result<()>>>,
     cancellation: CancellationToken,
     shutdown_timeout: Duration,
 }
@@ -148,35 +150,33 @@ impl SessionHandle for RustPlusSessionHandle {
 impl Drop for RustPlusSessionHandle {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        if let Some(driver) = self.driver.take() {
-            driver.abort();
-        }
+        drop(self.driver.take());
     }
 }
 
 fn endpoint(pairing: &Pairing) -> Result<String, AdapterError> {
-    let host = pairing.address().host();
-    if host.is_empty()
-        || host
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
-        || host.contains('/')
-        || host.contains('?')
-        || host.contains('#')
-        || host.contains("//")
-    {
-        return Err(AdapterError::InvalidEndpoint);
-    }
-    let host = if host.contains(':') {
-        if host.parse::<std::net::Ipv6Addr>().is_err() {
-            return Err(AdapterError::InvalidEndpoint);
-        }
-        format!("[{host}]")
+    let address = if cfg!(test) {
+        pairing
+            .address()
+            .host()
+            .parse()
+            .map_err(|_| AdapterError::InvalidEndpoint)?
     } else {
-        host.to_owned()
+        parse_public_ip(pairing.address().host()).map_err(|_| AdapterError::InvalidEndpoint)?
     };
-    let scheme = if cfg!(test) { "ws" } else { "wss" };
-    Ok(format!("{scheme}://{host}:{}", pairing.address().port()))
+    let mut endpoint = Url::parse(if cfg!(test) {
+        "ws://127.0.0.1"
+    } else {
+        "wss://127.0.0.1"
+    })
+    .map_err(|_| AdapterError::InvalidEndpoint)?;
+    endpoint
+        .set_ip_host(address)
+        .map_err(|_| AdapterError::InvalidEndpoint)?;
+    endpoint
+        .set_port(Some(pairing.address().port()))
+        .map_err(|_| AdapterError::InvalidEndpoint)?;
+    Ok(endpoint.to_string())
 }
 
 fn map_readiness(readiness: rustplus_client::Readiness, driver_alive: bool) -> SessionReadiness {

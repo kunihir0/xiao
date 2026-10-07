@@ -16,10 +16,11 @@ fields are retained by the converters rather than silently discarded.
 
 Credentials are transmitted only after endpoint validation accepts `wss://`.
 The crate enables rustls with the bundled WebPKI roots and normal certificate
-verification. Plain `ws://` is rejected; the explicit
-`ClientConfig::allow_insecure_for_tests` escape hatch accepts only loopback
-endpoints and is intended for local transport tests. `ClientConfig` debug output
-redacts `player_token`.
+verification. Plain `ws://` is rejected in production. The
+`insecure-test-transport` Cargo feature is off by default and is enabled only
+by local transport tests; its `ClientConfig::allow_insecure_for_tests` method
+is unavailable to production builds and accepts only loopback endpoints.
+`ClientConfig` debug output redacts `player_token`.
 
 Rate policy uses bounded integer token capacity and a bounded `Duration` refill
 interval; invalid values are rejected before transport queues are allocated.

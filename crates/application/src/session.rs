@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    hash::{BuildHasher, RandomState},
     sync::Arc,
     time::Duration,
 };
@@ -23,6 +24,7 @@ pub enum SessionState {
     Ready,
     Reconnecting,
     Closing,
+    Failed { reason: SessionError },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,17 +85,31 @@ impl PairingServiceHandle {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct EntityKey {
+    id: u32,
+    kind: Option<String>,
+    name: Option<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct StructuralKey {
+    server: ServerId,
+    player_id: u64,
+    token_hash: u64,
+    entity: Option<EntityKey>,
+}
 struct DedupeEntry {
     at: Instant,
     delivery: Option<String>,
-    structural: String,
+    structural: StructuralKey,
 }
 struct WorkerRecord {
+    server: ServerId,
     session_id: SessionId,
     pairing: Pairing,
     state: SessionState,
     cancellation: CancellationToken,
-    finished: oneshot::Receiver<()>,
+    finished: oneshot::Receiver<Result<(), SessionError>>,
     abort: tokio::task::AbortHandle,
 }
 enum WorkerMessage {
@@ -114,6 +130,7 @@ pub struct PairingService<S, C> {
     worker_events: mpsc::Sender<WorkerMessage>,
     worker_rx: mpsc::Receiver<WorkerMessage>,
     workers: JoinSet<()>,
+    key_hasher: RandomState,
     sessions: HashMap<ServerId, WorkerRecord>,
     dedupe: VecDeque<DedupeEntry>,
     next_session_id: u64,
@@ -148,6 +165,7 @@ where
                 sessions: HashMap::new(),
                 dedupe: VecDeque::new(),
                 next_session_id: 0,
+                key_hasher: RandomState::new(),
             },
             PairingServiceHandle {
                 readiness: readiness_rx,
@@ -161,7 +179,10 @@ where
             self.readiness.send_replace(ServiceReadiness::Failed);
             return Err(ServiceError::Store(StoreError::Invalid(reason.to_owned())));
         }
-        self.store.load().await.map_err(ServiceError::Store)?;
+        if let Err(error) = self.store.load().await {
+            self.readiness.send_replace(ServiceReadiness::Failed);
+            return Err(ServiceError::Store(error));
+        }
         if self.source.readiness() == crate::SourceReadiness::Ready {
             self.readiness.send_replace(ServiceReadiness::Ready);
         }
@@ -191,7 +212,9 @@ where
         self.record_dedupe(&pairing);
         let server = pairing.server_id().clone();
         if let Some(record) = self.sessions.remove(&server) {
-            if record.pairing.same_credentials(&pairing) {
+            if record.pairing.same_credentials(&pairing)
+                && !matches!(record.state, SessionState::Failed { .. })
+            {
                 let stored = pairing.clone();
                 self.sessions
                     .insert(server.clone(), WorkerRecord { pairing, ..record });
@@ -222,7 +245,7 @@ where
         let worker_server = server.clone();
         let worker_cancellation = cancellation.clone();
         let worker = self.workers.spawn(async move {
-            run_worker(
+            let result = run_worker(
                 connector,
                 worker_pairing,
                 worker_server,
@@ -232,11 +255,12 @@ where
                 events,
             )
             .await;
-            let _ = finished_tx.send(());
+            let _ = finished_tx.send(result);
         });
         self.sessions.insert(
-            server,
+            server.clone(),
             WorkerRecord {
+                server,
                 session_id,
                 pairing,
                 state: SessionState::Connecting,
@@ -264,8 +288,15 @@ where
         match event {
             SessionEvent::Ready => record.state = SessionState::Ready,
             SessionEvent::Reconnecting => record.state = SessionState::Reconnecting,
-            SessionEvent::Disconnected | SessionEvent::Terminated { .. } => {
-                self.sessions.remove(&server);
+            SessionEvent::Disconnected => {
+                record.state = SessionState::Failed {
+                    reason: SessionError::Disconnected,
+                };
+            }
+            SessionEvent::Terminated { error } => {
+                record.state = SessionState::Failed {
+                    reason: error.unwrap_or(SessionError::Failed),
+                };
             }
             SessionEvent::Lagged { .. } => {}
         }
@@ -294,7 +325,7 @@ where
         {
             self.dedupe.pop_front();
         }
-        let structural = structural_key(pairing);
+        let structural = structural_key(pairing, &self.key_hasher);
         let delivery = pairing.delivery_id().map(|id| id.as_str().to_owned());
         self.dedupe.iter().any(|entry| {
             (delivery.is_some() && entry.delivery.as_deref() == delivery.as_deref())
@@ -308,7 +339,7 @@ where
         self.dedupe.push_back(DedupeEntry {
             at: Instant::now(),
             delivery: pairing.delivery_id().map(|id| id.as_str().to_owned()),
-            structural: structural_key(pairing),
+            structural: structural_key(pairing, &self.key_hasher),
         });
     }
     fn allocate_session_id(&mut self) -> SessionId {
@@ -317,47 +348,50 @@ where
     }
     async fn stop_record(&self, record: WorkerRecord, shutdown: bool) -> Result<(), ServiceError> {
         record.cancellation.cancel();
-        if timeout(self.config.shutdown_timeout, record.finished)
-            .await
-            .is_err()
-        {
-            record.abort.abort();
-            if shutdown {
-                return Err(ServiceError::ShutdownTimeout(self.config.shutdown_timeout));
+        match timeout(self.config.shutdown_timeout, record.finished).await {
+            Err(_) if shutdown => {
+                record.abort.abort();
+                Err(ServiceError::Session {
+                    server: record.server,
+                    source: SessionError::ShutdownTimeout(self.config.shutdown_timeout),
+                })
             }
+            Err(_) => {
+                record.abort.abort();
+                Ok(())
+            }
+            Ok(Ok(Ok(()))) | Ok(Err(_)) => Ok(()),
+            Ok(Ok(Err(error))) if shutdown => Err(ServiceError::Session {
+                server: record.server,
+                source: error,
+            }),
+            Ok(Ok(Err(_))) => Ok(()),
         }
-        Ok(())
     }
     async fn stop(&mut self) -> Result<(), ServiceError> {
         self.readiness.send_replace(ServiceReadiness::Stopping);
         let source_result = timeout(self.config.shutdown_timeout, self.source.shutdown()).await;
-        let mut timed_out = source_result.is_err();
         let records: Vec<_> = self.sessions.drain().map(|(_, record)| record).collect();
         self.publish_snapshots();
+        let mut failure = match source_result {
+            Err(_) => Some(ServiceError::ShutdownTimeout(self.config.shutdown_timeout)),
+            Ok(Err(error)) => Some(ServiceError::Source(error)),
+            Ok(Ok(())) => None,
+        };
         for record in records {
-            if self.stop_record(record, true).await.is_err() {
-                timed_out = true;
+            if failure.is_none() {
+                failure = self.stop_record(record, true).await.err();
+            } else {
+                let _ = self.stop_record(record, true).await;
             }
         }
         while self.workers.join_next().await.is_some() {}
-        if timed_out {
+        if let Some(error) = failure {
             self.readiness.send_replace(ServiceReadiness::Failed);
-            return Err(ServiceError::ShutdownTimeout(self.config.shutdown_timeout));
+            return Err(error);
         }
-        match source_result {
-            Ok(Ok(())) => {
-                self.readiness.send_replace(ServiceReadiness::Stopped);
-                Ok(())
-            }
-            Ok(Err(error)) => {
-                self.readiness.send_replace(ServiceReadiness::Failed);
-                Err(ServiceError::Source(error))
-            }
-            Err(_) => {
-                self.readiness.send_replace(ServiceReadiness::Failed);
-                Err(ServiceError::ShutdownTimeout(self.config.shutdown_timeout))
-            }
-        }
+        self.readiness.send_replace(ServiceReadiness::Stopped);
+        Ok(())
     }
     async fn fail(&mut self, error: ServiceError) -> Result<(), ServiceError> {
         self.readiness.send_replace(ServiceReadiness::Failed);
@@ -371,26 +405,18 @@ where
         Err(error)
     }
 }
-
-fn structural_key(pairing: &Pairing) -> String {
-    let entity = pairing
-        .entity()
-        .map(|entity| {
-            format!(
-                "{}:{}:{}",
-                entity.id().value(),
-                entity.kind().unwrap_or_default(),
-                entity.name().unwrap_or_default()
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        "{}:{}:{}:{}",
-        pairing.server_id().as_str(),
-        pairing.credentials().player_id().value(),
-        pairing.credentials().player_token().value(),
-        entity
-    )
+fn structural_key(pairing: &Pairing, key_hasher: &RandomState) -> StructuralKey {
+    let token_hash = key_hasher.hash_one(pairing.credentials().player_token().value());
+    StructuralKey {
+        server: pairing.server_id().clone(),
+        player_id: pairing.credentials().player_id().value(),
+        token_hash,
+        entity: pairing.entity().map(|entity| EntityKey {
+            id: entity.id().value(),
+            kind: entity.kind().map(str::to_owned),
+            name: entity.name().map(str::to_owned),
+        }),
+    }
 }
 
 async fn run_worker<C: SessionConnector + 'static>(
@@ -401,13 +427,29 @@ async fn run_worker<C: SessionConnector + 'static>(
     cancellation: CancellationToken,
     config: SessionConfig,
     events: mpsc::Sender<WorkerMessage>,
-) {
+) -> Result<(), SessionError> {
     let mut handle = tokio::select! {
-        _ = cancellation.cancelled() => return,
+        _ = cancellation.cancelled() => return Ok(()),
         result = timeout(config.connect_timeout, connector.connect(&pairing)) => match result {
             Ok(Ok(handle)) => handle,
-            Ok(Err(error)) => { let _ = events.send(WorkerMessage::Event { server, session_id, event: SessionEvent::Terminated { error: Some(error) } }).await; return; }
-            Err(_) => { let _ = events.send(WorkerMessage::Event { server, session_id, event: SessionEvent::Terminated { error: Some(SessionError::ConnectTimeout(config.connect_timeout)) } }).await; return; }
+            Ok(Err(error)) => {
+                let _ = events.send(WorkerMessage::Event {
+                    server,
+                    session_id,
+                    event: SessionEvent::Terminated { error: Some(error) },
+                }).await;
+                return Ok(());
+            }
+            Err(_) => {
+                let _ = events.send(WorkerMessage::Event {
+                    server,
+                    session_id,
+                    event: SessionEvent::Terminated {
+                        error: Some(SessionError::ConnectTimeout(config.connect_timeout)),
+                    },
+                }).await;
+                return Ok(());
+            }
         }
     };
     let _ = events
@@ -419,12 +461,77 @@ async fn run_worker<C: SessionConnector + 'static>(
         .await;
     loop {
         tokio::select! {
-            _ = cancellation.cancelled() => { let result = timeout(config.shutdown_timeout, handle.shutdown()).await; if let Ok(Err(error)) = result { let _ = events.send(WorkerMessage::Event { server: server.clone(), session_id, event: SessionEvent::Terminated { error: Some(error) }}).await; } else if result.is_err() { let _ = events.send(WorkerMessage::Event { server: server.clone(), session_id, event: SessionEvent::Terminated { error: Some(SessionError::ShutdownTimeout(config.shutdown_timeout)) }}).await; } return; }
+            _ = cancellation.cancelled() => {
+                let result = match timeout(config.shutdown_timeout, handle.shutdown()).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(SessionError::ShutdownTimeout(config.shutdown_timeout)),
+                };
+                if let Err(error) = &result {
+                    let _ = events.send(WorkerMessage::Event {
+                        server: server.clone(),
+                        session_id,
+                        event: SessionEvent::Terminated { error: Some(error.clone()) },
+                    }).await;
+                }
+                return result;
+            }
             result = handle.next_event() => match result {
-                Ok(Some(event)) => { let terminal = matches!(event, SessionEvent::Disconnected | SessionEvent::Terminated { .. }); if events.send(WorkerMessage::Event { server: server.clone(), session_id, event }).await.is_err() || terminal { return; } }
-                Ok(None) => { let _ = events.send(WorkerMessage::Event { server: server.clone(), session_id, event: SessionEvent::Terminated { error: None }}).await; return; }
-                Err(error) => { let _ = events.send(WorkerMessage::Event { server: server.clone(), session_id, event: SessionEvent::Terminated { error: Some(error) }}).await; return; }
+                Ok(Some(event)) => {
+                    let terminal = matches!(
+                        event,
+                        SessionEvent::Disconnected | SessionEvent::Terminated { .. }
+                    );
+                    if events.send(WorkerMessage::Event {
+                        server: server.clone(),
+                        session_id,
+                        event,
+                    }).await.is_err() || terminal {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => {
+                    let _ = events.send(WorkerMessage::Event {
+                        server: server.clone(),
+                        session_id,
+                        event: SessionEvent::Terminated { error: None },
+                    }).await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = events.send(WorkerMessage::Event {
+                        server: server.clone(),
+                        session_id,
+                        event: SessionEvent::Terminated { error: Some(error) },
+                    }).await;
+                    return Ok(());
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::structural_key;
+    use bot_domain::{Pairing, PlayerCredentials, PlayerId, PlayerToken, ServerAddress};
+    use std::hash::RandomState;
+
+    #[test]
+    fn structural_key_debug_does_not_retain_player_token() {
+        let Ok(address) = ServerAddress::new("8.8.8.8", 28_015) else {
+            return;
+        };
+        let Ok(player_id) = PlayerId::new(42) else {
+            return;
+        };
+        let pairing = Pairing::new(
+            address,
+            PlayerCredentials::new(player_id, PlayerToken::new(123_456_789)),
+            None,
+            None,
+        );
+        let key = structural_key(&pairing, &RandomState::new());
+        assert!(!format!("{key:?}").contains("123456789"));
     }
 }
