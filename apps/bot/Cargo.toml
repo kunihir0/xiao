@@ -16,3 +16,12 @@ bot-config = { path = "../../crates/config", version = "0.1.0" }
 bot-db = { path = "../../crates/db", version = "0.1.0" }
 bot-discord = { path = "../../crates/discord", version = "0.1.0" }
 bot-telemetry = { path = "../../crates/telemetry", version = "0.1.0" }
+bot-application = { version = "0.1.0", path = "../../crates/application" }
+rustplus-adapter = { version = "0.1.0", path = "../../crates/rustplus-adapter" }
+push-receiver = { version = "0.1.0", path = "../../crates/push-receiver" }
+rustplus-client = { version = "0.1.0", path = "../../crates/rustplus-client" }
+tracing.workspace = true
+
+[dev-dependencies]
+bot-test-support = { path = "../../crates/test-support", version = "0.1.0" }
+tokio = { workspace = true, features = ["test-util"] }

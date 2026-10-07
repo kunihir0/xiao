@@ -8,3 +8,12 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+bot-domain = { version = "0.1.0", path = "../domain" }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+bot-test-support = { path = "../test-support", version = "0.1.0" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

@@ -12,6 +12,19 @@ pub struct Config {
     discord_token: String,
     database_url: String,
     telemetry: TelemetryConfig,
+    rustplus: Option<RustPlusConfig>,
+}
+
+/// Optional Rust+ push receiver configuration.
+#[derive(Clone)]
+pub struct RustPlusConfig {
+    fcm_sender_id: String,
+}
+
+impl RustPlusConfig {
+    pub fn fcm_sender_id(&self) -> &str {
+        &self.fcm_sender_id
+    }
 }
 
 impl Config {
@@ -51,11 +64,20 @@ impl Config {
                 value: "TELEMETRY_FORMAT",
             })?;
 
+        let rustplus = optional(&mut lookup, "RUSTPLUS_FCM_SENDER_ID")?
+            .map(|fcm_sender_id| RustPlusConfig { fcm_sender_id });
+
         Ok(Self {
             discord_token,
             database_url,
             telemetry: TelemetryConfig { filter, format },
+            rustplus,
         })
+    }
+
+    /// Returns the optional Rust+ push receiver settings.
+    pub fn rustplus(&self) -> Option<&RustPlusConfig> {
+        self.rustplus.as_ref()
     }
 
     /// Returns the Discord credential for the Discord adapter.
@@ -81,6 +103,16 @@ impl Debug for Config {
             .field("discord_token", &REDACTED)
             .field("database_url", &REDACTED)
             .field("telemetry", &self.telemetry)
+            .field("rustplus", &self.rustplus.as_ref().map(|_| REDACTED))
+            .finish()
+    }
+}
+
+impl Debug for RustPlusConfig {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RustPlusConfig")
+            .field("fcm_sender_id", &REDACTED)
             .finish()
     }
 }
@@ -275,6 +307,45 @@ mod tests {
             assert!(!output.contains("super-secret-token"));
             assert!(!output.contains("password@"));
             assert_eq!(output.matches("[REDACTED]").count(), 2);
+        }
+    }
+
+    #[test]
+    fn absent_rustplus_configuration_is_disabled() {
+        let result = config(&[
+            ("DISCORD_TOKEN", "token"),
+            ("DATABASE_URL", "postgres://localhost/bot"),
+        ]);
+        assert!(result.is_ok());
+        if let Ok(config) = result {
+            assert!(config.rustplus().is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_rustplus_configuration_is_typed_and_redacted() {
+        let result = config(&[
+            ("DISCORD_TOKEN", "token"),
+            ("DATABASE_URL", "postgres://localhost/bot"),
+            ("RUSTPLUS_FCM_SENDER_ID", " "),
+        ]);
+        assert!(matches!(
+            result,
+            Err(ConfigError::Empty {
+                variable: "RUSTPLUS_FCM_SENDER_ID"
+            })
+        ));
+
+        let result = config(&[
+            ("DISCORD_TOKEN", "token"),
+            ("DATABASE_URL", "postgres://localhost/bot"),
+            ("RUSTPLUS_FCM_SENDER_ID", "sender-secret"),
+        ]);
+        assert!(result.is_ok());
+        if let Ok(config) = result {
+            let debug = format!("{config:?}");
+            assert!(!debug.contains("sender-secret"));
+            assert_eq!(debug.matches("[REDACTED]").count(), 3);
         }
     }
 }

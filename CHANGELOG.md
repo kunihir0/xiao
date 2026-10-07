@@ -25,3 +25,10 @@ All notable externally meaningful changes are documented here. Releases follow S
   authenticated check-in credentials, generated Web Push key material, MCS
   stream acknowledgements, negotiated heartbeats, bounded cancellation, and
   external `aesgcm` compatibility fixtures.
+- Added opt-in application-owned Rust+ pairing/session ports, bounded in-memory
+  pairing storage, push pairing parsing, and joined session shutdown. Live
+  pairing still requires external Facepunch push-token registration and FCM
+  credential persistence, which remain a follow-up.
+- Hardened Rust+ pairing endpoints to public IP literals with special-use
+  range rejection, gated insecure local transport behind a test-only feature,
+  and preserved typed shutdown/session failure propagation.

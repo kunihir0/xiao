@@ -9,6 +9,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+insecure-test-transport = []
+
 [dependencies]
 futures-util = "0.3.34"
 prost = "0.14.4"
