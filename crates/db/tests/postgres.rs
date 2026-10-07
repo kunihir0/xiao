@@ -63,9 +63,17 @@ async fn applies_pending_migrations_idempotently_and_sets_readiness()
             return Err("database should not be ready before migrations".into());
         }
 
+        let expected = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations"))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join("up.sql").is_file())
+            .count();
         let first = db.run_migrations().await?;
-        if first.applied() != 1 {
-            return Err(format!("expected one pending migration, got {}", first.applied()).into());
+        if expected == 0 || first.applied() != expected {
+            return Err(format!(
+                "expected all {expected} embedded migrations pending, got {}",
+                first.applied()
+            )
+            .into());
         }
         if db.is_ready() {
             return Err("database should not be ready before ping".into());
