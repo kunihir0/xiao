@@ -377,7 +377,6 @@ impl ReconnectPolicy {
         Ok(())
     }
 
-impl ReconnectPolicy {
     #[must_use]
     pub fn delay(&self, attempt: u32, jitter_percent: u8) -> Duration {
         self.delay_with_jitter(attempt, jitter_percent, 0)

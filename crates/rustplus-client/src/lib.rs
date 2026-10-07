@@ -14,7 +14,7 @@ pub mod camera;
 mod error;
 mod types;
 
-pub use client::{ClientConfig, EventReceiver, RustPlusClient};
+pub use client::{ClientConfig, EventReceiver, RustPlusClient, MAX_REQUEST_SIZE};
 pub use error::{Error, Result};
 pub use types::{
     CameraEntity, CameraEntityKind, CameraRays, ChatMessage, ClanInfo, ClanInvite, ClanMember,
@@ -173,6 +173,24 @@ mod tests {
         assert!(a <= policy.max_delay);
         assert!(b <= policy.max_delay);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn reconnect_policy_rejects_sub_millisecond_delays() {
+        let policy = ReconnectPolicy {
+            initial_delay: Duration::from_micros(999),
+            ..ReconnectPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+        let policy = ReconnectPolicy {
+            initial_delay: Duration::from_nanos(1_000_001),
+            max_delay: Duration::from_millis(2),
+            ..ReconnectPolicy::default()
+        };
+        assert_eq!(
+            policy.delay_with_jitter(0, 0, 0),
+            Duration::from_nanos(1_000_001)
+        );
     }
 
     #[test]

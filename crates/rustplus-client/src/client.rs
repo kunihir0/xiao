@@ -41,10 +41,11 @@ const DEFAULT_PENDING: usize = 128;
 const MAX_QUEUE: usize = 4096;
 const MAX_EVENTS: usize = 8192;
 const MAX_PENDING: usize = 8192;
-const MAX_RECONNECT_ATTEMPTS: u32 = 100;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
-const MAX_FRAME: usize = 2 * 1024 * 1024;
+/// Maximum encoded protobuf request accepted by the outbound queue.
+pub const MAX_REQUEST_SIZE: usize = 2 * 1024 * 1024;
+const MAX_FRAME: usize = MAX_REQUEST_SIZE;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 type PendingKey = (u64, u32);
@@ -126,15 +127,10 @@ impl ClientConfig {
             ));
         }
         self.rate_policy.validate().map_err(Error::InvalidConfig)?;
-        if self.reconnect.max_attempts > MAX_RECONNECT_ATTEMPTS
-            || self.reconnect.initial_delay.is_zero()
-            || self.reconnect.max_delay.is_zero()
-            || self.reconnect.initial_delay > self.reconnect.max_delay
-            || self.reconnect.max_delay > MAX_RECONNECT_DELAY
-            || self.reconnect.jitter_percent > 100
-        {
+        self.reconnect.validate().map_err(Error::InvalidConfig)?;
+        if self.reconnect.max_delay > MAX_RECONNECT_DELAY {
             return Err(Error::InvalidConfig(
-                "reconnect policy is outside the supported bounds",
+                "reconnect maximum delay is outside the supported bound",
             ));
         }
         Ok(())
@@ -271,18 +267,12 @@ impl Drop for RustPlusClient {
 }
 
 impl RustPlusClient {
-    #[must_use]
-    pub fn new(config: ClientConfig) -> Self {
-        let event_capacity = config.event_capacity.clamp(1, MAX_EVENTS);
+    pub fn new(config: ClientConfig) -> Result<Self> {
+        config.validate()?;
         let rate_policy = config.rate_policy;
-        let rate_policy = if rate_policy.validate().is_ok() {
-            rate_policy
-        } else {
-            RatePolicy::default()
-        };
-        let (events, _) = broadcast::channel(event_capacity);
+        let (events, _) = broadcast::channel(config.event_capacity);
         let (readiness, _) = watch::channel(Readiness::Disconnected);
-        Self {
+        Ok(Self {
             inner: Arc::new(Inner {
                 rate: AsyncMutex::new(RateLimiter::new(rate_policy)),
                 config,
@@ -301,35 +291,36 @@ impl RustPlusClient {
                 owner_count: std::sync::atomic::AtomicUsize::new(1),
                 stopped: std::sync::atomic::AtomicBool::new(false),
             }),
-        }
+        })
     }
 
     pub async fn connect(&self) -> Result<()> {
-        let _transition = self.inner.lifecycle.lock().await;
-        self.connect_locked().await
-    }
-    async fn connect_locked(&self) -> Result<()> {
         self.inner.config.validate()?;
-        self.inner.stopped.store(false, Ordering::Release);
-        if let Ok(mut child_error) = self.inner.child_error.lock() {
-            *child_error = None;
-        }
-        if let Ok(mut signal) = self.inner.disconnect_signal.lock() {
-            *signal = CancellationToken::new();
-        }
-        if self.is_ready() {
-            return Ok(());
-        }
-        self.inner.readiness.send_replace(Readiness::Connecting);
+        let disconnect_signal = {
+            let _transition = self.inner.lifecycle.lock().await;
+            if self.is_ready() {
+                return Ok(());
+            }
+            self.inner.stopped.store(false, Ordering::Release);
+            if let Ok(mut child_error) = self.inner.child_error.lock() {
+                *child_error = None;
+            }
+            let signal = CancellationToken::new();
+            if let Ok(mut current) = self.inner.disconnect_signal.lock() {
+                *current = signal.clone();
+            } else {
+                return Err(Error::ShuttingDown);
+            }
+            self.inner.readiness.send_replace(Readiness::Connecting);
+            signal
+        };
+        self.connect_transport(disconnect_signal).await
+    }
+
+    async fn connect_transport(&self, disconnect_signal: CancellationToken) -> Result<()> {
         let ws_config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_FRAME));
-        let disconnect_signal = self
-            .inner
-            .disconnect_signal
-            .lock()
-            .ok()
-            .map(|signal| signal.clone());
         let stream = tokio::select! {
             result = connect_async_with_config(
                 self.inner.config.endpoint.as_str(),
@@ -346,17 +337,17 @@ impl RustPlusClient {
                 self.inner.readiness.send_replace(Readiness::Disconnected);
                 return Err(Error::ShuttingDown);
             },
-            _ = async {
-                if let Some(signal) = disconnect_signal {
-                    signal.cancelled().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
+            _ = disconnect_signal.cancelled() => {
                 self.inner.readiness.send_replace(Readiness::Disconnected);
                 return Err(Error::ShuttingDown);
             }
         };
+        let transition = self.inner.lifecycle.lock().await;
+        if disconnect_signal.is_cancelled() || self.inner.stopped.load(Ordering::Acquire) {
+            self.inner.readiness.send_replace(Readiness::Disconnected);
+            return Err(Error::ShuttingDown);
+        }
+        
         let generation = self
             .inner
             .generation
@@ -443,6 +434,7 @@ impl RustPlusClient {
             cancellation.cancel();
             return Err(Error::ShuttingDown);
         }
+        drop(transition);
         if let Err(error) = self.send_request_inner(Request::Info, false).await {
             cancellation.cancel();
             self.abort_supervisor().await;
@@ -484,26 +476,23 @@ impl RustPlusClient {
             .lock()
             .ok()
             .and_then(|mut task| task.take());
+        let mut shutdown_error = None;
         if let Some(mut task_handle) = task.take() {
             match timeout(SHUTDOWN_TIMEOUT, &mut task_handle).await {
                 Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => return Err(error),
-                Ok(Err(_)) => return Err(Error::ShuttingDown),
+                Ok(Ok(Err(error))) => shutdown_error = Some(error),
+                Ok(Err(_)) => shutdown_error = Some(Error::ShuttingDown),
                 Err(_) => {
                     task_handle.abort();
                     let _ = timeout(SHUTDOWN_TIMEOUT, &mut task_handle).await;
-                    if let Some(generation) = generation {
+                    if let Some(generation) = generation.as_ref() {
                         fail_pending_generation(
                             &self.inner.pending,
-                            generation,
+                            *generation,
                             Error::ShuttingDown,
                         );
                     }
-                    if let Ok(mut sender) = self.inner.outbound.lock() {
-                        *sender = None;
-                    }
-                    self.inner.readiness.send_replace(Readiness::Disconnected);
-                    return Err(Error::ShutdownTimeout(SHUTDOWN_TIMEOUT));
+                    shutdown_error = Some(Error::ShutdownTimeout(SHUTDOWN_TIMEOUT));
                 }
             }
         }
@@ -511,10 +500,14 @@ impl RustPlusClient {
             *sender = None;
         }
         if let Some(generation) = generation {
-            fail_pending_generation(&self.inner.pending, generation, Error::Disconnected);
+            fail_pending_generation(
+                &self.inner.pending,
+                generation,
+                shutdown_error.clone().unwrap_or(Error::Disconnected),
+            );
         }
         self.inner.readiness.send_replace(Readiness::Disconnected);
-        Ok(())
+        shutdown_error.map_or(Ok(()), Err)
     }
 
     async fn abort_supervisor(&self) {

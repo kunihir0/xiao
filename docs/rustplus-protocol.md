@@ -23,6 +23,11 @@ redacts `player_token`.
 
 Rate policy uses bounded integer token capacity and a bounded `Duration` refill
 interval; invalid values are rejected before transport queues are allocated.
+
+`RustPlusClient::new` validates endpoint, queue, pending, event, rate, and
+reconnect bounds before allocating channels; callers must handle its typed
+configuration error. Encoded outbound requests are capped at 2 MiB and return
+`Error::RequestTooLarge` before entering the bounded queue.
 Queue capacity and independent pending-request capacity are bounded. Request
 keys include a monotonically increasing connection generation, and sequence
 exhaustion/collisions are rejected; late responses from old sessions cannot
