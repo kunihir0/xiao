@@ -5,3 +5,5 @@ request_info = 08 01 10 2a 18 07 42 00
 response_success = 0a 04 08 01 22 00
 # Truncated AppMessage (must return Decode error, never panic)
 malformed_truncated = 0a 04 08
+# Independent camera ray sample (2x2 frame, first ray token)
+camera_2x2_single_ray = ff 00 00 00

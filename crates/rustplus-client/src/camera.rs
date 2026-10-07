@@ -274,3 +274,32 @@ impl IndexGenerator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_sample_position_fixture_places_first_ray() {
+        let fixture = include_str!("../tests/fixtures/legacy-wire.txt");
+        let encoded = fixture
+            .lines()
+            .find_map(|line| line.strip_prefix("camera_2x2_single_ray = "))
+            .expect("camera fixture");
+        let ray_data = encoded
+            .split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).expect("hex fixture"))
+            .collect::<Vec<_>>();
+        let mut frame = FrameBuilder::new(2, 2).expect("valid dimensions");
+        let decoded = frame
+            .ingest(&CameraRays {
+                vertical_fov: 1.0,
+                sample_offset: 0,
+                ray_data,
+                distance: 1.0,
+            })
+            .expect("valid ray fixture");
+        assert_eq!(decoded, 1);
+        assert_eq!(&frame.image().rgba[4..8], &[38, 38, 38, 255]);
+    }
+}
