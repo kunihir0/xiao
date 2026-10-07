@@ -9,6 +9,7 @@ struct State {
     rows: Vec<Pairing>,
     upserts: Vec<Pairing>,
     removals: Vec<ServerId>,
+    load_error: Option<StoreError>,
 }
 
 #[derive(Clone, Default)]
@@ -17,6 +18,19 @@ pub struct FakePairingStore {
 }
 
 impl FakePairingStore {
+    /// Creates a store that already holds persisted pairings, modelling a restart.
+    pub fn with_rows(rows: Vec<Pairing>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State {
+                rows,
+                ..State::default()
+            })),
+        }
+    }
+    /// Makes every subsequent `load` fail with `error`.
+    pub async fn fail_load(&self, error: StoreError) {
+        self.state.lock().await.load_error = Some(error);
+    }
     pub async fn rows(&self) -> Vec<Pairing> {
         self.state.lock().await.rows.clone()
     }
@@ -30,7 +44,13 @@ impl FakePairingStore {
 
 impl PairingStore for FakePairingStore {
     fn load<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Pairing>, StoreError>> {
-        Box::pin(async move { Ok(self.state.lock().await.rows.clone()) })
+        Box::pin(async move {
+            let state = self.state.lock().await;
+            match &state.load_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(state.rows.clone()),
+            }
+        })
     }
     fn upsert<'a>(&'a self, pairing: &'a Pairing) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {

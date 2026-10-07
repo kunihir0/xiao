@@ -1,6 +1,7 @@
 //! Validated application configuration.
 
 use std::fmt::{self, Debug, Display, Formatter};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use url::Url;
 
@@ -15,16 +16,118 @@ pub struct Config {
     rustplus: Option<RustPlusConfig>,
 }
 
-/// Optional Rust+ push receiver configuration.
+/// Rust+ companion configuration. Opt-in: every variable in
+/// [`RUSTPLUS_VARIABLES`] must be set together, or none of them.
 #[derive(Clone)]
 pub struct RustPlusConfig {
     fcm_sender_id: String,
+    steam_id: u64,
+    steam_auth_token_file: PathBuf,
+    keyring_file: PathBuf,
+    active_key_id: String,
 }
+
+/// Environment variables that together enable Rust+ pairing.
+pub const RUSTPLUS_VARIABLES: [&str; 5] = [
+    "RUSTPLUS_FCM_SENDER_ID",
+    "RUSTPLUS_STEAM_ID",
+    "RUSTPLUS_STEAM_AUTH_TOKEN_FILE",
+    "SECRET_KEYRING_FILE",
+    "SECRET_ACTIVE_KEY_ID",
+];
 
 impl RustPlusConfig {
     pub fn fcm_sender_id(&self) -> &str {
         &self.fcm_sender_id
     }
+
+    /// Steam account (SteamID64) that owns the companion registration.
+    pub const fn steam_id(&self) -> u64 {
+        self.steam_id
+    }
+
+    /// Owner-only file holding the operator-supplied Rust+ companion auth
+    /// token. Read only when a registration is required.
+    pub fn steam_auth_token_file(&self) -> &Path {
+        &self.steam_auth_token_file
+    }
+
+    /// Owner-only key-encryption keyring file (`key_id:hex32` lines).
+    pub fn keyring_file(&self) -> &Path {
+        &self.keyring_file
+    }
+
+    /// Key id used to wrap newly written data keys.
+    pub fn active_key_id(&self) -> &str {
+        &self.active_key_id
+    }
+
+    fn from_lookup<F>(lookup: &mut F) -> Result<Option<Self>, ConfigError>
+    where
+        F: FnMut(&'static str) -> Result<Option<String>, ConfigError>,
+    {
+        let mut values = Vec::with_capacity(RUSTPLUS_VARIABLES.len());
+        for variable in RUSTPLUS_VARIABLES {
+            values.push(optional(lookup, variable)?);
+        }
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if let Some(index) = values.iter().position(Option::is_none) {
+            return Err(ConfigError::PartialRustPlus {
+                missing: RUSTPLUS_VARIABLES[index],
+            });
+        }
+        let mut values = values.into_iter().flatten();
+        let mut next = || values.next().unwrap_or_default();
+        let fcm_sender_id = next();
+        let steam_id = next();
+        let steam_auth_token_file = next();
+        let keyring_file = next();
+        let active_key_id = next();
+
+        let steam_id = steam_id
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(ConfigError::InvalidRustPlus {
+                variable: "RUSTPLUS_STEAM_ID",
+                reason: "expected a non-zero SteamID64",
+            })?;
+        let active_key_id = active_key_id.trim().to_owned();
+        if active_key_id.len() > 64
+            || !active_key_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ConfigError::InvalidRustPlus {
+                variable: "SECRET_ACTIVE_KEY_ID",
+                reason: "expected 1-64 characters from [A-Za-z0-9._-]",
+            });
+        }
+        let steam_auth_token_file =
+            absolute_path("RUSTPLUS_STEAM_AUTH_TOKEN_FILE", steam_auth_token_file)?;
+        let keyring_file = absolute_path("SECRET_KEYRING_FILE", keyring_file)?;
+        Ok(Some(Self {
+            fcm_sender_id,
+            steam_id,
+            steam_auth_token_file,
+            keyring_file,
+            active_key_id,
+        }))
+    }
+}
+
+fn absolute_path(variable: &'static str, value: String) -> Result<PathBuf, ConfigError> {
+    let path = PathBuf::from(value.trim());
+    if !path.is_absolute() {
+        return Err(ConfigError::InvalidRustPlus {
+            variable,
+            reason: "expected an absolute file path",
+        });
+    }
+    Ok(path)
 }
 
 impl Config {
@@ -64,8 +167,7 @@ impl Config {
                 value: "TELEMETRY_FORMAT",
             })?;
 
-        let rustplus = optional(&mut lookup, "RUSTPLUS_FCM_SENDER_ID")?
-            .map(|fcm_sender_id| RustPlusConfig { fcm_sender_id });
+        let rustplus = RustPlusConfig::from_lookup(&mut lookup)?;
 
         Ok(Self {
             discord_token,
@@ -113,6 +215,10 @@ impl Debug for RustPlusConfig {
         formatter
             .debug_struct("RustPlusConfig")
             .field("fcm_sender_id", &REDACTED)
+            .field("steam_id", &self.steam_id)
+            .field("steam_auth_token_file", &self.steam_auth_token_file)
+            .field("keyring_file", &self.keyring_file)
+            .field("active_key_id", &self.active_key_id)
             .finish()
     }
 }
@@ -163,6 +269,13 @@ pub enum ConfigError {
     InvalidDatabaseUrl { reason: &'static str },
     /// The telemetry output format is not supported.
     InvalidTelemetryFormat { value: &'static str },
+    /// Only some of the Rust+ variables were set; the group is all-or-nothing.
+    PartialRustPlus { missing: &'static str },
+    /// A Rust+ variable was set to an unusable value.
+    InvalidRustPlus {
+        variable: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl Display for ConfigError {
@@ -186,6 +299,13 @@ impl Display for ConfigError {
             }
             Self::InvalidTelemetryFormat { value } => {
                 write!(formatter, "unsupported telemetry format in {value}")
+            }
+            Self::PartialRustPlus { missing } => write!(
+                formatter,
+                "incomplete Rust+ configuration: {missing} is required when any Rust+ variable is set"
+            ),
+            Self::InvalidRustPlus { variable, reason } => {
+                write!(formatter, "invalid {variable}: {reason}")
             }
         }
     }
@@ -322,30 +442,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn invalid_rustplus_configuration_is_typed_and_redacted() {
-        let result = config(&[
-            ("DISCORD_TOKEN", "token"),
-            ("DATABASE_URL", "postgres://localhost/bot"),
-            ("RUSTPLUS_FCM_SENDER_ID", " "),
-        ]);
-        assert!(matches!(
-            result,
-            Err(ConfigError::Empty {
-                variable: "RUSTPLUS_FCM_SENDER_ID"
-            })
-        ));
+    const RUSTPLUS: [(&str, &str); 5] = [
+        ("RUSTPLUS_FCM_SENDER_ID", "sender-secret"),
+        ("RUSTPLUS_STEAM_ID", "76561198000000001"),
+        (
+            "RUSTPLUS_STEAM_AUTH_TOKEN_FILE",
+            "/run/secrets/rustplus_token",
+        ),
+        ("SECRET_KEYRING_FILE", "/run/secrets/keyring"),
+        ("SECRET_ACTIVE_KEY_ID", "key-2026-10"),
+    ];
 
-        let result = config(&[
+    fn with_rustplus(
+        overrides: &[(&'static str, &'static str)],
+        omit: Option<&str>,
+    ) -> Result<Config, ConfigError> {
+        let mut values = vec![
             ("DISCORD_TOKEN", "token"),
             ("DATABASE_URL", "postgres://localhost/bot"),
-            ("RUSTPLUS_FCM_SENDER_ID", "sender-secret"),
-        ]);
+        ];
+        for (name, value) in RUSTPLUS {
+            if Some(name) == omit {
+                continue;
+            }
+            let value = overrides
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map_or(value, |(_, value)| *value);
+            values.push((name, value));
+        }
+        config(&values)
+    }
+
+    #[test]
+    fn complete_rustplus_configuration_is_typed_and_redacted() {
+        let result = with_rustplus(&[], None);
         assert!(result.is_ok());
         if let Ok(config) = result {
+            let rustplus = config.rustplus();
+            assert!(rustplus.is_some());
+            if let Some(rustplus) = rustplus {
+                assert_eq!(rustplus.steam_id(), 76_561_198_000_000_001);
+                assert_eq!(rustplus.active_key_id(), "key-2026-10");
+                assert_eq!(
+                    rustplus.keyring_file(),
+                    std::path::Path::new("/run/secrets/keyring")
+                );
+            }
             let debug = format!("{config:?}");
             assert!(!debug.contains("sender-secret"));
             assert_eq!(debug.matches("[REDACTED]").count(), 3);
         }
+    }
+
+    #[test]
+    fn partial_rustplus_configuration_is_a_typed_error() {
+        for (missing, _) in RUSTPLUS {
+            assert_eq!(
+                with_rustplus(&[], Some(missing)).err(),
+                Some(ConfigError::PartialRustPlus { missing }),
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_rustplus_values_are_rejected() {
+        let cases: [(&'static str, &'static str); 6] = [
+            ("RUSTPLUS_STEAM_ID", "0"),
+            ("RUSTPLUS_STEAM_ID", "steam"),
+            ("SECRET_ACTIVE_KEY_ID", "bad key"),
+            ("SECRET_ACTIVE_KEY_ID", "k\u{e9}y"),
+            ("SECRET_KEYRING_FILE", "relative/keyring"),
+            ("RUSTPLUS_STEAM_AUTH_TOKEN_FILE", "token.txt"),
+        ];
+        for (variable, value) in cases {
+            assert!(matches!(
+                with_rustplus(&[(variable, value)], None),
+                Err(ConfigError::InvalidRustPlus { variable: v, .. }) if v == variable
+            ));
+        }
+        assert_eq!(
+            with_rustplus(&[("RUSTPLUS_FCM_SENDER_ID", " ")], None).err(),
+            Some(ConfigError::Empty {
+                variable: "RUSTPLUS_FCM_SENDER_ID"
+            })
+        );
     }
 }
