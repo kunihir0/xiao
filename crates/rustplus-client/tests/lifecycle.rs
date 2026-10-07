@@ -289,6 +289,20 @@ async fn malformed_child_error_is_surfaced_by_reconnect() {
 }
 
 #[tokio::test]
+async fn disconnect_surfaces_child_error_and_keeps_terminal_readiness() {
+    let (endpoint, task) = child_error_server().await;
+    let client =
+        RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
+            .expect("client");
+    client.connect().await.expect("connect");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let result = client.disconnect().await;
+    assert!(matches!(result, Err(Error::Decode)));
+    assert_eq!(client.readiness(), Readiness::Disconnected);
+    task.abort();
+}
+
+#[tokio::test]
 async fn oversized_outbound_payloads_are_rejected_before_enqueue() {
     let (endpoint, task) = server(true).await;
     let client =
@@ -341,6 +355,8 @@ async fn timeout_removes_pending_and_max_pending_rejects_admission() {
     assert!(matches!(second, Err(Error::PendingFull)));
     let first = first.await.expect("first request task");
     assert!(matches!(first, Err(Error::Timeout(_))));
+    let after_timeout = client.send_request(Request::Info).await;
+    assert!(matches!(after_timeout, Err(Error::Timeout(_))));
     client.disconnect().await.expect("disconnect");
     task.abort();
 }
