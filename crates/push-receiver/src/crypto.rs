@@ -128,6 +128,7 @@ fn decode(value: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use super::*;
     use aes_gcm::aead::{Aead, KeyInit};
 
@@ -331,5 +332,29 @@ mod tests {
             ),
             Err(Error::InvalidPadding)
         ));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_authenticated_records_fail_closed_without_unbounded_output(
+            ciphertext in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let material = WebPushKeyMaterial::from_bytes([1; 32], [2; 16]);
+            let peer = if let Ok(secret) = SecretKey::from_slice(&[2; 32]) {
+                URL_SAFE_NO_PAD.encode(secret.public_key().to_sec1_point(false).as_bytes())
+            } else {
+                return;
+            };
+            let salt = URL_SAFE_NO_PAD.encode([3_u8; 16]);
+            let result = decrypt_web_push(
+                &material,
+                &format!("dh={peer}"),
+                &format!("salt={salt}"),
+                &ciphertext,
+            );
+            if let Ok(plaintext) = result {
+                prop_assert!(plaintext.len() <= ciphertext.len());
+            }
+        }
     }
 }
