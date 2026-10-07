@@ -53,6 +53,30 @@ impl WebPushKeyMaterial {
             auth_secret: auth_secret.to_vec(),
         }
     }
+
+    pub fn private_key(&self) -> &[u8] {
+        &self.private_key
+    }
+
+    pub fn auth_secret(&self) -> &[u8] {
+        &self.auth_secret
+    }
+
+    pub fn private_key_bytes(&self) -> Option<[u8; 32]> {
+        self.private_key.as_slice().try_into().ok()
+    }
+
+    pub fn auth_secret_bytes(&self) -> Option<[u8; 16]> {
+        self.auth_secret.as_slice().try_into().ok()
+    }
+}
+
+impl Drop for WebPushKeyMaterial {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.private_key.zeroize();
+        self.auth_secret.zeroize();
+    }
 }
 
 /// Decrypts the legacy Web Push `aesgcm` content encoding used by FCM.
