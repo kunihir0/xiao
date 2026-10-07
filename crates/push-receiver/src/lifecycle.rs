@@ -518,6 +518,7 @@ mod tests {
 
     struct ResetProbeConnector {
         calls: Arc<AtomicUsize>,
+        events: mpsc::UnboundedSender<usize>,
     }
     impl ReceiverConnector for ResetProbeConnector {
         fn connect<'a>(
@@ -527,6 +528,7 @@ mod tests {
         {
             Box::pin(async move {
                 let call = self.calls.fetch_add(1, Ordering::AcqRel);
+                let _ = self.events.send(call);
                 if call == 0 {
                     Ok(Box::new(ClosingSession) as Box<dyn crate::transport::McsSession>)
                 } else {
@@ -539,22 +541,19 @@ mod tests {
     #[tokio::test]
     async fn reconnect_budget_resets_after_a_successful_session() {
         let calls = Arc::new(AtomicUsize::new(0));
+        let (events, mut events_rx) = mpsc::unbounded_channel();
         let connector = Arc::new(ResetProbeConnector {
             calls: Arc::clone(&calls),
+            events,
         });
         let policy = RetryPolicy::new(std::time::Duration::ZERO, std::time::Duration::ZERO, 0)
             .with_max_attempts(1);
         let handle = start_connected(connector, 1, 1, policy);
-        let wait = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if calls.load(Ordering::Acquire) >= 3 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        assert!(wait.is_ok());
+        for expected in 0..3 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events_rx.recv()).await;
+            assert!(matches!(event, Ok(Some(value)) if value == expected));
+        }
         assert_eq!(calls.load(Ordering::Acquire), 3);
         let result = handle.shutdown().await;
         assert!(matches!(result, Err(Error::TransportClosed)));
