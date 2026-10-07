@@ -35,7 +35,7 @@ pub fn load_owner_only_secret(
 
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
             .open(path)
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
