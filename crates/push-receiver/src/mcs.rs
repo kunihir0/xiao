@@ -143,8 +143,7 @@ pub(crate) fn decode_data_message_with_metadata(payload: &[u8]) -> Result<Decode
         return Err(Error::NotificationTooLarge);
     }
     if message.app_data.iter().any(|entry| {
-        entry.key.len() > MAX_APP_DATA_ENTRY_BYTES
-            || entry.value.len() > MAX_APP_DATA_ENTRY_BYTES
+        entry.key.len() > MAX_APP_DATA_ENTRY_BYTES || entry.value.len() > MAX_APP_DATA_ENTRY_BYTES
     }) {
         return Err(Error::NotificationTooLarge);
     }
