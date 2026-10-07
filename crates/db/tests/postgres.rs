@@ -188,14 +188,15 @@ async fn postgres_tls_verify_full_connects_with_correct_ca()
         Err(_) => return Ok(()),
     };
 
-    let config = DbConfig::verify_full(&tls_url, &ca_file)?;
+    let config = DbConfig::verify_full(&tls_url, &ca_file)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
     let db = match Db::connect(&config).await {
         Ok(db) => db,
         Err(err) => {
             eprintln!(
                 "Db::connect failed in postgres_tls_verify_full_connects_with_correct_ca: {err:?}"
             );
-            return Err(Box::new(err));
+            return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
         }
     };
     assert!(!db.is_ready());
@@ -215,7 +216,8 @@ async fn postgres_tls_verify_full_fails_with_wrong_ca()
         Err(_) => return Ok(()),
     };
 
-    let config = DbConfig::verify_full(&tls_url, &wrong_ca_file)?;
+    let config = DbConfig::verify_full(&tls_url, &wrong_ca_file)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
     let result = Db::connect(&config).await;
     assert!(result.is_err(), "connecting with wrong CA must fail");
     Ok(())
@@ -234,7 +236,8 @@ async fn postgres_tls_verify_full_fails_on_hostname_mismatch()
         Err(_) => return Ok(()),
     };
 
-    let config = DbConfig::verify_full(&mismatch_url, &ca_file)?;
+    let config = DbConfig::verify_full(&mismatch_url, &ca_file)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
     let result = Db::connect(&config).await;
     assert!(
         result.is_err(),
@@ -253,7 +256,8 @@ async fn postgres_tls_verify_full_fails_when_server_has_ssl_off()
         Err(_) => return Ok(()),
     };
 
-    let config = DbConfig::verify_full(&plain_url, &ca_file)?;
+    let config = DbConfig::verify_full(&plain_url, &ca_file)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
     let result = Db::connect(&config).await;
     assert!(
         result.is_err(),
