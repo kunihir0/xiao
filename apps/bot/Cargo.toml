@@ -8,3 +8,9 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+bot-config = { path = "../../crates/config", version = "0.1.0" }
+bot-telemetry = { path = "../../crates/telemetry", version = "0.1.0" }
