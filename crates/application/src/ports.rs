@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use bot_domain::{Pairing, ServerId};
+use tokio::sync::watch;
 
 use crate::BoxFuture;
 
@@ -41,6 +42,7 @@ pub enum SessionEvent {
 
 pub trait PairingSource: Send {
     fn readiness(&self) -> SourceReadiness;
+    fn readiness_watch(&self) -> watch::Receiver<SourceReadiness>;
     fn next<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<Pairing>, PairingSourceError>>;
     fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, Result<(), PairingSourceError>>;
 }

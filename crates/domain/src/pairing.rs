@@ -2,6 +2,9 @@ use std::fmt;
 
 use crate::{DeliveryId, DomainError, EntityId, PlayerCredentials, ServerAddress, ServerId};
 
+pub const MAX_ENTITY_KIND_BYTES: usize = 64;
+pub const MAX_ENTITY_NAME_BYTES: usize = 256;
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct EntityPairing {
     id: EntityId,
@@ -20,7 +23,39 @@ impl EntityPairing {
                 field: "entity_type",
             });
         }
+        if kind
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_ENTITY_KIND_BYTES)
+        {
+            return Err(DomainError::Invalid {
+                field: "entity_type",
+            });
+        }
+        if kind
+            .as_deref()
+            .is_some_and(|value| value.chars().any(char::is_control))
+        {
+            return Err(DomainError::Invalid {
+                field: "entity_type",
+            });
+        }
         if name.as_deref().is_some_and(|value| value.trim().is_empty()) {
+            return Err(DomainError::Invalid {
+                field: "entity_name",
+            });
+        }
+        if name
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_ENTITY_NAME_BYTES)
+        {
+            return Err(DomainError::Invalid {
+                field: "entity_name",
+            });
+        }
+        if name
+            .as_deref()
+            .is_some_and(|value| value.chars().any(char::is_control))
+        {
             return Err(DomainError::Invalid {
                 field: "entity_name",
             });

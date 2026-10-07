@@ -8,7 +8,7 @@ use std::fmt;
 
 pub use credentials::{PlayerCredentials, PlayerToken};
 pub use ids::{DeliveryId, EntityId, PlayerId, ServerAddress, ServerId, SessionId};
-pub use pairing::{EntityPairing, Pairing};
+pub use pairing::{EntityPairing, MAX_ENTITY_KIND_BYTES, MAX_ENTITY_NAME_BYTES, Pairing};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DomainError {
@@ -67,6 +67,44 @@ mod tests {
         let pairing =
             super::Pairing::new(ServerAddress::new("host", 28082)?, credentials, None, None);
         assert!(!format!("{pairing:?}").contains("123456789"));
+        Ok(())
+    }
+
+    #[test]
+    fn entity_metadata_has_bounded_bytes_and_rejects_controls() -> Result<(), DomainError> {
+        let id = super::EntityId::new(1)?;
+        assert!(
+            super::EntityPairing::new(
+                id,
+                Some("k".repeat(super::MAX_ENTITY_KIND_BYTES)),
+                Some("n".repeat(super::MAX_ENTITY_NAME_BYTES)),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            super::EntityPairing::new(id, Some("k".repeat(super::MAX_ENTITY_KIND_BYTES + 1)), None,),
+            Err(DomainError::Invalid {
+                field: "entity_type"
+            })
+        ));
+        assert!(matches!(
+            super::EntityPairing::new(id, None, Some("n".repeat(super::MAX_ENTITY_NAME_BYTES + 1)),),
+            Err(DomainError::Invalid {
+                field: "entity_name"
+            })
+        ));
+        assert!(matches!(
+            super::EntityPairing::new(id, Some("kind\n".to_owned()), None),
+            Err(DomainError::Invalid {
+                field: "entity_type"
+            })
+        ));
+        assert!(matches!(
+            super::EntityPairing::new(id, None, Some("name\u{7f}".to_owned())),
+            Err(DomainError::Invalid {
+                field: "entity_name"
+            })
+        ));
         Ok(())
     }
 }

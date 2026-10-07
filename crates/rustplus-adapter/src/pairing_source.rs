@@ -1,33 +1,45 @@
 use bot_application::{BoxFuture, PairingSource, PairingSourceError, SourceReadiness};
 use bot_domain::Pairing;
+use tokio::sync::watch;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::{ParseConfig, parse::parse_notification};
 
 pub struct PushPairingSource {
     receiver: Option<push_receiver::ReceiverHandle>,
     config: ParseConfig,
+    readiness: watch::Receiver<SourceReadiness>,
+    readiness_task: Option<AbortOnDropHandle<()>>,
 }
 
 impl PushPairingSource {
     pub fn new(receiver: push_receiver::ReceiverHandle, config: ParseConfig) -> Self {
+        let mut receiver_readiness = receiver.readiness_watch();
+        let (readiness_tx, readiness) = watch::channel(map_readiness(*receiver_readiness.borrow()));
+        let readiness_task = tokio::spawn(async move {
+            while receiver_readiness.changed().await.is_ok() {
+                let state = map_readiness(*receiver_readiness.borrow());
+                if readiness_tx.send(state).is_err() || state == SourceReadiness::Stopped {
+                    break;
+                }
+            }
+        });
         Self {
             receiver: Some(receiver),
             config,
+            readiness,
+            readiness_task: Some(AbortOnDropHandle::new(readiness_task)),
         }
     }
 }
 
 impl PairingSource for PushPairingSource {
     fn readiness(&self) -> SourceReadiness {
-        match self
-            .receiver
-            .as_ref()
-            .map(push_receiver::ReceiverHandle::readiness)
-        {
-            Some(push_receiver::Readiness::Starting) => SourceReadiness::Starting,
-            Some(push_receiver::Readiness::Ready) => SourceReadiness::Ready,
-            None | Some(push_receiver::Readiness::Stopped) => SourceReadiness::Stopped,
-        }
+        *self.readiness.borrow()
+    }
+
+    fn readiness_watch(&self) -> watch::Receiver<SourceReadiness> {
+        self.readiness.clone()
     }
 
     fn next<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<Pairing>, PairingSourceError>> {
@@ -50,17 +62,29 @@ impl PairingSource for PushPairingSource {
 
     fn shutdown<'a>(&'a mut self) -> BoxFuture<'a, Result<(), PairingSourceError>> {
         Box::pin(async move {
-            let Some(receiver) = self.receiver.take() else {
-                return Ok(());
+            let result = match self.receiver.take() {
+                Some(receiver) => receiver
+                    .shutdown()
+                    .await
+                    .map_err(|error| PairingSourceError::Shutdown(error.to_string())),
+                None => Ok(()),
             };
-            receiver
-                .shutdown()
-                .await
-                .map_err(|error| PairingSourceError::Shutdown(error.to_string()))
+            if let Some(task) = self.readiness_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            result
         })
     }
 }
 
+fn map_readiness(readiness: push_receiver::Readiness) -> SourceReadiness {
+    match readiness {
+        push_receiver::Readiness::Starting => SourceReadiness::Starting,
+        push_receiver::Readiness::Ready => SourceReadiness::Ready,
+        push_receiver::Readiness::Stopped => SourceReadiness::Stopped,
+    }
+}
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
