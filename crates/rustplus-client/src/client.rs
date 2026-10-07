@@ -357,8 +357,12 @@ impl RustPlusClient {
         };
         let transition = self.inner.lifecycle.lock().await;
         if disconnect_signal.is_cancelled() || self.inner.stopped.load(Ordering::Acquire) {
-            let _ = stream.close(None).await;
+            // Release the lifecycle lock before the peer-driven close handshake
+            // so a stalling peer cannot block `disconnect()`; the close itself
+            // is bounded and the stream is dropped either way.
+            drop(transition);
             mark_disconnected_unless_closing(&self.inner.readiness);
+            let _ = timeout(SHUTDOWN_TIMEOUT, stream.close(None)).await;
             return Err(Error::ShuttingDown);
         }
 
