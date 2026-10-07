@@ -112,29 +112,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabled_pairing_service_is_joined_on_channel_shutdown() {
+    async fn enabled_pairing_service_is_joined_on_channel_shutdown() -> Result<(), BoxError> {
         let (mut trigger, signal) = channel_signal();
         let mut composition = Composition::new(signal);
         let (service, _sender) = service();
-        register_pairing_service(&mut composition, true, service).expect("registration");
+        register_pairing_service(&mut composition, true, service)?;
         let task = tokio::spawn(composition.run());
-        trigger.trigger().expect("shutdown trigger");
-        let report = task.await.expect("composition task").expect("run report");
+        trigger.trigger()?;
+        let report = task.await??;
         assert_eq!(report.readiness, Readiness::Stopped);
         assert!(report.shutdown_requested);
         assert_eq!(report.joined_tasks, 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn disabled_pairing_service_is_not_registered() {
+    async fn disabled_pairing_service_is_not_registered() -> Result<(), BoxError> {
         let (mut trigger, signal) = channel_signal();
         let mut composition = Composition::new(signal);
         let (service, _sender) = service();
-        register_pairing_service(&mut composition, false, service).expect("registration");
-        trigger.trigger().expect("shutdown trigger");
-        let report = composition.run().await.expect("run report");
+        register_pairing_service(&mut composition, false, service)?;
+        trigger.trigger()?;
+        let report = composition.run().await?;
         assert_eq!(report.readiness, Readiness::Stopped);
         assert!(report.shutdown_requested);
         assert_eq!(report.joined_tasks, 0);
+        Ok(())
     }
 }
