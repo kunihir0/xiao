@@ -712,7 +712,7 @@ async fn max_servers_does_not_open_a_second_session() -> Result<(), DomainError>
     connector.script(first.server_id().clone(), session).await;
     let mut test_config = config();
     test_config.max_servers = 1;
-    let (service, _) = PairingService::new(
+    let (service, handle) = PairingService::new(
         source,
         connector.clone(),
         FakePairingStore::default(),
@@ -726,12 +726,14 @@ async fn max_servers_does_not_open_a_second_session() -> Result<(), DomainError>
         .map_err(|_| DomainError::Invalid { field: "sender" })?;
     assert_eq!(calls_at_least(&connector, 1).await.len(), 1);
     settle().await;
+    assert_eq!(handle.sessions().len(), 1);
     sender
         .send(pairing("max-b.example", 15, 150, None, Some("b"))?)
         .await
         .map_err(|_| DomainError::Invalid { field: "sender" })?;
     settle().await;
     assert_eq!(connector.connect_calls().await.len(), 1);
+    assert_eq!(handle.sessions().len(), 1);
     cancellation.cancel();
     assert_eq!(
         task.await
