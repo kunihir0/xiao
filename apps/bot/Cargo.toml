@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
-bot-config = { version = "0.1.0", path = "../../crates/config" }
-bot-db = { version = "0.1.0", path = "../../crates/db" }
-bot-telemetry = { version = "0.1.0", path = "../../crates/telemetry" }
-tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
+tokio.workspace = true
+tokio-util.workspace = true
+bot-db = { path = "../../crates/db", version = "0.1.0" }
+bot-telemetry = { path = "../../crates/telemetry", version = "0.1.0" }

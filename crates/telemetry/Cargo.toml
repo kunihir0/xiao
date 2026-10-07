@@ -8,3 +8,7 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+tracing-subscriber.workspace = true
+bot-config = { path = "../config", version = "0.1.0" }
