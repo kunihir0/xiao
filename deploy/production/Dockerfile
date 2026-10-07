@@ -9,20 +9,19 @@ ARG DEBIAN_SNAPSHOT
 WORKDIR /src
 
 RUN rm -f /etc/apt/sources.list.d/debian.sources \
-    && printf '%s\n' \
-      'Types: deb' \
-      "URIs: https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/" \
-      'Suites: bookworm bookworm-updates' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      > /etc/apt/sources.list.d/snapshot.sources \
-    && printf '%s\n' \
-      'Types: deb' \
-      "URIs: https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/" \
-      'Suites: bookworm-security' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      >> /etc/apt/sources.list.d/snapshot.sources \
+    && ( \
+      echo "Types: deb" && \
+      echo "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/" && \
+      echo "Suites: bookworm bookworm-updates" && \
+      echo "Components: main" && \
+      echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" && \
+      echo "" && \
+      echo "Types: deb" && \
+      echo "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/" && \
+      echo "Suites: bookworm-security" && \
+      echo "Components: main" && \
+      echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" \
+    ) > /etc/apt/sources.list.d/snapshot.sources \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install --no-install-recommends --yes \
       ca-certificates=20250419~deb12u1 \
@@ -41,20 +40,19 @@ FROM ${RUNTIME_IMAGE} AS runtime
 ARG DEBIAN_SNAPSHOT
 
 RUN rm -f /etc/apt/sources.list.d/debian.sources \
-    && printf '%s\n' \
-      'Types: deb' \
-      "URIs: https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/" \
-      'Suites: bookworm bookworm-updates' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      > /etc/apt/sources.list.d/snapshot.sources \
-    && printf '%s\n' \
-      'Types: deb' \
-      "URIs: https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/" \
-      'Suites: bookworm-security' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      >> /etc/apt/sources.list.d/snapshot.sources \
+    && ( \
+      echo "Types: deb" && \
+      echo "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/" && \
+      echo "Suites: bookworm bookworm-updates" && \
+      echo "Components: main" && \
+      echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" && \
+      echo "" && \
+      echo "Types: deb" && \
+      echo "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/" && \
+      echo "Suites: bookworm-security" && \
+      echo "Components: main" && \
+      echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" \
+    ) > /etc/apt/sources.list.d/snapshot.sources \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install --no-install-recommends --yes \
       ca-certificates=20250419~deb12u1 \
