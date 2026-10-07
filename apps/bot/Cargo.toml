@@ -23,5 +23,5 @@ rustplus-client = { version = "0.1.0", path = "../../crates/rustplus-client" }
 tracing.workspace = true
 
 [dev-dependencies]
-bot-test-support = { path = "../../crates/test-support" }
-tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "sync", "time"] }
+bot-test-support = { path = "../../crates/test-support", version = "0.1.0" }
+tokio = { workspace = true, features = ["test-util"] }
