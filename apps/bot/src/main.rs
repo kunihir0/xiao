@@ -1,8 +1,8 @@
 //! Process composition root for the Discord bot.
 
+use bot::{BoxError, Composition, CtrlCSignal};
 use bot_config::Config;
 use bot_telemetry::init_from_config;
-use bot::{BoxError, Composition, CtrlCSignal};
 
 #[tokio::main]
 async fn main() {

@@ -2,7 +2,7 @@
 
 use bot_config::{Config, TelemetryConfig, TelemetryFormat};
 use std::fmt::{self, Display, Formatter};
-use tracing_subscriber::{fmt as tracing_fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 
 /// Lifetime marker for the process telemetry setup.
 ///
@@ -43,18 +43,9 @@ impl std::error::Error for TelemetryError {}
 pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
     let filter = EnvFilter::try_new(config.filter).map_err(|_| TelemetryError::InvalidFilter)?;
     let result = match config.format {
-        TelemetryFormat::Compact => tracing_fmt()
-            .with_env_filter(filter)
-            .compact()
-            .try_init(),
-        TelemetryFormat::Pretty => tracing_fmt()
-            .with_env_filter(filter)
-            .pretty()
-            .try_init(),
-        TelemetryFormat::Json => tracing_fmt()
-            .with_env_filter(filter)
-            .json()
-            .try_init(),
+        TelemetryFormat::Compact => tracing_fmt().with_env_filter(filter).compact().try_init(),
+        TelemetryFormat::Pretty => tracing_fmt().with_env_filter(filter).pretty().try_init(),
+        TelemetryFormat::Json => tracing_fmt().with_env_filter(filter).json().try_init(),
     };
 
     result.map_err(|_| TelemetryError::AlreadyInitialized)?;
@@ -68,7 +59,7 @@ pub fn init_from_config(config: &Config) -> Result<TelemetryGuard, TelemetryErro
 
 #[cfg(test)]
 mod tests {
-    use super::{init, TelemetryError};
+    use super::{TelemetryError, init};
     use bot_config::{TelemetryConfig, TelemetryFormat};
 
     #[test]
