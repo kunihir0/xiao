@@ -10,8 +10,10 @@ on:
         required: true
         type: string
 
-# This workflow has no pull_request trigger. Only a protected version tag or an
-# explicitly requested maintainer dispatch can receive attestation permissions.
+# This workflow has no pull_request trigger. Only a SemVer version tag push or an
+# explicitly requested maintainer dispatch reaches the attesting job. Tag
+# protection is unavailable on the current GitHub plan (rulesets API 403); see
+# docs/quality-and-supply-chain.md for the compensating checks.
 permissions:
   contents: read
 

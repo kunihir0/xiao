@@ -65,11 +65,22 @@ versions, mitigation, fixed version, and disclosure timing.
 
 ## Releases and provenance
 
-A protected `v*` tag or maintainer-triggered release dispatch builds the pinned
-Rust toolchain, a source archive, and the Linux binary. The release workflow
-publishes SHA-256 checksums, an SPDX SBOM, and GitHub artifact provenance using
-`id-token: write` and `attestations: write`. It has no pull-request trigger and
-never grants write tokens or production secrets to untrusted code.
+A SemVer `v*` tag push or a maintainer-triggered release dispatch builds the
+pinned Rust toolchain, a source archive, and the Linux binary. The release
+workflow publishes SHA-256 checksums, an SPDX SBOM, and GitHub artifact
+provenance using `id-token: write` and `attestations: write`, granted only to
+the attesting job. It has no pull-request trigger and never grants write tokens
+or production secrets to untrusted code.
+
+**Tag protection is not currently enforced.** This repository is private on the
+GitHub Free plan, where the rulesets API returns HTTP 403, so `v*` tags cannot be
+restricted to maintainers. Compensating controls in the workflow: the tag must
+match a strict SemVer pattern, checkout uses `refs/tags/<tag>`, and the build
+fails unless the tag's commit equals the checked-out `HEAD`. Anyone with push
+access can still create a tag and obtain an attestation for it, so consumers
+MUST verify that the attested commit is on `main`. Enabling tag rulesets
+(GitHub Pro/Team, or a public repository) is tracked for the next hosting-plan
+review.
 
 Artifact names are stable: `xiao-source-${tag}.tar.gz`,
 `xiao-${tag}-x86_64-unknown-linux-gnu.tar.gz`, `SHA256SUMS-${tag}.txt`, and
