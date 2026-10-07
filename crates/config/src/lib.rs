@@ -2,6 +2,7 @@
 
 use std::fmt::{self, Debug, Display, Formatter};
 use std::str::FromStr;
+use url::Url;
 
 const REDACTED: &str = "[REDACTED]";
 
@@ -20,14 +21,12 @@ impl Config {
     /// process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|name| {
-            std::env::var(name)
-                .map(Some)
-                .or_else(|error| match error {
-                    std::env::VarError::NotPresent => Ok(None),
-                    std::env::VarError::NotUnicode(_) => {
-                        Err(ConfigError::InvalidUnicode { variable: name })
-                    }
-                })
+            std::env::var(name).map(Some).or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok(None),
+                std::env::VarError::NotUnicode(_) => {
+                    Err(ConfigError::InvalidUnicode { variable: name })
+                }
+            })
         })
     }
 
@@ -41,7 +40,9 @@ impl Config {
 
         let filter = optional(&mut lookup, "RUST_LOG")?.unwrap_or_else(|| "info".to_owned());
         if filter.trim().is_empty() {
-            return Err(ConfigError::Empty { variable: "RUST_LOG" });
+            return Err(ConfigError::Empty {
+                variable: "RUST_LOG",
+            });
         }
         let format = optional(&mut lookup, "TELEMETRY_FORMAT")?
             .unwrap_or_else(|| "compact".to_owned())
@@ -135,12 +136,22 @@ pub enum ConfigError {
 impl Display for ConfigError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing { variable } => write!(formatter, "missing environment variable {variable}"),
-            Self::Empty { variable } => write!(formatter, "environment variable {variable} must not be empty"),
-            Self::InvalidUnicode { variable } => {
-                write!(formatter, "environment variable {variable} is not valid UTF-8")
+            Self::Missing { variable } => {
+                write!(formatter, "missing environment variable {variable}")
             }
-            Self::InvalidDatabaseUrl { reason } => write!(formatter, "invalid DATABASE_URL: {reason}"),
+            Self::Empty { variable } => write!(
+                formatter,
+                "environment variable {variable} must not be empty"
+            ),
+            Self::InvalidUnicode { variable } => {
+                write!(
+                    formatter,
+                    "environment variable {variable} is not valid UTF-8"
+                )
+            }
+            Self::InvalidDatabaseUrl { reason } => {
+                write!(formatter, "invalid DATABASE_URL: {reason}")
+            }
             Self::InvalidTelemetryFormat { value } => {
                 write!(formatter, "unsupported telemetry format in {value}")
             }
@@ -172,28 +183,22 @@ where
 }
 
 fn validate_database_url(value: &str) -> Result<(), ConfigError> {
-    if value.chars().any(char::is_control) || value.chars().any(char::is_whitespace) {
+    let parsed = Url::parse(value).map_err(|_| ConfigError::InvalidDatabaseUrl {
+        reason: "URL syntax is invalid",
+    })?;
+    if !matches!(parsed.scheme(), "postgres" | "postgresql") {
         return Err(ConfigError::InvalidDatabaseUrl {
-            reason: "contains whitespace or control characters",
+            reason: "expected postgres:// or postgresql://",
         });
     }
-
-    let authority = value
-        .strip_prefix("postgres://")
-        .or_else(|| value.strip_prefix("postgresql://"))
-        .and_then(|rest| rest.split(['/', '?', '#']).next())
-        .filter(|part| !part.is_empty())
-        .ok_or(ConfigError::InvalidDatabaseUrl {
-            reason: "expected postgres:// or postgresql:// with a host",
-        })?;
-
-    let host = match authority.rsplit('@').next() {
-        Some(host) => host,
-        None => authority,
-    };
-    if host.is_empty() || host == ":" || host.starts_with(':') {
+    if parsed.host_str().is_none_or(str::is_empty) {
         return Err(ConfigError::InvalidDatabaseUrl {
             reason: "database host is missing",
+        });
+    }
+    if parsed.path().trim_matches('/').is_empty() {
+        return Err(ConfigError::InvalidDatabaseUrl {
+            reason: "database name is missing",
         });
     }
     Ok(())
@@ -214,14 +219,33 @@ mod tests {
         let result = config(&[]);
         assert!(matches!(
             result,
-            Err(ConfigError::Missing { variable: "DISCORD_TOKEN" })
+            Err(ConfigError::Missing {
+                variable: "DISCORD_TOKEN"
+            })
         ));
     }
 
     #[test]
     fn invalid_database_url_is_rejected() {
         let result = config(&[("DISCORD_TOKEN", "token"), ("DATABASE_URL", "sqlite://db")]);
-        assert!(matches!(result, Err(ConfigError::InvalidDatabaseUrl { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidDatabaseUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_database_authority_and_path_are_rejected() {
+        for database_url in [
+            "postgres://localhost:not-a-port/bot",
+            "postgres://localhost/",
+        ] {
+            let result = config(&[("DISCORD_TOKEN", "token"), ("DATABASE_URL", database_url)]);
+            assert!(matches!(
+                result,
+                Err(ConfigError::InvalidDatabaseUrl { .. })
+            ));
+        }
     }
 
     #[test]

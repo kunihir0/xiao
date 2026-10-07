@@ -1,6 +1,6 @@
 //! Owned process composition and shutdown lifecycle.
 
-use std::{error::Error, fmt, future::Future, pin::Pin};
+use std::{collections::HashMap, error::Error, fmt, future::Future, pin::Pin};
 
 use tokio::{sync::oneshot, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -136,9 +136,14 @@ impl fmt::Display for CompositionError {
         match self {
             Self::AlreadyStarted => formatter.write_str("composition has already started"),
             Self::Signal(error) => write!(formatter, "{error}"),
-            Self::Component { name, source } => write!(formatter, "component {name} failed: {source}"),
+            Self::Component { name, source } => {
+                write!(formatter, "component {name} failed: {source}")
+            }
             Self::TaskJoin { name, cancelled } => {
-                write!(formatter, "component {name} join failed (cancelled: {cancelled})")
+                write!(
+                    formatter,
+                    "component {name} join failed (cancelled: {cancelled})"
+                )
             }
         }
     }
@@ -163,7 +168,7 @@ struct NamedTask {
 pub struct Composition<S> {
     signal: Option<S>,
     cancellation: CancellationToken,
-    tasks: JoinSet<NamedTask>,
+    tasks: Vec<(String, ComponentFuture)>,
     readiness: Readiness,
 }
 
@@ -176,7 +181,7 @@ where
         Self {
             signal: Some(signal),
             cancellation: CancellationToken::new(),
-            tasks: JoinSet::new(),
+            tasks: Vec::new(),
             readiness: Readiness::Starting,
         }
     }
@@ -200,15 +205,8 @@ where
             return Err(CompositionError::AlreadyStarted);
         }
         let name = name.into();
-        let cancellation = self.cancellation.child_token();
         let task: ComponentFuture = Box::pin(task);
-        self.tasks.spawn(async move {
-            let result = tokio::select! {
-                result = task => result,
-                _ = cancellation.cancelled() => Ok(()),
-            };
-            NamedTask { name, result }
-        });
+        self.tasks.push((name, task));
         Ok(())
     }
 
@@ -220,14 +218,24 @@ where
             None => return Err(CompositionError::AlreadyStarted),
         };
         let mut signal_future = signal.wait();
+        let mut tasks = JoinSet::new();
+        let mut task_names = HashMap::new();
+        for (name, task) in self.tasks {
+            let task_name = name.clone();
+            let task_id = tasks.spawn(async move {
+                let result = task.await;
+                NamedTask { name, result }
+            });
+            task_names.insert(task_id.id(), task_name);
+        }
         let mut signal_done = false;
         let mut failure = None;
         let mut shutdown_requested = false;
         let mut joined_tasks = 0;
-        let had_tasks = !self.tasks.is_empty();
+        let had_tasks = !tasks.is_empty();
 
         loop {
-            if self.tasks.is_empty() {
+            if tasks.is_empty() {
                 if had_tasks || signal_done || failure.is_some() {
                     break;
                 }
@@ -249,9 +257,9 @@ where
                         }
                     }
                 }
-                joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
                     match joined {
-                        Some(Ok(task)) => {
+                        Some(Ok((_id, task))) => {
                             joined_tasks += 1;
                             if let Err(source) = task.result {
                                 self.readiness = Readiness::Stopping;
@@ -266,8 +274,12 @@ where
                             self.readiness = Readiness::Stopping;
                             self.cancellation.cancel();
                             if failure.is_none() {
+                                let name = match task_names.remove(&error.id()) {
+                                    Some(name) => name,
+                                    None => "unknown".to_owned(),
+                                };
                                 failure = Some(CompositionError::TaskJoin {
-                                    name: "unknown".to_owned(),
+                                    name,
                                     cancelled: error.is_cancelled(),
                                 });
                             }
@@ -278,20 +290,28 @@ where
             }
         }
 
-        while let Some(joined) = self.tasks.join_next().await {
+        while let Some(joined) = tasks.join_next_with_id().await {
             joined_tasks += 1;
             match joined {
-                Ok(task) => {
+                Ok((_id, task)) => {
                     if failure.is_none() {
                         if let Err(source) = task.result {
-                            failure = Some(CompositionError::Component { name: task.name, source });
+                            failure = Some(CompositionError::Component {
+                                name: task.name,
+                                source,
+                            });
                         }
                     }
                 }
                 Err(error) => {
                     if failure.is_none() {
+                        let name = match task_names.remove(&error.id()) {
+                            Some(name) => name,
+                            None => "unknown".to_owned(),
+                        };
                         failure = Some(CompositionError::TaskJoin {
-                            name: "unknown".to_owned(),
+                            name,
+                            cancelled: error.is_cancelled(),
                         });
                     }
                 }
@@ -313,7 +333,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{channel_signal, Composition, CompositionError, Readiness};
+    use super::{Composition, CompositionError, Readiness, channel_signal};
     use std::{error::Error, io};
 
     fn boxed_error(message: &'static str) -> super::BoxError {
@@ -353,14 +373,29 @@ mod tests {
     async fn component_errors_reach_the_owner() {
         let (_trigger, signal) = channel_signal();
         let mut composition = Composition::new(signal);
-        let registered = composition.register("failing", async {
-            Err(boxed_error("component failed"))
-        });
+        let registered =
+            composition.register("failing", async { Err(boxed_error("component failed")) });
         assert!(registered.is_ok());
         let result = composition.run().await;
         assert!(matches!(
             result,
             Err(CompositionError::Component { ref name, .. }) if name == "failing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn component_failure_is_not_swallowed_by_shutdown() {
+        let (mut trigger, signal) = channel_signal();
+        let mut composition = Composition::new(signal);
+        let registered =
+            composition.register("racing", async { Err(boxed_error("racing failure")) });
+        assert!(registered.is_ok());
+        let triggered = trigger.trigger();
+        assert!(triggered.is_ok());
+        let result = composition.run().await;
+        assert!(matches!(
+            result,
+            Err(CompositionError::Component { ref name, .. }) if name == "racing"
         ));
     }
 
