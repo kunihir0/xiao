@@ -272,7 +272,7 @@ impl RustPlusClient {
         if self.is_ready() {
             return Ok(());
         }
-        let _ = self.inner.readiness.send(Readiness::Connecting);
+        self.inner.readiness.send_replace(Readiness::Connecting);
         let ws_config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_FRAME));
@@ -318,7 +318,10 @@ impl RustPlusClient {
         let supervisor = tokio::spawn(async move {
             tokio::pin!(reader);
             tokio::pin!(writer);
-            tokio::select! { result = &mut reader => { supervisor_token.cancel(); let _ = result; let _ = (&mut writer).await; }, result = &mut writer => { supervisor_token.cancel(); let _ = result; let _ = (&mut reader).await; } };
+            tokio::select! {
+                _result = &mut reader => { supervisor_token.cancel(); let _ = (&mut writer).await; },
+                _result = &mut writer => { supervisor_token.cancel(); let _ = (&mut reader).await; },
+            };
             // Both child tasks are joined before state is cleared.
             fail_pending(&pending_cleanup, Error::Disconnected);
             if let Some(inner) = weak.upgrade()
@@ -334,7 +337,7 @@ impl RustPlusClient {
                 {
                     *token = None;
                 }
-                let _ = readiness.send(Readiness::Disconnected);
+                readiness.send_replace(Readiness::Disconnected);
             }
         });
         if let Ok(mut task) = self.inner.supervisor.lock() {
@@ -343,14 +346,14 @@ impl RustPlusClient {
             cancellation.cancel();
             return Err(Error::ShuttingDown);
         }
-        let _ = self.inner.readiness.send(Readiness::Ready);
+        self.inner.readiness.send_replace(Readiness::Ready);
         Ok(())
     }
 
     pub async fn disconnect(&self) -> Result<()> {
         self.inner.stopped.store(true, Ordering::Release);
         let _transition = self.inner.lifecycle.lock().await;
-        let _ = self.inner.readiness.send(Readiness::Closing);
+        self.inner.readiness.send_replace(Readiness::Closing);
         let token = self
             .inner
             .cancellation
@@ -380,7 +383,7 @@ impl RustPlusClient {
             *sender = None;
         }
         fail_pending(&self.inner.pending, Error::Disconnected);
-        let _ = self.inner.readiness.send(Readiness::Disconnected);
+        self.inner.readiness.send_replace(Readiness::Disconnected);
         Ok(())
     }
     #[must_use]
@@ -432,13 +435,14 @@ impl RustPlusClient {
             .ok()
             .and_then(|sender| sender.clone())
             .ok_or(Error::Disconnected)?;
-        let sequence = self
+        let previous = self
             .inner
             .sequence
             .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1).filter(|next| *next != 0)
             })
             .map_err(|_| Error::SequenceExhausted)?;
+        let sequence = previous.checked_add(1).ok_or(Error::SequenceExhausted)?;
         let key = (generation, sequence);
         let (tx, rx) = oneshot::channel();
         {
