@@ -1383,9 +1383,8 @@ mod tests {
         assert!(rustls::crypto::CryptoProvider::get_default().is_none());
         let result = std::panic::catch_unwind(rustls_connector);
         assert!(result.is_ok(), "TLS connector construction must not panic");
-        assert!(matches!(
-            result.expect("panic already checked"),
-            Ok(Connector::Rustls(_))
-        ));
+        if let Ok(connector) = result {
+            assert!(matches!(connector, Ok(Connector::Rustls(_))));
+        }
     }
 }

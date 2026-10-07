@@ -633,13 +633,13 @@ mod tests {
         let mut handle = start_connected(connector, 1, 2, no_retry_policy());
         let received = tokio::time::timeout(std::time::Duration::from_secs(1), handle.recv()).await;
         assert!(received.is_ok());
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let acknowledged = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while acknowledgements.load(Ordering::Acquire) < 1 {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("message was not acknowledged");
+        .await;
+        assert!(acknowledged.is_ok());
         assert_eq!(acknowledgements.load(Ordering::Acquire), 1);
         assert!(handle.shutdown().await.is_ok());
     }
@@ -655,13 +655,13 @@ mod tests {
             acknowledgements: Arc::clone(&acknowledgements),
         });
         let handle = start_connected(connector, 1, 2, no_retry_policy());
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let acknowledged = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while acknowledgements.load(Ordering::Acquire) < 1 {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("first message was not admitted");
+        .await;
+        assert!(acknowledged.is_ok());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert!(handle.shutdown().await.is_ok());
         assert_eq!(acknowledgements.load(Ordering::Acquire), 1);
