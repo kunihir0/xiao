@@ -873,7 +873,7 @@ mod tests {
                     Ok(SessionEvent::Heartbeat)
                 });
             }
-            Box::pin(std::future::pending())
+            Box::pin(std::future::pending::<Result<SessionEvent>>())
         }
 
         fn acknowledge<'a>(&'a mut self) -> crate::transport::BoxFuture<'a, Result<()>> {
@@ -885,7 +885,7 @@ mod tests {
                     notify.notify_one();
                 }
                 if stall {
-                    std::future::pending().await
+                    std::future::pending::<Result<()>>().await
                 } else {
                     if let Some(counter) = acknowledgements {
                         counter.fetch_add(1, Ordering::AcqRel);
