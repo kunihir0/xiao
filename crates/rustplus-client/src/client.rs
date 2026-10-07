@@ -218,6 +218,7 @@ struct Inner {
     supervisor: Mutex<Option<JoinHandle<Result<()>>>>,
     child_error: Mutex<Option<Error>>,
     disconnect_signal: Mutex<CancellationToken>,
+    admission: Mutex<()>,
     lifecycle: AsyncMutex<()>,
     rate: AsyncMutex<RateLimiter>,
     owner_cancel: CancellationToken,
@@ -283,9 +284,10 @@ impl RustPlusClient {
                 events,
                 readiness,
                 cancellation: Mutex::new(None),
-                supervisor: Mutex::new(None),
                 child_error: Mutex::new(None),
+                supervisor: Mutex::new(None),
                 disconnect_signal: Mutex::new(CancellationToken::new()),
+                admission: Mutex::new(()),
                 lifecycle: AsyncMutex::new(()),
                 owner_cancel: CancellationToken::new(),
                 owner_count: std::sync::atomic::AtomicUsize::new(1),
@@ -296,6 +298,11 @@ impl RustPlusClient {
 
     pub async fn connect(&self) -> Result<()> {
         self.inner.config.validate()?;
+        let admission = self
+            .inner
+            .admission
+            .lock()
+            .map_err(|_| Error::ShuttingDown)?;
         let disconnect_signal = {
             if self.is_ready() {
                 return Ok(());
@@ -319,6 +326,7 @@ impl RustPlusClient {
             self.inner.readiness.send_replace(Readiness::Connecting);
             signal
         };
+        drop(admission);
         self.connect_transport(disconnect_signal).await
     }
 
@@ -326,7 +334,7 @@ impl RustPlusClient {
         let ws_config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_FRAME));
-        let stream = tokio::select! {
+        let mut stream = tokio::select! {
             result = connect_async_with_config(
                 self.inner.config.endpoint.as_str(),
                 Some(ws_config),
@@ -349,6 +357,7 @@ impl RustPlusClient {
         };
         let transition = self.inner.lifecycle.lock().await;
         if disconnect_signal.is_cancelled() || self.inner.stopped.load(Ordering::Acquire) {
+            let _ = stream.close(None).await;
             self.inner.readiness.send_replace(Readiness::Disconnected);
             return Err(Error::ShuttingDown);
         }
@@ -460,11 +469,17 @@ impl RustPlusClient {
     }
 
     pub async fn disconnect(&self) -> Result<()> {
-        self.inner.stopped.store(true, Ordering::Release);
+        let admission = self
+            .inner
+            .admission
+            .lock()
+            .map_err(|_| Error::ShuttingDown)?;
         self.inner.readiness.send_replace(Readiness::Closing);
+        self.inner.stopped.store(true, Ordering::Release);
         if let Ok(signal) = self.inner.disconnect_signal.lock() {
             signal.cancel();
         }
+        drop(admission);
         let _transition = self.inner.lifecycle.lock().await;
         let generation = self.inner.cancellation.lock().ok().and_then(|mut token| {
             token.take().map(|(generation, token)| {

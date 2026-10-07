@@ -307,19 +307,30 @@ async fn concurrent_connect_disconnect_always_ends_disconnected() {
 }
 #[tokio::test]
 async fn concurrent_connects_keep_one_owned_transport() {
-    let (endpoint, task) = delayed_handshake_server(Duration::from_millis(100)).await;
+    let (endpoint, task) = repeated_server(50).await;
     let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
         .expect("client");
-    let first = {
-        let client = client.clone();
-        tokio::spawn(async move { client.connect().await })
-    };
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    let second = client.connect().await;
-    assert!(matches!(second, Err(Error::AlreadyConnecting)));
-    first.await.expect("first connect task").expect("connect");
-    assert_eq!(client.readiness(), Readiness::Ready);
-    client.disconnect().await.expect("disconnect");
+    for _ in 0..50 {
+        let barrier = Arc::new(Barrier::new(2));
+        let first = {
+            let client = client.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                client.connect().await
+            })
+        };
+        barrier.wait().await;
+        let second = client.connect().await;
+        let first = first.await.expect("first connect task");
+        assert!(
+            (first.is_ok() && matches!(second, Err(Error::AlreadyConnecting)))
+                || (matches!(first, Err(Error::AlreadyConnecting)) && second.is_ok())
+        );
+        assert_eq!(client.readiness(), Readiness::Ready);
+        client.disconnect().await.expect("disconnect");
+        assert_eq!(client.readiness(), Readiness::Disconnected);
+    }
     task.abort();
 }
 
