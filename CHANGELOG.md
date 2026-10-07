@@ -13,3 +13,4 @@ All notable externally meaningful changes are documented here. Releases follow S
 - Added the owned Poise/Serenity Discord boundary with a slash-only `/ping`,
   truthful setup-registration readiness, cancellation-driven shard shutdown,
   and redacted token configuration.
+- Migrated the FCM/MCS push receiver behind private protobuf/framing and Web Push crypto boundaries, with malformed-input rejection, bounded persistent-ID deduplication, and joined shutdown/readiness semantics. Compatibility is characterized against legacy commit `3b5b741c7ef52c2da26414bad2cffbf778644fd`.
