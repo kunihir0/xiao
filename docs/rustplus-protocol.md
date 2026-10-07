@@ -30,3 +30,7 @@ map/team-message/camera-input behavior.
 height, arithmetic, sample offsets, and every variable-length ray token are
 checked before use. Zero, overlarge, truncated, and overflowing inputs return a
 typed `Error::InvalidCamera`; no Discord image scaling or encoding is performed.
+The decoder uses a 1,048,576-pixel and 32 MiB frame budget and rejects ray
+tokens after the expected sample count. The sample-position shuffle preserves
+the signed-state arithmetic used by the legacy implementation; an independent
+2x2 ray fixture is checked in under `crates/rustplus-client/tests/fixtures`.

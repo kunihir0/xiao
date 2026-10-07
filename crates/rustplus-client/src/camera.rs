@@ -43,7 +43,8 @@ impl FrameBuilder {
         let sample_bytes = pixels
             .checked_mul(2)
             .ok_or(Error::InvalidCamera("sample position overflow"))?;
-        if pixel_bytes
+        if u64::try_from(pixel_bytes)
+            .map_err(|_| Error::InvalidCamera("frame memory overflow"))?
             .checked_add(sample_bytes)
             .ok_or(Error::InvalidCamera("frame memory overflow"))?
             > MAX_FRAME_BYTES
