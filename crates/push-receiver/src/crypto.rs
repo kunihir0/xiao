@@ -105,6 +105,9 @@ pub fn decrypt_web_push(
         .map_err(|_| Error::DecryptionFailed)?
         .decrypt(&nonce, ciphertext)
         .map_err(|_| Error::DecryptionFailed)?;
+    if plaintext.len() < 2 {
+        return Err(Error::InvalidPadding);
+    }
     let padding = usize::from(u16::from_be_bytes([plaintext[0], plaintext[1]]));
     let start = 2usize.checked_add(padding).ok_or(Error::InvalidPadding)?;
     if start >= plaintext.len() || plaintext[2..start].iter().any(|byte| *byte != 0) {
@@ -238,7 +241,6 @@ mod tests {
             ));
         }
     }
-
     #[test]
     fn nist_aes128_gcm_known_answer_empty_plaintext() {
         let key = [0_u8; 16];
@@ -260,5 +262,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn encrypt_record(
+        material: &WebPushKeyMaterial,
+        peer_secret: [u8; 32],
+        salt: [u8; 16],
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        let private = SecretKey::from_slice(&material.private_key).ok();
+        let peer_private = SecretKey::from_slice(&peer_secret).ok();
+        let (Some(private), Some(peer_private)) = (private, peer_private) else {
+            return Vec::new();
+        };
+        let peer = peer_private.public_key();
+        let shared = diffie_hellman(private.to_nonzero_scalar(), peer.as_affine());
+        let ua_public = private.public_key().to_sec1_point(false);
+        let as_public = peer.to_sec1_point(false);
+        let mut ikm = [0_u8; 32];
+        let _ = Hkdf::<Sha256>::new(
+            Some(&material.auth_secret),
+            shared.raw_secret_bytes().as_slice(),
+        )
+        .expand(b"Content-Encoding: auth\0", &mut ikm);
+        let hkdf = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+        let mut context =
+            Vec::with_capacity(8 + ua_public.as_bytes().len() + as_public.as_bytes().len());
+        context.extend_from_slice(b"P-256\0");
+        context.extend_from_slice(&(ua_public.as_bytes().len() as u16).to_be_bytes());
+        context.extend_from_slice(ua_public.as_bytes());
+        context.extend_from_slice(&(as_public.as_bytes().len() as u16).to_be_bytes());
+        context.extend_from_slice(as_public.as_bytes());
+        let mut cek_info = b"Content-Encoding: aesgcm\0".to_vec();
+        cek_info.extend_from_slice(&context);
+        let mut cek = [0_u8; 16];
+        let _ = hkdf.expand(&cek_info, &mut cek);
+        let mut nonce_info = b"Content-Encoding: nonce\0".to_vec();
+        nonce_info.extend_from_slice(&context);
+        let mut nonce_bytes = [0_u8; 12];
+        let _ = hkdf.expand(&nonce_info, &mut nonce_bytes);
+        let Ok(nonce) = Nonce::try_from(nonce_bytes.as_slice()) else {
+            return Vec::new();
+        };
+        let Ok(cipher) = Aes128Gcm::new_from_slice(&cek) else {
+            return Vec::new();
+        };
+        cipher.encrypt(&nonce, plaintext).unwrap_or_default()
+    }
+
+    #[test]
+    fn authenticated_plaintext_shorter_than_padding_header_is_rejected() {
+        let material = WebPushKeyMaterial::from_bytes([1; 32], [2; 16]);
+        let peer = SecretKey::from_slice(&[2; 32]).ok().map(|secret| {
+            URL_SAFE_NO_PAD.encode(secret.public_key().to_sec1_point(false).as_bytes())
+        });
+        assert!(peer.is_some());
+        let Some(peer) = peer else {
+            return;
+        };
+        let salt = URL_SAFE_NO_PAD.encode([3_u8; 16]);
+        let ciphertext = encrypt_record(&material, [2; 32], [3; 16], &[0]);
+        assert!(matches!(
+            decrypt_web_push(
+                &material,
+                &format!("dh={peer}"),
+                &format!("salt={salt}"),
+                &ciphertext
+            ),
+            Err(Error::InvalidPadding)
+        ));
     }
 }

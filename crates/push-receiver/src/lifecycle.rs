@@ -82,19 +82,60 @@ impl Drop for ReceiverHandle {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ReceiverSourceSender {
+    input: mpsc::Sender<Result<Notification>>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl ReceiverSourceSender {
+    /// Validates and queues a source item. The byte reservation occurs only
+    /// after a channel permit is available, so canceled sends cannot leak
+    /// source-budget accounting.
+    pub async fn send(&self, item: Result<Notification>) -> Result<()> {
+        let bytes = item
+            .as_ref()
+            .map_or(0, |notification| notification_bytes(notification));
+        if bytes > MAX_NOTIFICATION_BYTES {
+            return Err(Error::NotificationTooLarge);
+        }
+        let permit = self
+            .input
+            .reserve()
+            .await
+            .map_err(|_| Error::ChannelClosed)?;
+        if bytes > 0 && !reserve_queue_bytes(&self.queued_bytes, bytes) {
+            return Err(Error::QueueByteBudget);
+        }
+        permit.send(item);
+        Ok(())
+    }
+}
+
 pub struct ReceiverSource {
     input: mpsc::Receiver<Result<Notification>>,
+    queued_bytes: Arc<AtomicUsize>,
 }
 impl ReceiverSource {
-    pub fn channel(capacity: usize) -> Result<(mpsc::Sender<Result<Notification>>, Self)> {
+    pub fn channel(capacity: usize) -> Result<(ReceiverSourceSender, Self)> {
         if capacity == 0 {
             return Err(Error::InvalidRegistration(
                 "receiver source capacity must be non-zero".into(),
             ));
         }
         let capacity = capacity.min(MAX_SOURCE_CAPACITY);
-        let (sender, input) = mpsc::channel(capacity);
-        Ok((sender, Self { input }))
+        let (input_sender, input) = mpsc::channel(capacity);
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        Ok((
+            ReceiverSourceSender {
+                input: input_sender,
+                queued_bytes: Arc::clone(&queued_bytes),
+            },
+            Self {
+                input,
+                queued_bytes,
+            },
+        ))
     }
 }
 
@@ -127,19 +168,34 @@ pub fn start_with_policy(
     let task_queued_bytes = Arc::clone(&queued_bytes);
     let task_readiness = readiness_tx.clone();
     let task = tokio::spawn(async move {
-        let mut source = source.input;
-        let mut dedupe = PersistentIdWindow::new(dedupe_capacity);
+        let ReceiverSource {
+            input: source_input,
+            queued_bytes: source_queued_bytes,
+        } = source;
+        let mut source = source_input;
         let mut attempts: u32 = 0;
         task_readiness
             .send(Readiness::Ready)
             .map_err(|_| Error::ChannelClosed)?;
         loop {
             tokio::select! {
-                _ = &mut shutdown_rx => { let _ = task_readiness.send(Readiness::Stopped); return Ok(()); }
+                _ = &mut shutdown_rx => {
+                    let _ = task_readiness.send(Readiness::Stopped);
+                    return Ok(());
+                }
                 item = source.recv() => {
-                    let Some(item) = item else { let _ = task_readiness.send(Readiness::Stopped); return Ok(()); };
+                    let Some(item) = item else {
+                        let _ = task_readiness.send(Readiness::Stopped);
+                        return Ok(());
+                    };
+                    if let Ok(notification) = &item {
+                        source_queued_bytes.fetch_sub(notification_bytes(notification), Ordering::AcqRel);
+                    }
                     let notification = match item {
-                        Ok(notification) => { attempts = 0; notification }
+                        Ok(notification) => {
+                            attempts = 0;
+                            notification
+                        }
                         Err(error) => {
                             attempts = attempts.saturating_add(1);
                             if attempts > policy.max_attempts() {
@@ -158,9 +214,13 @@ pub fn start_with_policy(
                             continue;
                         }
                     };
-                    if notification.persistent_id.as_deref().is_some_and(|id| dedupe.observe(id)) { continue; }
+                    if notification.persistent_id.as_deref().is_some_and(|id| dedupe.observe(id)) {
+                        continue;
+                    }
                     let bytes = notification_bytes(&notification);
-                    if bytes > MAX_NOTIFICATION_BYTES || !reserve_queue_bytes(&task_queued_bytes, bytes) {
+                    if bytes > MAX_NOTIFICATION_BYTES
+                        || !reserve_queue_bytes(&task_queued_bytes, bytes)
+                    {
                         let _ = task_readiness.send(Readiness::Stopped);
                         return Err(if bytes > MAX_NOTIFICATION_BYTES {
                             Error::NotificationTooLarge
@@ -168,7 +228,15 @@ pub fn start_with_policy(
                             Error::QueueByteBudget
                         });
                     }
-                    if notifications_tx.send(notification).await.is_err() {
+                    let send_result = tokio::select! {
+                        _ = &mut shutdown_rx => {
+                            task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                            let _ = task_readiness.send(Readiness::Stopped);
+                            return Ok(());
+                        }
+                        result = notifications_tx.send(notification) => result,
+                    };
+                    if send_result.is_err() {
                         task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                         let _ = task_readiness.send(Readiness::Stopped);
                         return Err(Error::ChannelClosed);
@@ -237,6 +305,9 @@ pub fn start_connected(
                     }
                 }
             };
+            // A connection that completed login is a successful session. Any
+            // later reconnect budget counts only failures in this session.
+            attempts = 0;
             let _ = task_readiness.send(Readiness::Ready);
             let mut heartbeat = tokio::time::interval(session.heartbeat_interval());
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -273,7 +344,15 @@ pub fn start_connected(
                                     task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                                     continue;
                                 }
-                                if notifications_tx.send(notification).await.is_err() {
+                                let send_result = tokio::select! {
+                                    _ = &mut shutdown_rx => {
+                                        task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                                        let _ = task_readiness.send(Readiness::Stopped);
+                                        return Ok(());
+                                    }
+                                    result = notifications_tx.send(notification) => result,
+                                };
+                                if send_result.is_err() {
                                     task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                                     let _ = task_readiness.send(Readiness::Stopped);
                                     return Err(Error::ChannelClosed);
@@ -385,6 +464,87 @@ mod tests {
                 .is_err()
         );
         assert!(handle.shutdown().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_send_when_output_queue_is_full() {
+        let source_result = ReceiverSource::channel(2);
+        assert!(source_result.is_ok());
+        let Some((sender, source)) = source_result.ok() else {
+            return;
+        };
+        let handle = start(source, 1, 2);
+        tokio::task::yield_now().await;
+        assert!(sender.send(Ok(Notification::new(vec![1], None))).await.is_ok());
+        assert!(sender.send(Ok(Notification::new(vec![2], None))).await.is_ok());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle.shutdown()).await;
+        assert!(matches!(result, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn source_sender_rejects_oversized_notifications_before_queueing() {
+        let source_result = ReceiverSource::channel(1);
+        assert!(source_result.is_ok());
+        let Some((sender, _source)) = source_result.ok() else {
+            return;
+        };
+        let result = sender
+            .send(Ok(Notification::new(
+                vec![0; MAX_NOTIFICATION_BYTES + 1],
+                None,
+            )))
+            .await;
+        assert!(matches!(result, Err(Error::NotificationTooLarge)));
+    }
+
+    struct ClosingSession;
+    impl crate::transport::McsSession for ClosingSession {
+        fn receive<'a>(&'a mut self) -> crate::transport::BoxFuture<'a, Result<SessionEvent>> {
+            Box::pin(async { Ok(SessionEvent::Closed) })
+        }
+
+        fn send_heartbeat<'a>(&'a mut self) -> crate::transport::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct ResetProbeConnector {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ReceiverConnector for ResetProbeConnector {
+        fn connect<'a>(
+            &'a self,
+            _persistent_ids: &'a [String],
+        ) -> crate::transport::BoxFuture<'a, Result<Box<dyn crate::transport::McsSession>>>
+        {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::AcqRel);
+                if call == 0 {
+                    Ok(Box::new(ClosingSession) as Box<dyn crate::transport::McsSession>)
+                } else {
+                    Err(Error::TransportClosed)
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_budget_resets_after_a_successful_session() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let connector = Arc::new(ResetProbeConnector {
+            calls: Arc::clone(&calls),
+        });
+        let policy = RetryPolicy::new(
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            0,
+        )
+        .with_max_attempts(1);
+        let handle = start_connected(connector, 1, 1, policy);
+        tokio::task::yield_now().await;
+        let result = handle.shutdown().await;
+        assert!(matches!(result, Err(Error::TransportClosed)));
+        assert_eq!(calls.load(Ordering::Acquire), 3);
     }
     #[test]
     fn rejects_zero_source_capacity() {

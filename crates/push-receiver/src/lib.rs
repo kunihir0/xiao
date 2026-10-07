@@ -35,8 +35,8 @@ pub use dedupe::{
 pub use error::{Error, Result};
 pub use lifecycle::{
     DEFAULT_DEDUPE_CAPACITY, DEFAULT_QUEUE_CAPACITY, MAX_NOTIFICATION_BYTES, MAX_QUEUE_BYTES,
-    MAX_QUEUE_CAPACITY, MAX_SOURCE_CAPACITY, Readiness, ReceiverHandle, ReceiverSource, start,
-    start_connected, start_with_policy,
+    MAX_QUEUE_CAPACITY, MAX_SOURCE_CAPACITY, Readiness, ReceiverHandle, ReceiverSource,
+    ReceiverSourceSender, start, start_connected, start_with_policy,
 };
 pub use mcs::{
     DurationConfig, LoginParameters, decode_data_message, decode_login_response,

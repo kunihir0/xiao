@@ -73,6 +73,12 @@ pub fn build_checkin_request(previous: Option<CheckinCredentials>) -> Vec<u8> {
 }
 
 pub fn parse_checkin_response(bytes: &[u8]) -> Result<CheckinResult> {
+    if bytes.len() > 64 * 1024 {
+        return Err(Error::FrameTooLarge {
+            actual: bytes.len(),
+            max: 64 * 1024,
+        });
+    }
     let response = proto::AndroidCheckinResponse::decode(bytes)
         .map_err(|error| Error::Decode(error.to_string()))?;
     if !response.stats_ok {
@@ -270,5 +276,13 @@ mod tests {
                 .map(|token| token.as_str().to_owned()),
             Some("APA91bFcmLegacyReferenceRegistrationToken-7f3a".to_owned())
         );
+    }
+
+    #[test]
+    fn rejects_oversized_checkin_response_before_decode() {
+        assert!(matches!(
+            parse_checkin_response(&vec![0_u8; 64 * 1024 + 1]),
+            Err(Error::FrameTooLarge { .. })
+        ));
     }
 }

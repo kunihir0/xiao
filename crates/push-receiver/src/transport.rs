@@ -2,11 +2,11 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::BytesMut;
+use prost::Message;
 use p256::{
     SecretKey,
     elliptic_curve::{Generate, sec1::ToSec1Point},
 };
-use prost::Message;
 use rand::{RngExt, rng};
 use reqwest::{Client, Response};
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
@@ -27,7 +27,7 @@ use crate::{
     codec::{FrameTag, McsCodec, McsFrame},
     crypto::WebPushKeyMaterial,
     mcs::{
-        LoginParameters, decode_data_message_with_metadata, decode_login_response,
+        LoginParameters, decode_data_message_with_metadata, decode_login_response_details,
         encode_heartbeat_ack, encode_heartbeat_ping, encode_login, encode_stream_ack,
     },
     proto,
@@ -37,7 +37,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const HEARTBEAT_GRACE: Duration = Duration::from_secs(5);
 const STREAM_ACK_THRESHOLD: usize = 10;
+
+fn http_error(error: reqwest::Error) -> Error {
+    Error::Http(error.without_url().to_string())
+}
 const SERVER_KEY: &[u8] = &[
     0x04, 0x33, 0x94, 0xf7, 0xdf, 0xa1, 0xeb, 0xb1, 0xdc, 0x03, 0xa2, 0x5e, 0x15, 0x71, 0xdb, 0x48,
     0xd3, 0x2e, 0xed, 0xed, 0xb2, 0x34, 0xdb, 0xb7, 0x47, 0x3a, 0x0c, 0x8f, 0xc4, 0xcc, 0xe1, 0x6f,
@@ -63,7 +68,7 @@ async fn bounded_body(mut response: Response, maximum: usize) -> Result<Vec<u8>>
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| Error::Http(error.to_string()))?
+        .map_err(http_error)?
     {
         let actual = body.len().saturating_add(chunk.len());
         if actual > maximum {
@@ -118,9 +123,9 @@ impl std::fmt::Debug for FcmConnector {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("FcmConnector")
-            .field("checkin_url", &self.checkin_url)
-            .field("registration_url", &self.registration_url)
-            .field("subscribe_url", &self.subscribe_url)
+            .field("checkin_url", &"<redacted>")
+            .field("registration_url", &"<redacted>")
+            .field("subscribe_url", &"<redacted>")
             .field("mcs_host", &self.mcs_host)
             .field("mcs_port", &self.mcs_port)
             .field("credentials", &"<redacted>")
@@ -138,12 +143,16 @@ impl FcmConnector {
         if sender_id.is_empty() || sender_id.len() > 256 {
             return Err(Error::MissingCredential("sender_id"));
         }
+        // reqwest's rustls-no-provider feature requires a process provider.
+        // Install the sole enabled backend before Client construction; the MCS
+        // client below also passes the same provider explicitly.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = Client::builder()
             .https_only(true)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(IO_TIMEOUT)
             .build()
-            .map_err(|error| Error::Http(error.to_string()))?;
+            .map_err(http_error)?;
         Ok(Self {
             client,
             checkin_url: "https://android.clients.google.com/checkin".into(),
@@ -196,9 +205,9 @@ impl FcmConnector {
             .body(build_checkin_request(None))
             .send()
             .await
-            .map_err(|error| Error::Http(error.to_string()))?
+            .map_err(http_error)?
             .error_for_status()
-            .map_err(|error| Error::Http(error.to_string()))?;
+            .map_err(http_error)?;
         let body = bounded_body(response, crate::MAX_FRAME_SIZE).await?;
         let result = parse_checkin_response(&body)?;
         let app_id = format!("wp:receiver.push.com#{}", Uuid::new_v4());
@@ -223,9 +232,9 @@ impl FcmConnector {
             .form(&form)
             .send()
             .await
-            .map_err(|error| Error::Http(error.to_string()))?
+            .map_err(http_error)?
             .error_for_status()
-            .map_err(|error| Error::Http(error.to_string()))?;
+            .map_err(http_error)?;
         let registration_body = String::from_utf8(bounded_body(registration, 4096).await?)
             .map_err(|_| Error::InvalidRegistration("registration response is not UTF-8".into()))?;
         let token = parse_registration_response(&registration_body)?;
@@ -245,9 +254,9 @@ impl FcmConnector {
             .form(&subscribe_form)
             .send()
             .await
-            .map_err(|error| Error::Http(error.to_string()))?
+            .map_err(http_error)?
             .error_for_status()
-            .map_err(|error| Error::Http(error.to_string()))?;
+            .map_err(http_error)?;
         let body = bounded_body(subscription, 16 * 1024).await?;
         serde_json::from_slice::<serde_json::Value>(&body).map_err(|error| {
             Error::InvalidRegistration(format!("invalid FCM response: {error}"))
@@ -291,9 +300,13 @@ impl ReceiverConnector for FcmConnector {
             .await
             .map_err(|_| Error::Timeout("MCS TCP connect"))??;
             let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let config = ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+            let config = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(|_| Error::InvalidState("ring provider lacks safe TLS versions"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
             let server_name = ServerName::try_from(self.mcs_host.clone())
                 .map_err(|_| Error::InvalidState("invalid MCS server name"))?;
             let stream = timeout(
@@ -319,12 +332,40 @@ impl ReceiverConnector for FcmConnector {
         })
     }
 }
-
 enum FrameEvent {
     Login,
     Data(crate::mcs::DecodedDataMessage),
-    HeartbeatPing,
+    HeartbeatPing(Option<i32>),
+    HeartbeatAck(Option<i32>),
+    Iq(Option<i32>),
     Close,
+}
+
+fn read_deadline(heartbeat: Duration) -> Duration {
+    heartbeat.saturating_add(HEARTBEAT_GRACE)
+}
+
+fn eof_result(decoder: &mut McsCodec, buffer: &mut BytesMut) -> Result<FrameEvent> {
+    match decoder.decode_eof(buffer) {
+        Ok(None) => Err(Error::TransportClosed),
+        Ok(Some(_)) => Err(Error::Protocol(
+            "MCS decoder returned a frame at EOF".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(Error::TruncatedFrame)
+        }
+        Err(error) => Err(Error::Decode(error.to_string())),
+    }
+}
+
+fn next_stream_id(current: i32, observed: Option<i32>) -> i32 {
+    observed.unwrap_or_else(|| {
+        if current > 0 {
+            current.saturating_add(1)
+        } else {
+            current
+        }
+    })
 }
 
 struct TlsMcsSession {
@@ -348,6 +389,9 @@ impl TlsMcsSession {
             last_stream_id_received: 0,
             unacknowledged_messages: 0,
         }
+    }
+    fn read_timeout(&self) -> Duration {
+        read_deadline(self.heartbeat)
     }
     async fn send_frame(&mut self, frame: McsFrame) -> Result<()> {
         let mut bytes = BytesMut::new();
@@ -377,7 +421,21 @@ impl TlsMcsSession {
                             &frame.payload,
                         )?));
                     }
-                    FrameTag::HeartbeatPing => return Ok(FrameEvent::HeartbeatPing),
+                    FrameTag::HeartbeatPing => {
+                        let ping = proto::HeartbeatPing::decode(frame.payload.as_slice())
+                            .map_err(|error| Error::Decode(error.to_string()))?;
+                        return Ok(FrameEvent::HeartbeatPing(ping.stream_id));
+                    }
+                    FrameTag::HeartbeatAck => {
+                        let ack = proto::HeartbeatAck::decode(frame.payload.as_slice())
+                            .map_err(|error| Error::Decode(error.to_string()))?;
+                        return Ok(FrameEvent::HeartbeatAck(ack.stream_id));
+                    }
+                    FrameTag::Iq => {
+                        let iq = proto::IqStanza::decode(frame.payload.as_slice())
+                            .map_err(|error| Error::Decode(error.to_string()))?;
+                        return Ok(FrameEvent::Iq(iq.stream_id));
+                    }
                     FrameTag::Close => return Ok(FrameEvent::Close),
                     FrameTag::StreamError => {
                         return Err(Error::Protocol("MCS stream error".into()));
@@ -385,11 +443,11 @@ impl TlsMcsSession {
                     _ => continue,
                 }
             }
-            let read = timeout(IO_TIMEOUT, self.stream.read_buf(&mut self.buffer))
+            let read = timeout(self.read_timeout(), self.stream.read_buf(&mut self.buffer))
                 .await
                 .map_err(|_| Error::Timeout("MCS read"))??;
             if read == 0 {
-                return Err(Error::TransportClosed);
+                return eof_result(&mut self.decoder, &mut self.buffer);
             }
         }
     }
@@ -401,14 +459,12 @@ struct LoginResponseConfig {
 }
 
 fn proto_login_response(payload: &[u8]) -> Result<LoginResponseConfig> {
-    let response =
-        proto::LoginResponse::decode(payload).map_err(|error| Error::Decode(error.to_string()))?;
-    let config = decode_login_response(payload)?;
+    let details = decode_login_response_details(payload)?;
     Ok(LoginResponseConfig {
-        heartbeat: Duration::from_millis(config.heartbeat_millis),
-        last_stream_id_received: response
+        heartbeat: Duration::from_millis(details.config.heartbeat_millis),
+        last_stream_id_received: details
             .last_stream_id_received
-            .or(response.stream_id)
+            .or(details.stream_id)
             .unwrap_or(1),
     })
 }
@@ -417,14 +473,21 @@ impl McsSession for TlsMcsSession {
     fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<SessionEvent>> {
         Box::pin(async move {
             loop {
-                match self.receive_frame().await? {
+                let event = self.receive_frame().await?;
+                let stream_id = match &event {
+                    FrameEvent::Data(data) => data.stream_id,
+                    FrameEvent::HeartbeatPing(stream_id)
+                    | FrameEvent::HeartbeatAck(stream_id)
+                    | FrameEvent::Iq(stream_id) => *stream_id,
+                    FrameEvent::Close => None,
+                    FrameEvent::Login => None,
+                };
+                if !matches!(&event, FrameEvent::Login) {
+                    self.last_stream_id_received =
+                        next_stream_id(self.last_stream_id_received, stream_id);
+                }
+                match event {
                     FrameEvent::Data(data) => {
-                        if let Some(stream_id) = data.stream_id {
-                            self.last_stream_id_received = stream_id;
-                        } else if self.last_stream_id_received > 0 {
-                            self.last_stream_id_received =
-                                self.last_stream_id_received.saturating_add(1);
-                        }
                         if data.notification.persistent_id.is_some() {
                             self.unacknowledged_messages =
                                 self.unacknowledged_messages.saturating_add(1);
@@ -439,7 +502,7 @@ impl McsSession for TlsMcsSession {
                         }
                         return Ok(SessionEvent::Notification(data.notification));
                     }
-                    FrameEvent::HeartbeatPing => {
+                    FrameEvent::HeartbeatPing(_) => {
                         let payload = encode_heartbeat_ack(
                             (self.last_stream_id_received > 0)
                                 .then_some(self.last_stream_id_received),
@@ -447,6 +510,7 @@ impl McsSession for TlsMcsSession {
                         self.send_frame(McsFrame::new(FrameTag::HeartbeatAck, payload))
                             .await?;
                     }
+                    FrameEvent::HeartbeatAck(_) | FrameEvent::Iq(_) => {}
                     FrameEvent::Close => return Ok(SessionEvent::Closed),
                     FrameEvent::Login => {}
                 }
@@ -479,6 +543,60 @@ impl Default for ProductionConfig {
             queue_capacity: crate::DEFAULT_QUEUE_CAPACITY,
             dedupe_capacity: crate::DEFAULT_DEDUPE_CAPACITY,
             retry: crate::RetryPolicy::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eof_with_partial_frame_is_a_typed_truncation() {
+        let mut decoder = McsCodec::server();
+        let mut buffer = BytesMut::from(&[FrameTag::DataMessage as u8, 5, 1][..]);
+        assert!(decoder.decode_frame(&mut buffer).is_ok());
+        assert!(matches!(
+            eof_result(&mut decoder, &mut buffer),
+            Err(Error::TruncatedFrame)
+        ));
+    }
+
+    #[test]
+    fn read_deadline_follows_negotiated_heartbeat() {
+        assert_eq!(
+            read_deadline(Duration::from_secs(45)),
+            Duration::from_secs(50)
+        );
+    }
+
+    #[test]
+    fn stream_counter_advances_for_stanzas_without_explicit_ids() {
+        assert_eq!(next_stream_id(7, None), 8);
+        assert_eq!(next_stream_id(7, Some(12)), 12);
+        assert_eq!(next_stream_id(0, None), 0);
+    }
+
+    #[test]
+    fn ring_provider_can_construct_connector_client() {
+        assert!(FcmConnector::new("sender").is_ok());
+    }
+
+    #[test]
+    fn connector_debug_redacts_custom_endpoint_urls() {
+        let connector = FcmConnector::new("sender")
+            .ok()
+            .map(|connector| {
+                connector.with_endpoints(
+                    "https://secret.example/checkin?token=secret",
+                    "https://secret.example/register",
+                )
+            });
+        assert!(connector.is_some());
+        if let Some(connector) = connector {
+            let debug = format!("{connector:?}");
+            assert!(!debug.contains("secret.example"));
+            assert!(!debug.contains("token=secret"));
         }
     }
 }

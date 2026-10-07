@@ -1,4 +1,7 @@
-use std::collections::{HashSet, VecDeque};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+};
 
 pub const MAX_DEDUPE_CAPACITY: usize = 16_384;
 pub const MAX_DEDUPE_BYTES: usize = 2 * 1024 * 1024;
@@ -9,8 +12,8 @@ pub struct PersistentIdWindow {
     capacity: usize,
     byte_budget: usize,
     bytes: usize,
-    order: VecDeque<String>,
-    seen: HashSet<String>,
+    order: VecDeque<Arc<str>>,
+    seen: HashSet<Arc<str>>,
 }
 
 impl std::fmt::Debug for PersistentIdWindow {
@@ -36,10 +39,14 @@ impl PersistentIdWindow {
             seen: HashSet::with_capacity(capacity.min(1024)),
         }
     }
+    /// Returns a bounded snapshot for a reconnect LoginRequest. The window
+    /// owns each ID once; this snapshot is the only allocation needed to
+    /// translate protocol IDs into the connector contract.
     #[must_use]
     pub fn ids(&self) -> Vec<String> {
-        self.order.iter().cloned().collect()
+        self.order.iter().map(|id| id.to_string()).collect()
     }
+
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.bytes
@@ -63,9 +70,9 @@ impl PersistentIdWindow {
                 return false;
             }
         }
-        let value = id.to_owned();
+        let value: Arc<str> = Arc::from(id);
         self.bytes = self.bytes.saturating_add(value.len());
-        self.seen.insert(value.clone());
+        self.seen.insert(Arc::clone(&value));
         self.order.push_back(value);
         false
     }

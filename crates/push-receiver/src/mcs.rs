@@ -5,6 +5,7 @@ use crate::{Error, Notification, Result, checkin::CheckinCredentials, proto};
 pub const MAX_PERSISTENT_ID_BYTES: usize = crate::dedupe::MAX_PERSISTENT_ID_BYTES;
 pub const MAX_APP_DATA_ITEMS: usize = 128;
 pub const MAX_APP_DATA_BYTES: usize = 64 * 1024;
+pub const MAX_APP_DATA_ENTRY_BYTES: usize = 16 * 1024;
 pub const MAX_RAW_DATA_BYTES: usize = crate::MAX_NOTIFICATION_BYTES;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -26,9 +27,14 @@ impl std::fmt::Debug for LoginParameters {
     }
 }
 
+/// Encodes a LoginRequest within the MCS frame budget.
+///
+/// Persistent IDs are sent newest-first and the oldest IDs are trimmed when
+/// needed to fit [`crate::MAX_FRAME_SIZE`]. A trimmed ID can be redelivered
+/// after reconnect, so consumers must retain notification idempotency.
 pub fn encode_login(parameters: &LoginParameters) -> Result<Vec<u8>> {
     let credentials = parameters.credentials;
-    let request = proto::LoginRequest {
+    let mut request = proto::LoginRequest {
         id: "chrome-63.0.3234.0".into(),
         domain: "mcs.android.com".into(),
         user: credentials.android_id().to_string(),
@@ -43,13 +49,36 @@ pub fn encode_login(parameters: &LoginParameters) -> Result<Vec<u8>> {
             name: "new_vc".into(),
             value: "1".into(),
         }],
-        received_persistent_id: parameters.persistent_ids.clone(),
         ..Default::default()
     };
-    Ok(request.encode_to_vec())
+    for id in parameters.persistent_ids.iter().rev() {
+        request.received_persistent_id.push(id.clone());
+        if request.encoded_len() > crate::MAX_FRAME_SIZE {
+            request.received_persistent_id.pop();
+            break;
+        }
+    }
+    let encoded = request.encode_to_vec();
+    if encoded.len() > crate::MAX_FRAME_SIZE {
+        return Err(Error::FrameTooLarge {
+            actual: encoded.len(),
+            max: crate::MAX_FRAME_SIZE,
+        });
+    }
+    Ok(encoded)
 }
 
 pub fn decode_login_response(payload: &[u8]) -> Result<DurationConfig> {
+    Ok(decode_login_response_details(payload)?.config)
+}
+
+pub(crate) struct LoginResponseDetails {
+    pub config: DurationConfig,
+    pub stream_id: Option<i32>,
+    pub last_stream_id_received: Option<i32>,
+}
+
+pub(crate) fn decode_login_response_details(payload: &[u8]) -> Result<LoginResponseDetails> {
     if payload.len() > crate::MAX_FRAME_SIZE {
         return Err(Error::FrameTooLarge {
             actual: payload.len(),
@@ -63,20 +92,25 @@ pub fn decode_login_response(payload: &[u8]) -> Result<DurationConfig> {
             "MCS login response missing id".into(),
         ));
     }
-    if let Some(error) = response.error.filter(|error| error.code != 0) {
+    if response.error.as_ref().is_some_and(|error| error.code != 0) {
         return Err(Error::InvalidRegistration(format!(
             "MCS login {}",
-            error.code
+            response.error.as_ref().map_or(0, |error| error.code)
         )));
     }
     let millis = response
         .heartbeat_config
+        .as_ref()
         .and_then(|config| config.interval_ms)
         .map(i64::from)
         .filter(|value| *value > 0)
         .unwrap_or(300_000);
-    Ok(DurationConfig {
-        heartbeat_millis: millis.clamp(30_000, 900_000) as u64,
+    Ok(LoginResponseDetails {
+        config: DurationConfig {
+            heartbeat_millis: millis.clamp(30_000, 900_000) as u64,
+        },
+        stream_id: response.stream_id,
+        last_stream_id_received: response.last_stream_id_received,
     })
 }
 
@@ -106,6 +140,12 @@ pub(crate) fn decode_data_message_with_metadata(payload: &[u8]) -> Result<Decode
         ));
     }
     if message.app_data.len() > MAX_APP_DATA_ITEMS {
+        return Err(Error::NotificationTooLarge);
+    }
+    if message.app_data.iter().any(|entry| {
+        entry.key.len() > MAX_APP_DATA_ENTRY_BYTES
+            || entry.value.len() > MAX_APP_DATA_ENTRY_BYTES
+    }) {
         return Err(Error::NotificationTooLarge);
     }
     let app_data_bytes = message
@@ -202,5 +242,54 @@ mod tests {
             notification.ok().map(|value| value.payload),
             Some(b"hello".to_vec())
         );
+    }
+
+    #[test]
+    fn trims_login_persistent_ids_to_frame_budget_newest_first() {
+        let credentials = CheckinCredentials::new(0x1234_5678, 0x8765_4321);
+        assert!(credentials.is_ok());
+        let Some(credentials) = credentials.ok() else {
+            return;
+        };
+        let ids = (0..400)
+            .map(|index| format!("{index:04}-{}", "x".repeat(MAX_PERSISTENT_ID_BYTES)))
+            .collect::<Vec<_>>();
+        let payload = encode_login(&LoginParameters {
+            credentials,
+            persistent_ids: ids.clone(),
+        });
+        assert!(payload.is_ok());
+        let Ok(payload) = payload else {
+            return;
+        };
+        assert!(payload.len() <= crate::MAX_FRAME_SIZE);
+        let request = proto::LoginRequest::decode(payload.as_slice());
+        assert!(request.is_ok());
+        let Ok(request) = request else {
+            return;
+        };
+        assert_eq!(request.received_persistent_id.first(), ids.last());
+        assert!(request.received_persistent_id.len() < ids.len());
+    }
+
+    #[test]
+    fn rejects_repeated_app_data_before_materializing_notification() {
+        let message = proto::DataMessageStanza {
+            from: "fcm".into(),
+            category: "cat".into(),
+            app_data: (0..=MAX_APP_DATA_ITEMS)
+                .map(|index| proto::AppData {
+                    key: format!("key-{index}"),
+                    value: "value".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let payload = message.encode_to_vec();
+        assert!(payload.len() < crate::MAX_FRAME_SIZE);
+        assert!(matches!(
+            decode_data_message(&payload),
+            Err(Error::NotificationTooLarge)
+        ));
     }
 }
