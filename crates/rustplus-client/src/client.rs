@@ -337,7 +337,7 @@ impl RustPlusClient {
         let generation = self
             .inner
             .generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
             .map_err(|_| Error::SequenceExhausted)?
             .checked_add(1)
             .ok_or(Error::SequenceExhausted)?;
@@ -943,7 +943,7 @@ fn clan_chat(raw: &proto::AppClanMessage) -> ChatMessage {
     }
 }
 
-fn valid_timestamp(value: i64) -> Option<i64> {
+pub(crate) fn valid_timestamp(value: i64) -> Option<i64> {
     (value > 0).then_some(value)
 }
 
