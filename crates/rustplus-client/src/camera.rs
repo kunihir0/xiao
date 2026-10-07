@@ -4,7 +4,8 @@ use crate::{
 };
 
 const MAX_DIMENSION: u32 = 4096;
-const MAX_PIXELS: u64 = 16_777_216;
+const MAX_PIXELS: u64 = 1_048_576;
+const MAX_FRAME_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraImage {
@@ -19,7 +20,7 @@ pub struct FrameBuilder {
     pub height: u32,
     pub pixels: Vec<u8>,
     pub received: u32,
-    sample_pos: Vec<(u16, u16)>,
+    sample_pos: Vec<u16>,
 }
 
 impl FrameBuilder {
@@ -39,27 +40,47 @@ impl FrameBuilder {
             .checked_mul(4)
             .ok_or(Error::InvalidCamera("pixel buffer overflow"))?
             as usize;
-        let mut sample_pos = Vec::with_capacity(pixels as usize);
+        let sample_bytes = pixels
+            .checked_mul(2)
+            .ok_or(Error::InvalidCamera("sample position overflow"))?;
+        if pixel_bytes
+            .checked_add(sample_bytes)
+            .ok_or(Error::InvalidCamera("frame memory overflow"))?
+            > MAX_FRAME_BYTES
+        {
+            return Err(Error::InvalidCamera("frame memory budget exceeded"));
+        }
+        let mut sample_pos = Vec::with_capacity(
+            usize::try_from(sample_bytes)
+                .map_err(|_| Error::InvalidCamera("sample position overflow"))?,
+        );
         for y in 0..height {
             for x in 0..width {
-                sample_pos.push((
+                sample_pos.push(
                     u16::try_from(x)
                         .map_err(|_| Error::InvalidCamera("width exceeds sample format"))?,
+                );
+                sample_pos.push(
                     u16::try_from(y)
                         .map_err(|_| Error::InvalidCamera("height exceeds sample format"))?,
-                ));
+                );
             }
         }
         let mut generator = IndexGenerator::new(1337);
         for index in (1..pixels).rev() {
-            let swap = usize::try_from(
-                generator.next_int(
-                    u32::try_from(index + 1)
-                        .map_err(|_| Error::InvalidCamera("sample index overflow"))?,
-                ),
-            )
-            .map_err(|_| Error::InvalidCamera("sample index overflow"))?;
-            sample_pos.swap(index as usize, swap);
+            let max = u32::try_from(index + 1)
+                .map_err(|_| Error::InvalidCamera("sample index overflow"))?;
+            let swap = usize::try_from(generator.next_int(max))
+                .map_err(|_| Error::InvalidCamera("sample index overflow"))?;
+            let current = usize::try_from(index)
+                .map_err(|_| Error::InvalidCamera("sample index overflow"))?
+                .checked_mul(2)
+                .ok_or(Error::InvalidCamera("sample index overflow"))?;
+            let target = swap
+                .checked_mul(2)
+                .ok_or(Error::InvalidCamera("sample index overflow"))?;
+            sample_pos.swap(current, target);
+            sample_pos.swap(current + 1, target + 1);
         }
         Ok(Self {
             width,
@@ -74,20 +95,28 @@ impl FrameBuilder {
         if rays.sample_offset < 0 {
             return Err(Error::InvalidCamera("negative sample offset"));
         }
-        let sample_count = self.sample_pos.len();
+        let sample_count = self.sample_pos.len() / 2;
+        let total_positions = self.sample_pos.len();
         let mut offset = usize::try_from(rays.sample_offset)
             .map_err(|_| Error::InvalidCamera("sample offset overflow"))?;
         if sample_count == 0 {
             return Err(Error::InvalidCamera("empty frame"));
         }
-        offset = (offset
+        offset = offset
             .checked_mul(2)
-            .ok_or(Error::InvalidCamera("sample offset overflow"))?)
-            % (sample_count * 2);
+            .ok_or(Error::InvalidCamera("sample offset overflow"))?
+            % total_positions;
         let mut pointer = 0usize;
         let mut lookback = [[0u8; 3]; 64];
         let mut decoded = 0usize;
         while pointer < rays.ray_data.len() {
+            if usize::try_from(self.received)
+                .ok()
+                .and_then(|received| received.checked_add(decoded))
+                .is_none_or(|count| count >= sample_count)
+            {
+                return Err(Error::InvalidCamera("ray payload exceeds frame samples"));
+            }
             let token = rays.ray_data[pointer];
             pointer += 1;
             let sample = if token == 255 {
@@ -131,12 +160,22 @@ impl FrameBuilder {
             let t = sample[0];
             let r = sample[1];
             let material = sample[2];
-            let first = offset % (sample_count * 2);
-            let second = (first + 1) % (sample_count * 2);
-            offset = (second + 1) % (sample_count * 2);
-            let sample = self.sample_pos[first / 2];
-            let x = usize::from(sample.0);
-            let y = usize::from(self.height as u16 - 1 - sample.1);
+            let first = offset;
+            let second = first
+                .checked_add(1)
+                .ok_or(Error::InvalidCamera("sample offset overflow"))?
+                % total_positions;
+            offset = second
+                .checked_add(1)
+                .ok_or(Error::InvalidCamera("sample offset overflow"))?
+                % total_positions;
+            let x = usize::from(self.sample_pos[first]);
+            let y = usize::from(
+                (self.height as u16)
+                    .checked_sub(self.sample_pos[second])
+                    .and_then(|value| value.checked_sub(1))
+                    .ok_or(Error::InvalidCamera("sample position out of bounds"))?,
+            );
             let pixel = y
                 .checked_mul(self.width as usize)
                 .and_then(|v| v.checked_add(x))
@@ -210,19 +249,28 @@ impl IndexGenerator {
         this
     }
     fn next_state(&mut self) -> u32 {
-        let old = self.state;
-        let mut value = old;
-        value ^= value << 13;
-        value ^= value >> 17;
-        value ^= value << 5;
-        self.state = value;
-        old
+        let t = self.state as i32;
+        let mut value = t;
+        value ^= value.wrapping_shl(13);
+        value ^= (value as u32 >> 17) as i32;
+        value ^= value.wrapping_shl(5);
+        self.state = value as u32;
+        if t >= 0 {
+            t as u32
+        } else {
+            (4_294_967_295_i64 + i64::from(t) - 1) as u32
+        }
     }
     fn next_int(&mut self, max: u32) -> u32 {
         if max == 0 {
             0
         } else {
-            ((u64::from(self.next_state()) * u64::from(max)) / 4_294_967_295) as u32
+            let mut value =
+                ((u64::from(self.next_state()) * u64::from(max)) / 4_294_967_295) as i32;
+            if value < 0 {
+                value = (max as i32).wrapping_add(value).wrapping_sub(1);
+            }
+            value as u32
         }
     }
 }
