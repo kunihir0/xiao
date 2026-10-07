@@ -1,6 +1,5 @@
-#![allow(deprecated)]
 use aes_gcm_siv::{
-    Aes256GcmSiv, Key, Nonce,
+    Aes256GcmSiv, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
 use rand::{RngExt, rng};
@@ -155,7 +154,9 @@ impl FileKeyring {
         {
             return Err(KeyringError::InsecurePermissions);
         }
-        let contents = fs::read_to_string(path).map_err(|_| KeyringError::Read)?;
+        // Key material is read into zeroizing buffers so the hex text and the
+        // decoded bytes are wiped once the keyring is built.
+        let contents = Zeroizing::new(fs::read_to_string(path).map_err(|_| KeyringError::Read)?);
         let mut entries = Vec::new();
         for line in contents.lines() {
             let line = line.trim();
@@ -168,7 +169,7 @@ impl FileKeyring {
             if hex.len() != 64 {
                 return Err(KeyringError::InvalidKey);
             }
-            let mut bytes = [0u8; 32];
+            let mut bytes = Zeroizing::new([0u8; 32]);
             let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
             if !remainder.is_empty() {
                 return Err(KeyringError::InvalidKey);
@@ -178,22 +179,30 @@ impl FileKeyring {
             }
             entries.push((id, bytes));
         }
-        Self::from_entries(active_key_id, entries)
+        Self::from_zeroizing_entries(active_key_id, entries)
     }
     pub fn from_keys(
         active: impl AsRef<str>,
         keys: Vec<(KeyId, [u8; 32])>,
     ) -> Result<Self, KeyringError> {
-        Self::from_entries(active.as_ref(), keys)
+        Self::from_zeroizing_entries(
+            active.as_ref(),
+            keys.into_iter()
+                .map(|(id, key)| (id, Zeroizing::new(key)))
+                .collect(),
+        )
     }
-    fn from_entries(active: &str, entries: Vec<(KeyId, [u8; 32])>) -> Result<Self, KeyringError> {
+    fn from_zeroizing_entries(
+        active: &str,
+        entries: Vec<(KeyId, Zeroizing<[u8; 32]>)>,
+    ) -> Result<Self, KeyringError> {
         if entries.is_empty() {
             return Err(KeyringError::Empty);
         }
         let active = KeyId::new(active).map_err(|_| KeyringError::InvalidKeyId)?;
         let mut keys = HashMap::with_capacity(entries.len());
         for (id, bytes) in entries {
-            if keys.insert(id, Zeroizing::new(bytes)).is_some() {
+            if keys.insert(id, bytes).is_some() {
                 return Err(KeyringError::Duplicate);
             }
         }
@@ -227,10 +236,9 @@ impl KeyProvider for FileKeyring {
             let kek = self.keys.get(key_id).ok_or(SecretError::KeyUnavailable)?;
             let mut nonce = [0u8; NONCE_LEN];
             rng().fill(&mut nonce);
-            let cipher = cipher(kek);
-            let encrypted = cipher
+            let encrypted = cipher(kek)?
                 .encrypt(
-                    Nonce::from_slice(&nonce),
+                    &Nonce::from(nonce),
                     Payload {
                         msg: dek.bytes(),
                         aad,
@@ -254,16 +262,21 @@ impl KeyProvider for FileKeyring {
                 return Err(SecretError::Decryption);
             }
             let kek = self.keys.get(key_id).ok_or(SecretError::KeyUnavailable)?;
-            let plain = cipher(kek)
-                .decrypt(
-                    Nonce::from_slice(&wrapped[..NONCE_LEN]),
-                    Payload {
-                        msg: &wrapped[NONCE_LEN..],
-                        aad,
-                    },
-                )
+            let plain = Zeroizing::new(
+                cipher(kek)?
+                    .decrypt(
+                        nonce_ref(&wrapped[..NONCE_LEN])?,
+                        Payload {
+                            msg: &wrapped[NONCE_LEN..],
+                            aad,
+                        },
+                    )
+                    .map_err(|_| SecretError::Decryption)?,
+            );
+            let bytes: [u8; 32] = plain
+                .as_slice()
+                .try_into()
                 .map_err(|_| SecretError::Decryption)?;
-            let bytes: [u8; 32] = plain.try_into().map_err(|_| SecretError::Decryption)?;
             Ok(DataKey::from_bytes(bytes))
         })
     }
@@ -279,8 +292,11 @@ fn hex_digit(b: u8) -> Option<u8> {
         _ => None,
     }
 }
-fn cipher(key: &[u8; 32]) -> Aes256GcmSiv {
-    Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(key))
+fn cipher(key: &[u8; 32]) -> Result<Aes256GcmSiv, SecretError> {
+    Aes256GcmSiv::new_from_slice(key).map_err(|_| SecretError::KeyUnavailable)
+}
+fn nonce_ref(bytes: &[u8]) -> Result<&Nonce, SecretError> {
+    <&Nonce>::try_from(bytes).map_err(|_| SecretError::UnsupportedEnvelope)
 }
 
 #[allow(dead_code)]
@@ -330,9 +346,9 @@ pub(crate) async fn seal(
     }
     let mut nonce = [0; NONCE_LEN];
     rng().fill(&mut nonce);
-    let ciphertext = cipher(data_key.bytes())
+    let ciphertext = cipher(data_key.bytes())?
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: plaintext,
                 aad: &data_aad,
@@ -374,9 +390,9 @@ pub(crate) async fn open(
     let data_aad = aad(table, record_id, kind);
     let wrap = wrap_aad(&data_aad, &key_id);
     let dek = provider.unwrap(&key_id, wrapped_dek, &wrap).await?;
-    cipher(dek.bytes())
+    cipher(dek.bytes())?
         .decrypt(
-            Nonce::from_slice(nonce),
+            nonce_ref(nonce)?,
             Payload {
                 msg: ciphertext,
                 aad: &data_aad,
