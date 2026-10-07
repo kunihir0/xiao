@@ -232,10 +232,10 @@ fn is_special_v4(address: Ipv4Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
     use super::{parse_notification, parse_public_ip};
     use crate::{ParseConfig, ParseError};
     use bot_domain::{MAX_ENTITY_KIND_BYTES, MAX_ENTITY_NAME_BYTES};
+    use proptest::prelude::*;
 
     #[test]
     fn parses_number_and_string_forms_from_any_app_data_key() -> Result<(), ParseError> {

@@ -128,9 +128,9 @@ fn decode(value: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
     use super::*;
     use aes_gcm::aead::{Aead, KeyInit};
+    use proptest::prelude::*;
 
     #[test]
     fn malformed_base64_and_padding_fail_closed() {

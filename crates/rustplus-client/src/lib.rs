@@ -26,8 +26,8 @@ pub use types::{
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use proptest::prelude::*;
     use super::*;
+    use proptest::prelude::*;
     use prost::Message;
     use std::time::Duration;
 

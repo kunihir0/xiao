@@ -247,8 +247,8 @@ fn encode_varint(mut value: usize, dst: &mut BytesMut) {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn rejects_overlong_and_overflow_varints() {
