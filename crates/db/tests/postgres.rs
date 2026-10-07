@@ -33,7 +33,9 @@ async fn drop_schema(
 #[tokio::test]
 async fn invalid_connection_fails_without_leaking_url()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = DbConfig::new("postgres://secret-user:secret-password@127.0.0.1:1/no-db")?;
+    let config = DbConfig::insecure_for_local_dev(
+        "postgres://secret-user:secret-password@127.0.0.1:1/no-db",
+    )?;
     let debug = format!("{config:?}");
     assert!(!debug.contains("secret-password"));
 
@@ -57,7 +59,8 @@ async fn applies_pending_migrations_idempotently_and_sets_readiness()
     let operation_base_url = base_url.clone();
     let operation_schema = schema.clone();
     let mut operation = tokio::spawn(async move {
-        let config = DbConfig::new(schema_url(&operation_base_url, &operation_schema))?;
+        let config =
+            DbConfig::insecure_for_local_dev(schema_url(&operation_base_url, &operation_schema))?;
         let db = Db::connect(&config).await?;
         if db.is_ready() {
             return Err("database should not be ready before migrations".into());
@@ -118,7 +121,8 @@ async fn unmigrated_schema_fails_readiness_and_verify_and_ping_succeeds_once_mig
     let operation_base_url = base_url.clone();
     let operation_schema = schema.clone();
     let mut operation = tokio::spawn(async move {
-        let config = DbConfig::new(schema_url(&operation_base_url, &operation_schema))?;
+        let config =
+            DbConfig::insecure_for_local_dev(schema_url(&operation_base_url, &operation_schema))?;
         let db = Db::connect(&config).await?;
 
         // Before migrations, verify_schema_current and ping must fail with SchemaPending
@@ -169,4 +173,83 @@ async fn unmigrated_schema_fails_readiness_and_verify_and_ping_succeeds_once_mig
 
     drop_schema(&base_url, &schema).await?;
     result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires real PostgreSQL TLS service and DATABASE_TLS_URL"]
+async fn postgres_tls_verify_full_connects_with_correct_ca()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tls_url = match std::env::var("DATABASE_TLS_URL") {
+        Ok(url) => url,
+        Err(_) => return Ok(()),
+    };
+    let ca_file = match std::env::var("DATABASE_CA_FILE") {
+        Ok(file) => file,
+        Err(_) => return Ok(()),
+    };
+
+    let config = DbConfig::verify_full(&tls_url, &ca_file)?;
+    let db = Db::connect(&config).await?;
+    assert!(!db.is_ready());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires real PostgreSQL TLS service and DATABASE_TLS_URL"]
+async fn postgres_tls_verify_full_fails_with_wrong_ca()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tls_url = match std::env::var("DATABASE_TLS_URL") {
+        Ok(url) => url,
+        Err(_) => return Ok(()),
+    };
+    let wrong_ca_file = match std::env::var("DATABASE_WRONG_CA_FILE") {
+        Ok(file) => file,
+        Err(_) => return Ok(()),
+    };
+
+    let config = DbConfig::verify_full(&tls_url, &wrong_ca_file)?;
+    let result = Db::connect(&config).await;
+    assert!(result.is_err(), "connecting with wrong CA must fail");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires real PostgreSQL TLS service and DATABASE_TLS_HOSTNAME_MISMATCH_URL"]
+async fn postgres_tls_verify_full_fails_on_hostname_mismatch()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mismatch_url = match std::env::var("DATABASE_TLS_HOSTNAME_MISMATCH_URL") {
+        Ok(url) => url,
+        Err(_) => return Ok(()),
+    };
+    let ca_file = match std::env::var("DATABASE_CA_FILE") {
+        Ok(file) => file,
+        Err(_) => return Ok(()),
+    };
+
+    let config = DbConfig::verify_full(&mismatch_url, &ca_file)?;
+    let result = Db::connect(&config).await;
+    assert!(
+        result.is_err(),
+        "connecting with hostname mismatch must fail"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires plain PostgreSQL service and DATABASE_URL"]
+async fn postgres_tls_verify_full_fails_when_server_has_ssl_off()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let plain_url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is required")?;
+    let ca_file = match std::env::var("DATABASE_CA_FILE") {
+        Ok(file) => file,
+        Err(_) => return Ok(()),
+    };
+
+    let config = DbConfig::verify_full(&plain_url, &ca_file)?;
+    let result = Db::connect(&config).await;
+    assert!(
+        result.is_err(),
+        "verify-full against plain postgres must fail without plaintext fallback"
+    );
+    Ok(())
 }

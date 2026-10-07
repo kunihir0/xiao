@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Trusted release/operator procedure. The registry reference may be a tag while
-# building; the printed manifest digest is the only value promoted to Compose.
+# Trusted release/operator procedure.
 : "${IMAGE:?set IMAGE to a registry repository and release tag}"
-SOURCE_COMMIT="${SOURCE_COMMIT:-${GITHUB_SHA:-}}"
-if [[ -z "$SOURCE_COMMIT" ]]; then
-  SOURCE_COMMIT=$(git rev-parse HEAD)
+
+# Working tree must be completely clean
+if [[ -n "$(git status --porcelain)" ]]; then
+  printf '%s\n' 'working directory has uncommitted changes; aborting' >&2
+  exit 1
 fi
-if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
-  printf '%s\n' 'SOURCE_COMMIT must be a 40-character Git commit SHA' >&2
-  exit 64
+
+HEAD_COMMIT=$(git rev-parse HEAD)
+
+if [[ -n "${SOURCE_COMMIT:-}" && "$SOURCE_COMMIT" != "$HEAD_COMMIT" ]]; then
+  printf '%s\n' "SOURCE_COMMIT ($SOURCE_COMMIT) does not match git rev-parse HEAD ($HEAD_COMMIT)" >&2
+  exit 1
 fi
+SOURCE_COMMIT="$HEAD_COMMIT"
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$repo_root"

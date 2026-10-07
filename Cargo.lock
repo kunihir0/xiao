@@ -185,7 +185,10 @@ dependencies = [
 name = "bot-config"
 version = "0.1.0"
 dependencies = [
+ "rustix",
+ "tempfile",
  "url",
+ "zeroize",
 ]
 
 [[package]]

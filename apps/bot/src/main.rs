@@ -86,21 +86,23 @@ fn create_db_config(
     database_url: &str,
     tls_config: &bot_config::DatabaseTlsConfig,
 ) -> Result<DbConfig, BoxError> {
-    let mut config = DbConfig::new(database_url)?;
-    config = match tls_config {
+    match tls_config {
         bot_config::DatabaseTlsConfig::VerifyFull { ca_file } => {
-            config.with_tls_verify_full(ca_file)?
+            DbConfig::verify_full(database_url, ca_file).map_err(|e| Box::new(e) as BoxError)
         }
-        bot_config::DatabaseTlsConfig::Insecure => config.with_insecure_tls(),
-    };
-    Ok(config)
+        bot_config::DatabaseTlsConfig::Insecure => {
+            DbConfig::insecure_for_local_dev(database_url).map_err(|e| Box::new(e) as BoxError)
+        }
+    }
 }
 
-async fn run_migrations_command(config: &Config) -> Result<(), BoxError> {
-    let migration_url = config
-        .migration_database_url()
-        .unwrap_or_else(|| config.database_url());
-    let db_config = create_db_config(migration_url, config.database_tls())?;
+async fn run_migrations_command() -> Result<(), BoxError> {
+    let migration_config =
+        bot_config::MigrationConfig::from_env().map_err(|error| Box::new(error) as BoxError)?;
+    let db_config = create_db_config(
+        migration_config.database_url(),
+        migration_config.database_tls(),
+    )?;
     let database = Db::connect(&db_config).await?;
     info!("running database migrations");
     let report = database.run_migrations().await?;
@@ -114,16 +116,23 @@ async fn run_migrations_command(config: &Config) -> Result<(), BoxError> {
 }
 
 async fn run() -> Result<(), BoxError> {
-    let config = Config::from_env().map_err(|error| Box::new(error) as BoxError)?;
-    let _telemetry = init_from_config(&config).map_err(|error| Box::new(error) as BoxError)?;
-
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mode = parse_bot_mode(&args, config.database_migrate_on_startup())
-        .map_err(|msg| Box::<dyn std::error::Error + Send + Sync>::from(msg))?;
+    let mode =
+        parse_bot_mode(&args, true).map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
 
     match mode {
-        BotMode::MigrateOnly => run_migrations_command(&config).await,
-        BotMode::Run { migrate_on_startup } => {
+        BotMode::MigrateOnly => run_migrations_command().await,
+        BotMode::Run {
+            migrate_on_startup: requested_migrate_on_startup,
+        } => {
+            let config = Config::from_env().map_err(|error| Box::new(error) as BoxError)?;
+            let _telemetry =
+                init_from_config(&config).map_err(|error| Box::new(error) as BoxError)?;
+            let migrate_on_startup = if requested_migrate_on_startup {
+                config.database_migrate_on_startup()
+            } else {
+                false
+            };
             let database_config = create_db_config(config.database_url(), config.database_tls())?;
             let database = Db::connect(&database_config).await?;
             if migrate_on_startup {
@@ -231,44 +240,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_bot_mode_defaults_to_config_setting() {
+    fn parse_bot_mode_defaults_to_config_setting() -> Result<(), String> {
         assert_eq!(
-            parse_bot_mode(&[], true).unwrap(),
+            parse_bot_mode(&[], true)?,
             BotMode::Run {
                 migrate_on_startup: true
             }
         );
         assert_eq!(
-            parse_bot_mode(&[], false).unwrap(),
+            parse_bot_mode(&[], false)?,
             BotMode::Run {
                 migrate_on_startup: false
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_bot_mode_migrate_subcommand_selects_migrate_only() {
+    fn parse_bot_mode_migrate_subcommand_selects_migrate_only() -> Result<(), String> {
         for arg in ["migrate", "--migrate"] {
             assert_eq!(
-                parse_bot_mode(&[arg.to_owned()], true).unwrap(),
+                parse_bot_mode(&[arg.to_owned()], true)?,
                 BotMode::MigrateOnly
             );
             assert_eq!(
-                parse_bot_mode(&[arg.to_owned()], false).unwrap(),
+                parse_bot_mode(&[arg.to_owned()], false)?,
                 BotMode::MigrateOnly
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn parse_bot_mode_startup_migration_flags_override_default() {
+    fn parse_bot_mode_startup_migration_flags_override_default() -> Result<(), String> {
         for arg in [
             "--no-startup-migrations",
             "--no-migrate",
             "--skip-migrations",
         ] {
             assert_eq!(
-                parse_bot_mode(&[arg.to_owned()], true).unwrap(),
+                parse_bot_mode(&[arg.to_owned()], true)?,
                 BotMode::Run {
                     migrate_on_startup: false
                 }
@@ -276,22 +287,18 @@ mod tests {
         }
         for arg in ["--startup-migrations", "--migrate-on-startup"] {
             assert_eq!(
-                parse_bot_mode(&[arg.to_owned()], false).unwrap(),
+                parse_bot_mode(&[arg.to_owned()], false)?,
                 BotMode::Run {
                     migrate_on_startup: true
                 }
             );
         }
+        Ok(())
     }
 
     #[test]
     fn parse_bot_mode_rejects_unknown_argument() {
         let result = parse_bot_mode(&["--invalid-arg".to_owned()], true);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("unknown command line argument")
-        );
+        assert!(matches!(&result, Err(msg) if msg.contains("unknown command line argument")));
     }
 }

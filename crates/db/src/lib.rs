@@ -43,12 +43,33 @@ pub struct DbConfig {
 }
 
 impl DbConfig {
-    /// Creates a database configuration from a PostgreSQL connection URL.
-    ///
-    /// By default, TLS is set to [`DbTlsMode::Insecure`] for local development
-    /// and unit testing convenience. Production code MUST call
-    /// [`DbConfig::with_tls_verify_full`] or [`DbConfig::with_tls`].
-    pub fn new(database_url: impl Into<String>) -> Result<Self, DbError> {
+    /// Creates a database configuration enforcing strict verify-full TLS with a CA certificate file.
+    pub fn verify_full(
+        database_url: impl Into<String>,
+        ca_file: impl Into<PathBuf>,
+    ) -> Result<Self, DbError> {
+        let database_url = database_url.into();
+        if database_url.trim().is_empty() {
+            return Err(DbError::InvalidConfiguration {
+                reason: "database URL must not be empty",
+            });
+        }
+        let ca_file = ca_file.into();
+        if ca_file.as_os_str().is_empty() {
+            return Err(DbError::InvalidConfiguration {
+                reason: "CA certificate path must not be empty",
+            });
+        }
+
+        Ok(Self {
+            database_url,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            tls: DbTlsMode::VerifyFull { ca_file },
+        })
+    }
+
+    /// Explicitly opts into insecure unencrypted database connections for local development or tests.
+    pub fn insecure_for_local_dev(database_url: impl Into<String>) -> Result<Self, DbError> {
         let database_url = database_url.into();
         if database_url.trim().is_empty() {
             return Err(DbError::InvalidConfiguration {
@@ -250,7 +271,7 @@ impl Db {
                 manager_config.recycling_method = RecyclingMethod::Verified;
                 manager_config.custom_setup = Box::new(move |url: &str| {
                     let tls_connector = tls_connector.clone();
-                    let pg_config = match url.parse::<tokio_postgres::Config>() {
+                    let mut pg_config = match url.parse::<tokio_postgres::Config>() {
                         Ok(pg_config) => pg_config,
                         Err(err) => {
                             return futures_util::future::err(
@@ -259,6 +280,7 @@ impl Db {
                             .boxed();
                         }
                     };
+                    pg_config.ssl_mode(tokio_postgres::config::SslMode::Require);
                     async move {
                         let (client, conn) =
                             pg_config.connect(tls_connector).await.map_err(|err| {
@@ -421,45 +443,40 @@ mod tests {
     type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
     #[test]
-    fn db_config_new_defaults_to_insecure_tls() -> Result<(), BoxError> {
-        let config = DbConfig::new("postgres://localhost/bot")?;
-        assert_eq!(config.tls(), &DbTlsMode::Insecure);
-        assert_eq!(config.max_connections, DEFAULT_MAX_CONNECTIONS);
+    fn db_config_constructors_require_explicit_tls_mode() -> Result<(), BoxError> {
+        let insecure = DbConfig::insecure_for_local_dev("postgres://localhost/bot")?;
+        assert_eq!(insecure.tls(), &DbTlsMode::Insecure);
+        assert_eq!(insecure.max_connections, DEFAULT_MAX_CONNECTIONS);
+
+        let secure = DbConfig::verify_full("postgres://localhost/bot", "/path/to/ca.crt")?;
+        assert_eq!(
+            secure.tls(),
+            &DbTlsMode::VerifyFull {
+                ca_file: PathBuf::from("/path/to/ca.crt")
+            }
+        );
+        let debug = format!("{secure:?}");
+        assert!(debug.contains("/path/to/ca.crt"));
+        assert!(!debug.contains("postgres://localhost/bot"));
         Ok(())
     }
 
     #[test]
     fn db_config_rejects_empty_inputs() {
         assert!(matches!(
-            DbConfig::new("   "),
+            DbConfig::insecure_for_local_dev("   "),
             Err(DbError::InvalidConfiguration { .. })
         ));
         assert!(matches!(
-            DbConfig::new("postgres://localhost/bot").and_then(|c| c.with_max_connections(0)),
+            DbConfig::verify_full("postgres://localhost/bot", ""),
             Err(DbError::InvalidConfiguration { .. })
         ));
         assert!(matches!(
-            DbConfig::new("postgres://localhost/bot").and_then(|c| c.with_tls_verify_full("")),
+            DbConfig::insecure_for_local_dev("postgres://localhost/bot")
+                .and_then(|c| c.with_max_connections(0)),
             Err(DbError::InvalidConfiguration { .. })
         ));
     }
-
-    #[test]
-    fn db_config_with_tls_verify_full_configures_mode() -> Result<(), BoxError> {
-        let config =
-            DbConfig::new("postgres://localhost/bot")?.with_tls_verify_full("/path/to/ca.crt")?;
-        assert_eq!(
-            config.tls(),
-            &DbTlsMode::VerifyFull {
-                ca_file: PathBuf::from("/path/to/ca.crt")
-            }
-        );
-        let debug = format!("{config:?}");
-        assert!(debug.contains("/path/to/ca.crt"));
-        assert!(!debug.contains("postgres://localhost/bot"));
-        Ok(())
-    }
-
     #[test]
     fn db_error_debug_does_not_leak_details() {
         for (error, expected_name) in [
@@ -513,7 +530,7 @@ mod tests {
     async fn pool_exhaustion_returns_typed_timeout_error() -> Result<(), BoxError> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL is required for the PostgreSQL pool test")?;
-        let config = DbConfig::new(database_url)?.with_max_connections(1)?;
+        let config = DbConfig::insecure_for_local_dev(database_url)?.with_max_connections(1)?;
         let database = Db::connect(&config).await?;
         let _held_connection = database
             .pool

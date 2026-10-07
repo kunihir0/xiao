@@ -1,5 +1,6 @@
-# Production application only. PostgreSQL is provisioned and backed up separately.
-# Set XIAO_IMAGE to an immutable registry reference, never :latest.
+# Production application and migration service.
+# PostgreSQL is provisioned externally with TLS and automated backups.
+# Set XIAO_IMAGE to an immutable registry reference with digest (@sha256:...).
 secrets:
   discord_token:
     file: "${DISCORD_TOKEN_FILE:?set DISCORD_TOKEN_FILE to a secret-manager-mounted file}"
@@ -8,11 +9,49 @@ secrets:
   migration_database_url:
     file: "${MIGRATION_DATABASE_URL_FILE:-/dev/null}"
   database_ca:
-    file: "${DATABASE_CA_FILE:-/dev/null}"
+    file: "${DATABASE_CA_SOURCE:-/dev/null}"
   rustplus_fcm_sender_id:
     # /dev/null means disabled until #16 credential persistence is deployed.
     file: "${RUSTPLUS_FCM_SENDER_ID_FILE:-/dev/null}"
+
 services:
+  # One-shot migration job run before deploying the bot container.
+  # Mounts only the migration DDL credential and CA bundle.
+  # Run via: docker compose run --rm migrate
+  migrate:
+    image: "${XIAO_IMAGE:?set XIAO_IMAGE to an immutable image digest}"
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    command: ["migrate"]
+    environment:
+      MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_database_url
+      DATABASE_CA_FILE: /run/secrets/database_ca
+      DATABASE_TLS_MODE: "${DATABASE_TLS_MODE:-verify-full}"
+      RUST_LOG: "${RUST_LOG:-info}"
+      TELEMETRY_FORMAT: "${TELEMETRY_FORMAT:-json}"
+    secrets:
+      - source: migration_database_url
+        target: migration_database_url
+        mode: 0444
+      - source: database_ca
+        target: database_ca
+        mode: 0444
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+          pids: 64
+
+  # Long-running bot process using least-privilege DML connection only.
+  # Does NOT mount the DDL migration credentials.
   bot:
     image: "${XIAO_IMAGE:?set XIAO_IMAGE to an immutable image digest}"
     init: true
@@ -24,12 +63,10 @@ services:
       - /tmp:rw,noexec,nosuid,size=16m
     security_opt:
       - no-new-privileges:true
-    entrypoint: ["/usr/local/bin/xiao-entrypoint"]
     environment:
       DISCORD_TOKEN_FILE: /run/secrets/discord_token
       DATABASE_URL_FILE: /run/secrets/database_url
-      MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_database_url
-      DATABASE_CA_FILE: "${DATABASE_CA_FILE:-/run/secrets/database_ca}"
+      DATABASE_CA_FILE: /run/secrets/database_ca
       DATABASE_TLS_MODE: "${DATABASE_TLS_MODE:-verify-full}"
       DATABASE_MIGRATE_ON_STARTUP: "${DATABASE_MIGRATE_ON_STARTUP:-false}"
       RUSTPLUS_FCM_SENDER_ID_FILE: /run/secrets/rustplus_fcm_sender_id
@@ -41,9 +78,6 @@ services:
         mode: 0444
       - source: database_url
         target: database_url
-        mode: 0444
-      - source: migration_database_url
-        target: migration_database_url
         mode: 0444
       - source: database_ca
         target: database_ca

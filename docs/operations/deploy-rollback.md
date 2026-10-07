@@ -42,21 +42,50 @@ evidence before rollout. Never rebuild a rollback image from a moving tag.
    Contract migrations MUST be separately reviewable and reversible by backup
    restore, not bundled with an incompatible application rollout.
 
-The bot binary includes a built-in `migrate` command (also callable via
-`--migrate`) that runs embedded migrations using `MIGRATION_DATABASE_URL` (or
-falling back to `DATABASE_URL` locally), verifies the schema is current, and
-exits. In production runtime mode, the bot connects using `DATABASE_URL` with
-TLS `verify-full` and `DATABASE_CA_FILE`. With startup migrations disabled
-(`DATABASE_MIGRATE_ON_STARTUP=false` or `--no-startup-migrations`), the bot
-verifies that the schema is current and runs the PostgreSQL readiness ping
-before constructing Discord. If migrations are missing or unapplied, it exits
-with a typed `SchemaPending` error before Discord is constructed. Local
-development preserves default startup migrations and provides an explicit
-opt-in for unencrypted connections via `DATABASE_TLS_MODE=insecure`.
-There is no HTTP readiness endpoint. A failed migration or schema check exits
-before Discord is constructed; `restart: unless-stopped` must not be used to
-hide the failure. Pause rollout, capture logs, and follow the failed-migration
-section below.
+The bot image provides two separated commands:
+- `migrate`: runs only embedded migrations using `MIGRATION_DATABASE_URL` (or
+  `MIGRATION_DATABASE_URL_FILE`) under the DDL owner role, verifies the schema
+  is current, and exits immediately. In production, it does not fall back to the
+  runtime role. Run via `docker compose run --rm migrate`.
+- `bot` (default): connects using `DATABASE_URL` (or `DATABASE_URL_FILE`) under
+  the DML-only runtime role with startup migrations disabled
+  (`DATABASE_MIGRATE_ON_STARTUP=false`), verifies schema currency against
+  PostgreSQL before readiness, runs the readiness ping, and starts Discord.
+
+### Concrete PostgreSQL role provisioning (DDL vs DML separation)
+
+Run by the database administrator during initial database setup or rotation:
+
+```sql
+-- 1. Create separate roles
+CREATE ROLE xiao_migrator WITH LOGIN PASSWORD 'MIGRATOR_SECRET_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+CREATE ROLE xiao_app WITH LOGIN PASSWORD 'APP_SECRET_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+
+-- 2. Grant DDL ownership to migrator on target schema
+GRANT CONNECT ON DATABASE xiao TO xiao_migrator, xiao_app;
+GRANT USAGE, CREATE ON SCHEMA public TO xiao_migrator;
+ALTER SCHEMA public OWNER TO xiao_migrator;
+
+-- 3. Grant least-privilege DML access to runtime app role
+GRANT USAGE ON SCHEMA public TO xiao_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO xiao_app;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO xiao_app;
+
+-- 4. Ensure future tables and sequences created by migrator grant DML to xiao_app
+ALTER DEFAULT PRIVILEGES FOR ROLE xiao_migrator IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO xiao_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE xiao_migrator IN SCHEMA public
+    GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO xiao_app;
+
+-- Revocation / Rotation procedure:
+-- When rotating passwords:
+--   1. ALTER ROLE xiao_app WITH PASSWORD 'NEW_PASSWORD';
+--   2. Update secret manager DATABASE_URL_FILE.
+--   3. Recreate bot container with updated secret mount.
+-- If migrator credentials are compromised:
+--   1. Immediately ALTER ROLE xiao_migrator WITH NOLOGIN;
+--   2. Issue fresh password and update MIGRATION_DATABASE_URL_FILE before next release.
+```
 ## Rolling out
 
 ```console

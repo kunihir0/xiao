@@ -135,4 +135,54 @@ jobs:
         with:
           tool: cargo-nextest
           fallback: none
-      - run: cargo nextest run -p bot-db --all-features --run-ignored all
+      - name: Generate ephemeral TLS certificates for PostgreSQL TLS integration test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pg-tls
+          # Root CA
+          openssl req -new -x509 -days 1 -nodes \
+            -subj "/CN=Test PostgreSQL Root CA" \
+            -keyout /tmp/pg-tls/ca.key -out /tmp/pg-tls/ca.crt
+          # Server certificate for localhost
+          openssl req -new -nodes \
+            -subj "/CN=localhost" \
+            -keyout /tmp/pg-tls/server.key -out /tmp/pg-tls/server.csr
+          openssl x509 -req -days 1 -in /tmp/pg-tls/server.csr \
+            -CA /tmp/pg-tls/ca.crt -CAkey /tmp/pg-tls/ca.key -CAcreateserial \
+            -out /tmp/pg-tls/server.crt \
+            -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1")
+          # Wrong CA
+          openssl req -new -x509 -days 1 -nodes \
+            -subj "/CN=Untrusted Root CA" \
+            -keyout /tmp/pg-tls/wrong_ca.key -out /tmp/pg-tls/wrong_ca.crt
+          chmod 0600 /tmp/pg-tls/server.key /tmp/pg-tls/ca.key
+          chmod 0644 /tmp/pg-tls/server.crt /tmp/pg-tls/ca.crt /tmp/pg-tls/wrong_ca.crt
+      - name: Start PostgreSQL container with TLS enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name postgres-tls \
+            -e POSTGRES_DB=bot_tls \
+            -e POSTGRES_USER=bot \
+            -e POSTGRES_PASSWORD=bot \
+            -p 5433:5432 \
+            -v /tmp/pg-tls/server.crt:/var/lib/postgresql/server.crt:ro \
+            -v /tmp/pg-tls/server.key:/var/lib/postgresql/server.key:ro \
+            postgres:18.6-alpine \
+            -c ssl=on \
+            -c ssl_cert_file=/var/lib/postgresql/server.crt \
+            -c ssl_key_file=/var/lib/postgresql/server.key
+          for _ in {1..30}; do
+            if docker exec postgres-tls pg_isready -U bot -d bot_tls >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+      - name: Run database tests including TLS verify-full tests
+        env:
+          DATABASE_TLS_URL: postgres://bot:bot@localhost:5433/bot_tls
+          DATABASE_TLS_HOSTNAME_MISMATCH_URL: postgres://bot:bot@127.0.0.2:5433/bot_tls
+          DATABASE_CA_FILE: /tmp/pg-tls/ca.crt
+          DATABASE_WRONG_CA_FILE: /tmp/pg-tls/wrong_ca.crt
+        run: cargo nextest run -p bot-db --all-features --run-ignored all
