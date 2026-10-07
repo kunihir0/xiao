@@ -8,3 +8,16 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+poise = { workspace = true, default-features = false }
+# Poise 0.7 does not expose Serenity's native TLS backend as a feature. This
+# feature-only dependency selects native TLS without leaking Serenity types.
+serenity = { version = "0.12.5", default-features = false, features = ["native_tls_backend"] }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[package.metadata.cargo-shear]
+ignored = ["serenity"]

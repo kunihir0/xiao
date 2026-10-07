@@ -20,10 +20,13 @@ edition = "2024"
 rust-version = "1.99.0"
 license = "MIT OR Apache-2.0"
 [workspace.dependencies]
-tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 url = "2.5.8"
+poise = "0.7.0"
+thiserror = "2.0.21"
+tracing = "0.1.41"
 
 
 [workspace.lints.rust]

@@ -3,6 +3,7 @@
 use bot::{BoxError, Composition, CtrlCSignal};
 use bot_config::Config;
 use bot_db::{Db, DbConfig};
+use bot_discord::{DiscordConfig, DiscordHandle};
 use bot_telemetry::init_from_config;
 
 #[tokio::main]
@@ -20,9 +21,17 @@ async fn run() -> Result<(), BoxError> {
     let database = Db::connect(&database_config).await?;
     database.initialize().await?;
 
-    // Database startup is complete before the owned application lifecycle is
-    // created. Discord components are registered by their future slice.
-    let composition = Composition::new(CtrlCSignal);
+    // Database startup is complete before Discord is constructed.
+    let mut composition = Composition::new(CtrlCSignal);
+    let discord = DiscordHandle::new(DiscordConfig::new(config.discord_token().to_owned())?);
+    let cancellation = composition.cancellation_token();
+    composition.register("discord", async move {
+        discord
+            .run(cancellation)
+            .await
+            .map_err(|error| Box::new(error) as BoxError)
+    })?;
+
     composition
         .run()
         .await
