@@ -4,7 +4,6 @@ mod companion;
 mod future;
 mod ports;
 mod session;
-mod store;
 
 pub use companion::{
     CompanionRegistrar, CredentialError, CredentialId, CredentialState, DeviceId, EnrollmentError,
@@ -17,4 +16,3 @@ pub use ports::*;
 pub use session::{
     PairingService, PairingServiceHandle, SessionConfig, SessionSnapshot, SessionState,
 };
-pub use store::MemoryPairingStore;

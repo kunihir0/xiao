@@ -16,8 +16,8 @@ insecure-test-transport = []
 [dependencies]
 futures-util = "0.3.34"
 prost = "0.14.4"
-rand = "0.10.3"
-rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
+rand.workspace = true
+rustls.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }

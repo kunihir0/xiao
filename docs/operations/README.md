@@ -38,3 +38,6 @@ and deployment files; this workflow does not modify `deploy/`.
 Runbooks are added with the capability they operate. Before production launch, cover at minimum: deploy/rollback, failed migration, database restore test, Discord outage/reconnect, bot token rotation, rate-limit incident, and recovery from a bad release.
 
 A backup policy is incomplete until restore is exercised. A release is incomplete if its database change prevents the documented application rollback path.
+
+- [Rust+ companion credentials](rustplus-companion.md): configuration, keyring,
+  out-of-band auth token, re-enrollment, key rotation, and platform limits.

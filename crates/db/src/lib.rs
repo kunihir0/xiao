@@ -235,7 +235,20 @@ impl Db {
             .map(|_| ())
             .map_err(|_| DbError::Connection)
     }
+
+    pub(crate) fn pool(&self) -> &DatabasePool {
+        &self.pool
+    }
 }
+
+mod repositories;
+mod rotation;
+pub mod schema;
+pub mod secrets;
+
+pub use repositories::{PostgresPairingStore, PostgresPushCredentialStore};
+pub use rotation::{RewrapReport, rewrap_secrets, secret_key_ids_in_use};
+pub use secrets::{DataKey, FileKeyring, KeyId, KeyProvider, KeyringError, SecretError};
 
 #[cfg(test)]
 mod tests {

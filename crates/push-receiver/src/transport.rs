@@ -242,6 +242,15 @@ impl FcmConnector {
         }
     }
 
+    /// Ensures the legacy FCM registration is complete and returns all
+    /// credentials needed to restore a companion receiver.
+    pub async fn register(&self) -> Result<FcmRegistrationSnapshot> {
+        self.ensure_registered().await?;
+        self.snapshot()
+            .await
+            .ok_or(Error::InvalidState("FCM registration snapshot incomplete"))
+    }
+
     pub async fn registration_token(&self) -> Option<RegistrationToken> {
         self.registration_token.lock().await.clone()
     }
@@ -630,6 +639,7 @@ impl Default for ProductionConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
