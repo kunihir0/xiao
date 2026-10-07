@@ -21,6 +21,7 @@ pub struct FakeSessionHandle {
 #[derive(Clone)]
 pub struct FakeSessionSender {
     sender: mpsc::Sender<Result<Option<SessionEvent>, SessionError>>,
+    shutdown_called: Arc<AtomicBool>,
 }
 
 impl FakeSessionHandle {
@@ -33,7 +34,10 @@ impl FakeSessionHandle {
                 readiness,
                 shutdown_called: Arc::clone(&shutdown_called),
             },
-            FakeSessionSender { sender },
+            FakeSessionSender {
+                sender,
+                shutdown_called,
+            },
         )
     }
 
@@ -46,6 +50,10 @@ impl FakeSessionHandle {
 pub struct FakeSessionSendError;
 
 impl FakeSessionSender {
+    pub fn shutdown_called(&self) -> bool {
+        self.shutdown_called.load(Ordering::Acquire)
+    }
+
     pub async fn send(&self, event: SessionEvent) -> Result<(), FakeSessionSendError> {
         self.sender
             .send(Ok(Some(event)))
@@ -85,6 +93,7 @@ impl SessionHandle for FakeSessionHandle {
 
 type SessionScript = Result<FakeSessionHandle, SessionError>;
 
+#[derive(Clone)]
 pub struct FakeSessionConnector {
     calls: Arc<Mutex<Vec<ServerId>>>,
     scripts: Arc<Mutex<HashMap<ServerId, Vec<SessionScript>>>>,

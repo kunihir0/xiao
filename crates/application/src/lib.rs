@@ -7,5 +7,7 @@ mod store;
 
 pub use future::BoxFuture;
 pub use ports::*;
-pub use session::{PairingService, PairingServiceHandle, SessionConfig};
+pub use session::{
+    PairingService, PairingServiceHandle, SessionConfig, SessionSnapshot, SessionState,
+};
 pub use store::MemoryPairingStore;

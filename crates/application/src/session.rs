@@ -1,14 +1,14 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bot_domain::{Pairing, ServerId, SessionId};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinSet,
-    time::timeout,
+    time::{Instant, timeout},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -17,7 +17,22 @@ use crate::{
     SessionEvent, StoreError,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionState {
+    Connecting,
+    Ready,
+    Reconnecting,
+    Closing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSnapshot {
+    pub server_id: ServerId,
+    pub session_id: SessionId,
+    pub state: SessionState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionConfig {
     pub connect_timeout: Duration,
     pub shutdown_timeout: Duration,
@@ -54,6 +69,7 @@ impl SessionConfig {
 #[derive(Clone)]
 pub struct PairingServiceHandle {
     readiness: watch::Receiver<ServiceReadiness>,
+    sessions: watch::Receiver<Vec<SessionSnapshot>>,
 }
 impl PairingServiceHandle {
     pub fn readiness(&self) -> ServiceReadiness {
@@ -61,6 +77,9 @@ impl PairingServiceHandle {
     }
     pub fn readiness_watch(&self) -> watch::Receiver<ServiceReadiness> {
         self.readiness.clone()
+    }
+    pub fn sessions(&self) -> Vec<SessionSnapshot> {
+        self.sessions.borrow().clone()
     }
 }
 
@@ -72,6 +91,7 @@ struct DedupeEntry {
 struct WorkerRecord {
     session_id: SessionId,
     pairing: Pairing,
+    state: SessionState,
     cancellation: CancellationToken,
     finished: oneshot::Receiver<()>,
     abort: tokio::task::AbortHandle,
@@ -90,6 +110,7 @@ pub struct PairingService<S, C> {
     store: Arc<dyn PairingStore>,
     config: SessionConfig,
     readiness: watch::Sender<ServiceReadiness>,
+    sessions_watch: watch::Sender<Vec<SessionSnapshot>>,
     worker_events: mpsc::Sender<WorkerMessage>,
     worker_rx: mpsc::Receiver<WorkerMessage>,
     workers: JoinSet<()>,
@@ -110,6 +131,7 @@ where
         config: SessionConfig,
     ) -> (Self, PairingServiceHandle) {
         let (readiness, readiness_rx) = watch::channel(ServiceReadiness::Starting);
+        let (sessions_watch, sessions_rx) = watch::channel(Vec::new());
         let capacity = config.max_servers.saturating_mul(4).clamp(1, 1024);
         let (worker_events, worker_rx) = mpsc::channel(capacity);
         (
@@ -119,6 +141,7 @@ where
                 store: Arc::new(store),
                 config,
                 readiness,
+                sessions_watch,
                 worker_events,
                 worker_rx,
                 workers: JoinSet::new(),
@@ -128,6 +151,7 @@ where
             },
             PairingServiceHandle {
                 readiness: readiness_rx,
+                sessions: sessions_rx,
             },
         )
     }
@@ -171,12 +195,14 @@ where
                 let stored = pairing.clone();
                 self.sessions
                     .insert(server.clone(), WorkerRecord { pairing, ..record });
+                self.publish_snapshots();
                 self.store
                     .upsert(&stored)
                     .await
                     .map_err(ServiceError::Store)?;
                 return Ok(());
             }
+            self.publish_snapshots();
             self.stop_record(record, false).await?;
         }
         if self.sessions.len() >= self.config.max_servers {
@@ -213,11 +239,13 @@ where
             WorkerRecord {
                 session_id,
                 pairing,
+                state: SessionState::Connecting,
                 cancellation,
                 finished: finished_rx,
                 abort: worker,
             },
         );
+        self.publish_snapshots();
         Ok(())
     }
 
@@ -227,19 +255,36 @@ where
             session_id,
             event,
         } = message;
-        let Some(record) = self.sessions.get(&server) else {
+        let Some(record) = self.sessions.get_mut(&server) else {
             return;
         };
         if record.session_id != session_id {
             return;
         }
-        if matches!(
-            event,
-            SessionEvent::Disconnected | SessionEvent::Terminated { .. }
-        ) {
-            self.sessions.remove(&server);
+        match event {
+            SessionEvent::Ready => record.state = SessionState::Ready,
+            SessionEvent::Reconnecting => record.state = SessionState::Reconnecting,
+            SessionEvent::Disconnected | SessionEvent::Terminated { .. } => {
+                self.sessions.remove(&server);
+            }
+            SessionEvent::Lagged { .. } => {}
         }
+        self.publish_snapshots();
     }
+
+    fn publish_snapshots(&self) {
+        let snapshots = self
+            .sessions
+            .iter()
+            .map(|(server_id, record)| SessionSnapshot {
+                server_id: server_id.clone(),
+                session_id: record.session_id,
+                state: record.state.clone(),
+            })
+            .collect();
+        self.sessions_watch.send_replace(snapshots);
+    }
+
     fn is_duplicate(&mut self, pairing: &Pairing) -> bool {
         let now = Instant::now();
         while self
@@ -288,6 +333,7 @@ where
         let source_result = timeout(self.config.shutdown_timeout, self.source.shutdown()).await;
         let mut timed_out = source_result.is_err();
         let records: Vec<_> = self.sessions.drain().map(|(_, record)| record).collect();
+        self.publish_snapshots();
         for record in records {
             if self.stop_record(record, true).await.is_err() {
                 timed_out = true;
@@ -317,6 +363,7 @@ where
         self.readiness.send_replace(ServiceReadiness::Failed);
         let _ = timeout(self.config.shutdown_timeout, self.source.shutdown()).await;
         let records: Vec<_> = self.sessions.drain().map(|(_, record)| record).collect();
+        self.publish_snapshots();
         for record in records {
             let _ = self.stop_record(record, false).await;
         }
