@@ -24,6 +24,8 @@ pub enum Error {
     UnsupportedTag(u8),
     #[error("frame payload is too large ({actual} bytes, max {max})")]
     FrameTooLarge { actual: usize, max: usize },
+    #[error("inbound MCS stream counter exhausted")]
+    StreamIdExhausted,
     #[error("truncated frame")]
     TruncatedFrame,
     #[error("invalid or overlong varint")]

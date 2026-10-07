@@ -332,9 +332,9 @@ impl ReceiverConnector for FcmConnector {
 enum FrameEvent {
     Login,
     Data(crate::mcs::DecodedDataMessage),
-    HeartbeatPing(Option<i32>),
-    HeartbeatAck(Option<i32>),
-    Iq(Option<i32>),
+    HeartbeatPing,
+    HeartbeatAck,
+    Iq,
     Close,
 }
 
@@ -355,14 +355,8 @@ fn eof_result(decoder: &mut McsCodec, buffer: &mut BytesMut) -> Result<FrameEven
     }
 }
 
-fn next_stream_id(current: i32, observed: Option<i32>) -> i32 {
-    observed.unwrap_or_else(|| {
-        if current > 0 {
-            current.saturating_add(1)
-        } else {
-            current
-        }
-    })
+fn next_stream_id(current: i32, _wire_stream_id: Option<i32>) -> Result<i32> {
+    current.checked_add(1).ok_or(Error::StreamIdExhausted)
 }
 
 struct TlsMcsSession {
@@ -419,19 +413,19 @@ impl TlsMcsSession {
                         )?));
                     }
                     FrameTag::HeartbeatPing => {
-                        let ping = proto::HeartbeatPing::decode(frame.payload.as_slice())
+                        proto::HeartbeatPing::decode(frame.payload.as_slice())
                             .map_err(|error| Error::Decode(error.to_string()))?;
-                        return Ok(FrameEvent::HeartbeatPing(ping.stream_id));
+                        return Ok(FrameEvent::HeartbeatPing);
                     }
                     FrameTag::HeartbeatAck => {
-                        let ack = proto::HeartbeatAck::decode(frame.payload.as_slice())
+                        proto::HeartbeatAck::decode(frame.payload.as_slice())
                             .map_err(|error| Error::Decode(error.to_string()))?;
-                        return Ok(FrameEvent::HeartbeatAck(ack.stream_id));
+                        return Ok(FrameEvent::HeartbeatAck);
                     }
                     FrameTag::Iq => {
-                        let iq = proto::IqStanza::decode(frame.payload.as_slice())
+                        proto::IqStanza::decode(frame.payload.as_slice())
                             .map_err(|error| Error::Decode(error.to_string()))?;
-                        return Ok(FrameEvent::Iq(iq.stream_id));
+                        return Ok(FrameEvent::Iq);
                     }
                     FrameTag::Close => return Ok(FrameEvent::Close),
                     FrameTag::StreamError => {
@@ -471,17 +465,9 @@ impl McsSession for TlsMcsSession {
         Box::pin(async move {
             loop {
                 let event = self.receive_frame().await?;
-                let stream_id = match &event {
-                    FrameEvent::Data(data) => data.stream_id,
-                    FrameEvent::HeartbeatPing(stream_id)
-                    | FrameEvent::HeartbeatAck(stream_id)
-                    | FrameEvent::Iq(stream_id) => *stream_id,
-                    FrameEvent::Close => None,
-                    FrameEvent::Login => None,
-                };
                 if !matches!(&event, FrameEvent::Login) {
                     self.last_stream_id_received =
-                        next_stream_id(self.last_stream_id_received, stream_id);
+                        next_stream_id(self.last_stream_id_received, None)?;
                 }
                 match event {
                     FrameEvent::Data(data) => {
@@ -499,7 +485,7 @@ impl McsSession for TlsMcsSession {
                         }
                         return Ok(SessionEvent::Notification(data.notification));
                     }
-                    FrameEvent::HeartbeatPing(_) => {
+                    FrameEvent::HeartbeatPing => {
                         let payload = encode_heartbeat_ack(
                             (self.last_stream_id_received > 0)
                                 .then_some(self.last_stream_id_received),
@@ -507,7 +493,7 @@ impl McsSession for TlsMcsSession {
                         self.send_frame(McsFrame::new(FrameTag::HeartbeatAck, payload))
                             .await?;
                     }
-                    FrameEvent::HeartbeatAck(_) | FrameEvent::Iq(_) => {}
+                    FrameEvent::HeartbeatAck | FrameEvent::Iq => {}
                     FrameEvent::Close => return Ok(SessionEvent::Closed),
                     FrameEvent::Login => {}
                 }
@@ -568,10 +554,15 @@ mod tests {
     }
 
     #[test]
-    fn stream_counter_advances_for_stanzas_without_explicit_ids() {
-        assert_eq!(next_stream_id(7, None), 8);
-        assert_eq!(next_stream_id(7, Some(12)), 12);
-        assert_eq!(next_stream_id(0, None), 0);
+    fn stream_counter_ignores_malicious_wire_ids() {
+        assert_eq!(next_stream_id(7, Some(i32::MAX)).ok(), Some(8));
+        assert_eq!(next_stream_id(8, Some(0)).ok(), Some(9));
+        assert_eq!(next_stream_id(9, Some(-1)).ok(), Some(10));
+        assert_eq!(next_stream_id(0, None).ok(), Some(1));
+        assert!(matches!(
+            next_stream_id(i32::MAX, Some(0)),
+            Err(Error::StreamIdExhausted)
+        ));
     }
 
     #[test]

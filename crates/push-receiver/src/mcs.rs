@@ -122,7 +122,6 @@ pub struct DurationConfig {
 pub(crate) struct DecodedDataMessage {
     pub notification: Notification,
     pub immediate_ack: bool,
-    pub stream_id: Option<i32>,
 }
 
 pub(crate) fn decode_data_message_with_metadata(payload: &[u8]) -> Result<DecodedDataMessage> {
@@ -184,7 +183,6 @@ pub(crate) fn decode_data_message_with_metadata(payload: &[u8]) -> Result<Decode
             sent: message.sent,
         },
         immediate_ack: message.immediate_ack.unwrap_or(false),
-        stream_id: message.stream_id,
     })
 }
 
