@@ -59,16 +59,16 @@ jobs:
             config_digest=$(jq -r '.config.digest' <<<"$manifest")
             config_hash=${config_digest#sha256:}
             config=$(tar -xOf xiao-oci.tar "blobs/sha256/$config_hash")
-            revision=$(jq -r '.config.Labels[\"org.opencontainers.image.revision\"] // empty' <<<"$config")
+            revision=$(jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' <<<"$config")
             test "$revision" = "$EXPECTED_REVISION"
             printf '%s manifest=%s config=%s revision=%s\n' \
               "$platform" "$digest" "$config_digest" "$revision" | tee -a oci-metadata.txt
             count=$((count + 1))
           done < <(
             jq -r '.manifests[]
-              | select(.platform.os == \"linux\")
-              | select(.platform.architecture == \"amd64\" or .platform.architecture == \"arm64\")
-              | [.platform.os + \"/\" + .platform.architecture, .digest]
+              | select(.platform.os == "linux")
+              | select(.platform.architecture == "amd64" or .platform.architecture == "arm64")
+              | [.platform.os + "/" + .platform.architecture, .digest]
               | @tsv' oci-index.json
           )
           test "$count" -eq 2
