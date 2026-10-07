@@ -181,8 +181,8 @@ jobs:
           done
       - name: Run database tests including TLS verify-full tests
         env:
-          DATABASE_TLS_URL: postgres://bot:bot@localhost:5433/bot_tls
+          DATABASE_TLS_URL: postgres://bot:bot@127.0.0.1:5433/bot_tls
           DATABASE_TLS_HOSTNAME_MISMATCH_URL: postgres://bot:bot@127.0.0.2:5433/bot_tls
           DATABASE_CA_FILE: /tmp/pg-tls/ca.crt
           DATABASE_WRONG_CA_FILE: /tmp/pg-tls/wrong_ca.crt
-        run: cargo nextest run -p bot-db --all-features --run-ignored all
+        run: cargo nextest run -p bot-db --all-features --run-ignored all --no-fail-fast

@@ -189,7 +189,15 @@ async fn postgres_tls_verify_full_connects_with_correct_ca()
     };
 
     let config = DbConfig::verify_full(&tls_url, &ca_file)?;
-    let db = Db::connect(&config).await?;
+    let db = match Db::connect(&config).await {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!(
+                "Db::connect failed in postgres_tls_verify_full_connects_with_correct_ca: {err:?}"
+            );
+            return Err(Box::new(err));
+        }
+    };
     assert!(!db.is_ready());
     Ok(())
 }
