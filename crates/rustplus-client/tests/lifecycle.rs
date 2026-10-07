@@ -5,8 +5,11 @@ use rustplus_client::{
     ClientConfig, Error, EventReceiveError, MAX_REQUEST_SIZE, Readiness, Request, ResponsePayload,
     RustPlusClient,
 };
-use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{net::TcpListener, sync::Barrier};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -240,6 +243,68 @@ async fn flapping_server() -> (String, tokio::task::JoinHandle<()>) {
     (endpoint, task)
 }
 
+async fn repeated_server(connections: usize) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
+    let endpoint = format!("ws://{}/", listener.local_addr().expect("address"));
+    let task = tokio::spawn(async move {
+        for _ in 0..connections {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            let Some(Ok(Message::Binary(data))) = socket.next().await else {
+                return;
+            };
+            let mut response = fixture("response_success");
+            if let Some(sequence) = data.get(1) {
+                response[3] = *sequence;
+            }
+            let _ = socket.send(Message::Binary(response.into())).await;
+            while let Some(Ok(message)) = socket.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        }
+    });
+    (endpoint, task)
+}
+
+#[tokio::test]
+
+async fn concurrent_connect_disconnect_always_ends_disconnected() {
+    let (endpoint, task) = repeated_server(50).await;
+    let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
+        .expect("client");
+    for _ in 0..50 {
+        let barrier = Arc::new(Barrier::new(2));
+        let connecting = {
+            let client = client.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                client.connect().await
+            })
+        };
+        barrier.wait().await;
+        let disconnecting = client.disconnect();
+        let (connect_result, disconnect_result) = tokio::join!(connecting, disconnecting);
+        let connect_result = connect_result.expect("connect task");
+        assert!(matches!(
+            connect_result,
+            Ok(())
+                | Err(Error::AlreadyConnecting
+                    | Error::ShuttingDown
+                    | Error::Transport
+                    | Error::Disconnected)
+        ));
+        assert!(disconnect_result.is_ok() || matches!(disconnect_result, Err(Error::Transport)));
+        assert_eq!(client.readiness(), Readiness::Disconnected);
+    }
+    task.abort();
+}
 #[tokio::test]
 async fn concurrent_connects_keep_one_owned_transport() {
     let (endpoint, task) = delayed_handshake_server(Duration::from_millis(100)).await;

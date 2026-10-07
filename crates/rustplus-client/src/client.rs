@@ -300,6 +300,9 @@ impl RustPlusClient {
             if self.is_ready() {
                 return Ok(());
             }
+            if self.readiness() == Readiness::Closing {
+                return Err(Error::ShuttingDown);
+            }
             if self.readiness() == Readiness::Connecting {
                 return Err(Error::AlreadyConnecting);
             }
@@ -458,11 +461,11 @@ impl RustPlusClient {
 
     pub async fn disconnect(&self) -> Result<()> {
         self.inner.stopped.store(true, Ordering::Release);
+        self.inner.readiness.send_replace(Readiness::Closing);
         if let Ok(signal) = self.inner.disconnect_signal.lock() {
             signal.cancel();
         }
         let _transition = self.inner.lifecycle.lock().await;
-        self.inner.readiness.send_replace(Readiness::Closing);
         let generation = self.inner.cancellation.lock().ok().and_then(|mut token| {
             token.take().map(|(generation, token)| {
                 token.cancel();
