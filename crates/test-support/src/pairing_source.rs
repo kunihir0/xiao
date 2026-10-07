@@ -16,6 +16,7 @@ pub struct FakePairingSource {
 #[derive(Clone)]
 pub struct FakePairingSender {
     sender: mpsc::Sender<Result<Option<Pairing>, PairingSourceError>>,
+    shutdown_called: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -31,7 +32,10 @@ impl FakePairingSource {
                 readiness: SourceReadiness::Ready,
                 shutdown_called: Arc::clone(&shutdown_called),
             },
-            FakePairingSender { sender },
+            FakePairingSender {
+                sender,
+                shutdown_called,
+            },
         )
     }
 
@@ -58,6 +62,9 @@ impl FakePairingSender {
         result: Result<Option<Pairing>, PairingSourceError>,
     ) -> Result<(), SendError> {
         self.sender.send(result).await.map_err(|_| SendError)
+    }
+    pub fn shutdown_called(&self) -> bool {
+        self.shutdown_called.load(Ordering::Acquire)
     }
 }
 
