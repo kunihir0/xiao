@@ -164,11 +164,12 @@ impl Debug for DbError {
 }
 
 fn build_rustls_client_config(ca_file: &Path) -> Result<rustls::ClientConfig, DbError> {
-    let file = std::fs::File::open(ca_file).map_err(|_| DbError::TlsConfiguration {
-        reason: "failed to open CA certificate file",
-    })?;
-    let mut reader = std::io::BufReader::new(file);
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_file)
+        .map_err(|_| DbError::TlsConfiguration {
+            reason: "failed to open CA certificate file",
+        })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| DbError::TlsConfiguration {
             reason: "invalid PEM format in CA certificate file",
