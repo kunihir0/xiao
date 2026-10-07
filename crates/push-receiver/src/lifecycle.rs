@@ -139,9 +139,18 @@ pub fn start_with_policy(
                         Ok(notification) => { attempts = 0; notification }
                         Err(error) => {
                             attempts = attempts.saturating_add(1);
-                            if attempts > policy.max_attempts() { let _ = task_readiness.send(Readiness::Stopped); return Err(error); }
+                            if attempts > policy.max_attempts() {
+                                let _ = task_readiness.send(Readiness::Stopped);
+                                return Err(error);
+                            }
                             let _ = task_readiness.send(Readiness::Starting);
-                            tokio::time::sleep(policy.delay(attempts, 0)).await;
+                            tokio::select! {
+                                _ = &mut shutdown_rx => {
+                                    let _ = task_readiness.send(Readiness::Stopped);
+                                    return Ok(());
+                                }
+                                _ = tokio::time::sleep(policy.delay(attempts, 0)) => {}
+                            }
                             task_readiness.send(Readiness::Ready).map_err(|_| Error::ChannelClosed)?;
                             continue;
                         }
@@ -260,11 +269,20 @@ pub fn start_connected(
                                     return Err(Error::ChannelClosed);
                                 }
                             }
-                            Ok(SessionEvent::Closed) | Err(_) => {
+                            Ok(SessionEvent::Closed) => {
                                 attempts = attempts.saturating_add(1);
                                 if attempts > policy.max_attempts() {
                                     let _ = task_readiness.send(Readiness::Stopped);
                                     return Err(Error::TransportClosed);
+                                }
+                                let _ = task_readiness.send(Readiness::Starting);
+                                break;
+                            }
+                            Err(error) => {
+                                attempts = attempts.saturating_add(1);
+                                if attempts > policy.max_attempts() {
+                                    let _ = task_readiness.send(Readiness::Stopped);
+                                    return Err(error);
                                 }
                                 let _ = task_readiness.send(Readiness::Starting);
                                 break;
