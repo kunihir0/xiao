@@ -1,0 +1,17 @@
+# Source: kunihir0/rustplus master @ 5b9a0803ac404a00b7f58e298c91b1130504d5c7
+# AppRequest(seq=1, playerId=42, playerToken=7, getInfo={})
+request_info = 08 01 10 2a 18 07 42 00
+# AppMessage(response(AppResponse(seq=1, success={})))
+response_success = 0a 04 08 01 22 00
+# Truncated AppMessage (must return Decode error, never panic)
+malformed_truncated = 0a 04 08
+# Independent marker monitor response (seq=3, one player marker)
+monitor_markers = 0a 19 08 03 6a 15 0a 13 08 2a 10 01 1d 00 00 20 41 25 00 00 a0 40 5a 03 4a 6f 65
+# Independent camera ray sample (2x2 frame, first ray token)
+camera_2x2_single_ray = ff 00 00 00
+# Independent camera broadcast event (AppMessage broadcast with one ray)
+event_camera = 12 14 52 12 0d 00 00 80 3f 10 00 1a 04 ff 00 00 00 25 00 00 80 3f
+# Malformed protobuf varint, length, and dimension payloads
+malformed_varint = 0a 80
+malformed_length = 0a 7f 08
+malformed_dimension = 0a 08 08 01 12 06 08 ff ff ff ff
