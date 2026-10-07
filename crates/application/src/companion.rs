@@ -82,7 +82,7 @@ impl DeviceId {
 pub struct FcmSecrets {
     android_id: u64,
     security_token: u64,
-    registration_token: String,
+    registration_token: Zeroizing<String>,
     web_push_private_key: [u8; 32],
     web_push_auth_secret: [u8; 16],
 }
@@ -99,7 +99,7 @@ impl FcmSecrets {
         let secrets = Self {
             android_id,
             security_token,
-            registration_token,
+            registration_token: Zeroizing::new(registration_token),
             web_push_private_key,
             web_push_auth_secret,
         };

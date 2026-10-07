@@ -3,6 +3,7 @@
 mod companion;
 mod future;
 mod ports;
+mod secret_file;
 mod session;
 
 pub use companion::{
@@ -13,6 +14,7 @@ pub use companion::{
 };
 pub use future::BoxFuture;
 pub use ports::*;
+pub use secret_file::{SecretFileError, load_owner_only_secret};
 pub use session::{
     PairingService, PairingServiceHandle, SessionConfig, SessionSnapshot, SessionState,
 };

@@ -18,16 +18,19 @@
 use std::{fmt, path::PathBuf, time::Duration};
 
 use bot_application::{
-    BoxFuture, CompanionRegistrar, DeviceId, FcmSecrets, RegistrationError, SteamAuthToken,
-    SteamAuthTokenSource,
+    BoxFuture, CompanionRegistrar, DeviceId, FcmSecrets, RegistrationError, SecretFileError,
+    SteamAuthToken, SteamAuthTokenSource, load_owner_only_secret,
 };
+use bytes::Bytes;
 use push_receiver::{
     CheckinCredentials, FcmConnector, FcmRegistrationSnapshot, RegistrationToken,
     WebPushKeyMaterial,
 };
 use reqwest::{Client, Response, StatusCode};
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
-use tokio::{fs, io::AsyncReadExt};
+use tokio::task;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -261,12 +264,16 @@ impl FacepunchRegistrar {
         &self,
         service: &'static str,
         url: &str,
-        body: Vec<u8>,
+        body: Zeroizing<Vec<u8>>,
     ) -> Result<Response, RegistrationError> {
+        // Bytes::from_owner keeps the Zeroizing allocation alive through the
+        // reqwest/hyper handoff and wipes it when the final body owner drops.
+        // Buffers internal to reqwest/hyper after send are outside this crate's
+        // control and cannot be wiped (zeroize where practical).
         self.client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
+            .body(reqwest::Body::from(Bytes::from_owner(body)))
             .send()
             .await
             .map_err(|error| map_http_error(service, error))
@@ -276,7 +283,7 @@ impl FacepunchRegistrar {
         &self,
         service: &'static str,
         mut response: Response,
-    ) -> Result<Vec<u8>, RegistrationError> {
+    ) -> Result<Zeroizing<Vec<u8>>, RegistrationError> {
         if response
             .content_length()
             .is_some_and(|length| length > MAX_RESPONSE_BODY as u64)
@@ -285,7 +292,7 @@ impl FacepunchRegistrar {
                 "response body too large",
             ));
         }
-        let mut body = Vec::new();
+        let mut body = Zeroizing::new(Vec::new());
         while let Some(chunk) = response
             .chunk()
             .await
@@ -307,16 +314,42 @@ impl FacepunchRegistrar {
         device_id: &DeviceId,
         fcm: &FcmSecrets,
     ) -> Result<(), RegistrationError> {
-        let device_token = Zeroizing::new(fcm.registration_token().to_owned());
-        let expo_request = serde_json::json!({
-            "type": "fcm",
-            "deviceId": device_id.as_str(),
-            "development": false,
-            "appId": EXPO_APP_ID,
-            "deviceToken": device_token.as_str(),
-            "projectId": EXPO_PROJECT_ID,
-        });
+        #[derive(Serialize)]
+        struct ExpoRequest<'a> {
+            #[serde(rename = "type")]
+            request_type: &'static str,
+            #[serde(rename = "deviceId")]
+            device_id: &'a str,
+            development: bool,
+            #[serde(rename = "appId")]
+            app_id: &'static str,
+            #[serde(rename = "deviceToken")]
+            device_token: &'a str,
+            #[serde(rename = "projectId")]
+            project_id: &'static str,
+        }
+
+        #[derive(Serialize)]
+        struct FacepunchRequest<'a> {
+            #[serde(rename = "AuthToken")]
+            auth_token: &'a str,
+            #[serde(rename = "DeviceId")]
+            device_id: &'a str,
+            #[serde(rename = "PushKind")]
+            push_kind: u8,
+            #[serde(rename = "PushToken")]
+            push_token: &'a str,
+        }
+        let expo_request = ExpoRequest {
+            request_type: "fcm",
+            device_id: device_id.as_str(),
+            development: false,
+            app_id: EXPO_APP_ID,
+            device_token: fcm.registration_token(),
+            project_id: EXPO_PROJECT_ID,
+        };
         let expo_body = serde_json::to_vec(&expo_request)
+            .map(Zeroizing::new)
             .map_err(|_| RegistrationError::InvalidResponse("could not encode Expo request"))?;
         let expo_response = self
             .send_json("expo", self.endpoints.expo_url(), expo_body)
@@ -327,17 +360,17 @@ impl FacepunchRegistrar {
             return Err(status_error("expo", expo_status));
         }
         let expo_token = parse_expo_token(&expo_body)?;
-        let expo_token = Zeroizing::new(expo_token);
-        let steam_token = Zeroizing::new(auth_token.expose_secret().to_owned());
-        let facepunch_request = serde_json::json!({
-            "AuthToken": steam_token.as_str(),
-            "DeviceId": device_id.as_str(),
-            "PushKind": 3,
-            "PushToken": expo_token.as_str(),
-        });
-        let facepunch_body = serde_json::to_vec(&facepunch_request).map_err(|_| {
-            RegistrationError::InvalidResponse("could not encode Facepunch request")
-        })?;
+        let facepunch_request = FacepunchRequest {
+            auth_token: auth_token.expose_secret(),
+            device_id: device_id.as_str(),
+            push_kind: 3,
+            push_token: &expo_token,
+        };
+        let facepunch_body = serde_json::to_vec(&facepunch_request)
+            .map(Zeroizing::new)
+            .map_err(|_| {
+                RegistrationError::InvalidResponse("could not encode Facepunch request")
+            })?;
         let facepunch_response = self
             .send_json("facepunch", self.endpoints.facepunch_url(), facepunch_body)
             .await?;
@@ -405,16 +438,24 @@ fn status_error(service: &'static str, status: StatusCode) -> RegistrationError 
     }
 }
 
-fn parse_expo_token(body: &[u8]) -> Result<String, RegistrationError> {
-    let value: Value = serde_json::from_slice(body)
+#[derive(Deserialize)]
+struct ExpoResponse<'a> {
+    #[serde(borrow)]
+    data: Option<ExpoData<'a>>,
+}
+
+#[derive(Deserialize)]
+struct ExpoData<'a> {
+    #[serde(rename = "expoPushToken", borrow)]
+    expo_push_token: Option<&'a str>,
+}
+
+fn parse_expo_token(body: &[u8]) -> Result<Zeroizing<String>, RegistrationError> {
+    let response: ExpoResponse<'_> = serde_json::from_slice(body)
         .map_err(|_| RegistrationError::InvalidResponse("malformed Expo response"))?;
-    let token = value
-        .get("data")
-        .and_then(|data| data.get("expoPushToken"))
-        .and_then(Value::as_str)
-        .ok_or(RegistrationError::InvalidResponse(
-            "missing Expo push token",
-        ))?;
+    let token = response.data.and_then(|data| data.expo_push_token).ok_or(
+        RegistrationError::InvalidResponse("missing Expo push token"),
+    )?;
     if (!token.starts_with("ExponentPushToken[") && !token.starts_with("ExpoPushToken["))
         || token.len() > 256
         || token.chars().any(char::is_control)
@@ -424,7 +465,19 @@ fn parse_expo_token(body: &[u8]) -> Result<String, RegistrationError> {
             "invalid Expo push token",
         ));
     }
-    Ok(token.to_owned())
+    Ok(Zeroizing::new(token.to_owned()))
+}
+
+fn map_secret_file_error(error: SecretFileError) -> RegistrationError {
+    let reason = match error {
+        SecretFileError::Missing => "missing",
+        SecretFileError::Read | SecretFileError::Unsupported => "unreadable",
+        SecretFileError::TooLarge => "oversized",
+        SecretFileError::NotRegular => "not a regular file",
+        SecretFileError::InsecurePermissions => "insecure permissions",
+        SecretFileError::WrongOwner => "wrong owner",
+    };
+    RegistrationError::AuthTokenUnavailable(reason)
 }
 
 /// Reads an operator-provided Steam auth token only when `load` is called.
@@ -450,46 +503,13 @@ impl FileSteamAuthToken {
 
 impl SteamAuthTokenSource for FileSteamAuthToken {
     fn load<'a>(&'a self) -> BoxFuture<'a, Result<SteamAuthToken, RegistrationError>> {
+        let path = self.path.clone();
         Box::pin(async move {
-            let metadata = fs::metadata(&self.path).await.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    RegistrationError::AuthTokenUnavailable("missing")
-                } else {
-                    RegistrationError::AuthTokenUnavailable("unreadable")
-                }
-            })?;
-            if !metadata.is_file() {
-                return Err(RegistrationError::AuthTokenUnavailable(
-                    "not a regular file",
-                ));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    return Err(RegistrationError::AuthTokenUnavailable(
-                        "insecure permissions",
-                    ));
-                }
-            }
-            let file = fs::File::open(&self.path).await.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    RegistrationError::AuthTokenUnavailable("missing")
-                } else {
-                    RegistrationError::AuthTokenUnavailable("unreadable")
-                }
-            })?;
-            let mut bytes = Zeroizing::new(Vec::with_capacity(8 * 1024 + 1));
-            file.take((8 * 1024 + 1) as u64)
-                .read_to_end(&mut bytes)
+            let value = task::spawn_blocking(move || load_owner_only_secret(&path, 8 * 1024))
                 .await
-                .map_err(|_| RegistrationError::AuthTokenUnavailable("unreadable"))?;
-            if bytes.len() > 8 * 1024 {
-                return Err(RegistrationError::AuthTokenUnavailable("oversized"));
-            }
-            let value = std::str::from_utf8(&bytes)
-                .map_err(|_| RegistrationError::AuthTokenUnavailable("invalid"))?
-                .trim_end();
+                .map_err(|_| RegistrationError::AuthTokenUnavailable("unreadable"))?
+                .map_err(map_secret_file_error)?;
+            let value = value.trim_end();
             if value.is_empty() {
                 return Err(RegistrationError::AuthTokenUnavailable("empty"));
             }
@@ -872,7 +892,9 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            parse_expo_token(br#"{"data":{"expoPushToken":"ExpoPushToken[ok]"}}"#).unwrap(),
+            parse_expo_token(br#"{"data":{"expoPushToken":"ExpoPushToken[ok]"}}"#)
+                .unwrap()
+                .as_str(),
             "ExpoPushToken[ok]"
         );
     }

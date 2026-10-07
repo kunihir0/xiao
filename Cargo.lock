@@ -192,6 +192,8 @@ version = "0.1.0"
 dependencies = [
  "bot-domain",
  "bot-test-support",
+ "libc",
+ "rustix",
  "tokio",
  "tokio-util",
  "uuid",
@@ -2317,6 +2319,7 @@ version = "0.1.0"
 dependencies = [
  "bot-application",
  "bot-domain",
+ "bytes",
  "futures-util",
  "proptest",
  "push-receiver",

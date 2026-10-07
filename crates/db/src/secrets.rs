@@ -3,11 +3,11 @@ use aes_gcm_siv::{
     aead::{Aead, KeyInit, Payload},
 };
 use rand::{RngExt, rng};
-use std::{collections::HashMap, fmt, fs, path::Path};
+use std::{collections::HashMap, fmt, path::Path};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use bot_application::BoxFuture;
+use bot_application::{BoxFuture, SecretFileError, load_owner_only_secret};
 
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
@@ -134,29 +134,22 @@ pub struct FileKeyring {
     active: KeyId,
     keys: HashMap<KeyId, Zeroizing<[u8; 32]>>,
 }
+fn map_keyring_file_error(error: SecretFileError) -> KeyringError {
+    match error {
+        SecretFileError::Missing | SecretFileError::Read | SecretFileError::Unsupported => {
+            KeyringError::Read
+        }
+        SecretFileError::TooLarge => KeyringError::TooLarge,
+        SecretFileError::NotRegular
+        | SecretFileError::InsecurePermissions
+        | SecretFileError::WrongOwner => KeyringError::InsecurePermissions,
+    }
+}
+
 impl FileKeyring {
     pub fn load(path: &Path, active_key_id: &str) -> Result<Self, KeyringError> {
-        let metadata = fs::metadata(path).map_err(|_| KeyringError::Read)?;
-        if metadata.len() > MAX_KEYRING_BYTES {
-            return Err(KeyringError::TooLarge);
-        }
-        if !metadata.is_file() {
-            return Err(KeyringError::InsecurePermissions);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o077 != 0 {
-                return Err(KeyringError::InsecurePermissions);
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            return Err(KeyringError::InsecurePermissions);
-        }
-        // Key material is read into zeroizing buffers so the hex text and the
-        // decoded bytes are wiped once the keyring is built.
-        let contents = Zeroizing::new(fs::read_to_string(path).map_err(|_| KeyringError::Read)?);
+        let contents = load_owner_only_secret(path, MAX_KEYRING_BYTES as usize)
+            .map_err(map_keyring_file_error)?;
         let mut entries = Vec::new();
         for line in contents.lines() {
             let line = line.trim();

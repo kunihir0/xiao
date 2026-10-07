@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 bot-application = { version = "0.1.0", path = "../application" }
 bot-domain = { version = "0.1.0", path = "../domain" }
+bytes = "1.12.1"
 push-receiver = { version = "0.1.0", path = "../push-receiver" }
 reqwest.workspace = true
 rustls.workspace = true

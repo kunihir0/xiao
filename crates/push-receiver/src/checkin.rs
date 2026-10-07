@@ -1,11 +1,10 @@
+use crate::{Error, Result, proto, wire::preflight_repeated_len_delimited};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use p256::PublicKey;
 use prost::Message;
 use serde::Deserialize;
 use url::Url;
-
-use crate::{Error, Result, proto, wire::preflight_repeated_len_delimited};
-
+use zeroize::Zeroizing;
 const MAX_CHECKIN_SETTINGS: usize = 128;
 const MAX_CHECKIN_SETTING_ENTRY_BYTES: usize = 16 * 1024;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,7 +111,7 @@ pub fn parse_checkin_response(bytes: &[u8]) -> Result<CheckinResult> {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct RegistrationToken(String);
+pub struct RegistrationToken(Zeroizing<String>);
 impl std::fmt::Debug for RegistrationToken {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RegistrationToken(<redacted>)")
@@ -120,7 +119,7 @@ impl std::fmt::Debug for RegistrationToken {
 }
 impl RegistrationToken {
     pub fn new(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
+        let value = Zeroizing::new(value.into());
         if value.is_empty()
             || value.len() > 4096
             || value
@@ -269,10 +268,20 @@ mod tests {
     #[test]
     fn parses_reference_registration_response() {
         let token = parse_registration_response("token=abc.def");
-        assert!(token.is_ok());
-        assert_eq!(token.ok().map(|value| value.0), Some("abc.def".to_owned()));
+        assert!(matches!(
+            &token,
+            Ok(value) if value.as_str() == "abc.def"
+        ));
         assert!(parse_registration_response("Error=INVALID").is_err());
         assert!(parse_registration_response("token=").is_err());
+    }
+    #[test]
+    fn registration_token_debug_is_redacted() {
+        let token = RegistrationToken::new("secret-registration-token");
+        assert!(matches!(
+            &token,
+            Ok(value) if !format!("{value:?}").contains("secret-registration-token")
+        ));
     }
 
     #[test]
