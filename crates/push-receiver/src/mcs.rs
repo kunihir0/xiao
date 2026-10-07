@@ -2,10 +2,23 @@ use prost::Message;
 
 use crate::{Error, Notification, Result, checkin::CheckinCredentials, proto};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LoginParameters {
     pub credentials: CheckinCredentials,
     pub persistent_ids: Vec<String>,
+}
+
+impl std::fmt::Debug for LoginParameters {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoginParameters")
+            .field("credentials", &self.credentials)
+            .field(
+                "persistent_ids",
+                &format_args!("<{} ids>", self.persistent_ids.len()),
+            )
+            .finish()
+    }
 }
 
 pub fn encode_login(parameters: &LoginParameters) -> Result<Vec<u8>> {
@@ -32,6 +45,12 @@ pub fn encode_login(parameters: &LoginParameters) -> Result<Vec<u8>> {
 }
 
 pub fn decode_login_response(payload: &[u8]) -> Result<DurationConfig> {
+    if payload.len() > crate::MAX_FRAME_SIZE {
+        return Err(Error::FrameTooLarge {
+            actual: payload.len(),
+            max: crate::MAX_FRAME_SIZE,
+        });
+    }
     let response =
         proto::LoginResponse::decode(payload).map_err(|error| Error::Decode(error.to_string()))?;
     if response.id.is_empty() {
@@ -62,6 +81,12 @@ pub struct DurationConfig {
 }
 
 pub fn decode_data_message(payload: &[u8]) -> Result<Notification> {
+    if payload.len() > crate::MAX_FRAME_SIZE {
+        return Err(Error::FrameTooLarge {
+            actual: payload.len(),
+            max: crate::MAX_FRAME_SIZE,
+        });
+    }
     let message = proto::DataMessageStanza::decode(payload)
         .map_err(|error| Error::Decode(error.to_string()))?;
     if message.from.is_empty() || message.category.is_empty() {
@@ -91,4 +116,27 @@ pub fn encode_heartbeat_ack(last_stream_id_received: Option<i32>) -> Result<Vec<
         ..Default::default()
     }
     .encode_to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consumes_independent_login_and_data_fixtures() {
+        let login = include_str!("../fixtures/login_response.hex")
+            .split_whitespace()
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .collect::<Vec<_>>();
+        assert!(decode_login_response(&login).is_ok());
+        let data = include_str!("../fixtures/data_message.hex")
+            .split_whitespace()
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .collect::<Vec<_>>();
+        let notification = decode_data_message(&data);
+        assert_eq!(
+            notification.ok().map(|value| value.payload),
+            Some(vec![1, 2, 3])
+        );
+    }
 }

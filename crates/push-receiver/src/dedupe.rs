@@ -2,11 +2,22 @@ use std::collections::{HashSet, VecDeque};
 
 pub const MAX_DEDUPE_CAPACITY: usize = 16_384;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PersistentIdWindow {
     capacity: usize,
     order: VecDeque<String>,
     seen: HashSet<String>,
+}
+
+impl std::fmt::Debug for PersistentIdWindow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistentIdWindow")
+            .field("capacity", &self.capacity)
+            .field("count", &self.order.len())
+            .field("bytes", &self.bytes())
+            .finish()
+    }
 }
 impl PersistentIdWindow {
     #[must_use]
@@ -19,8 +30,12 @@ impl PersistentIdWindow {
         }
     }
     #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.capacity
+    pub fn ids(&self) -> Vec<String> {
+        self.order.iter().cloned().collect()
+    }
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.order.iter().map(String::len).sum()
     }
     /// Returns true when `id` was already observed; new IDs are retained up to the configured bound.
     pub fn observe(&mut self, id: &str) -> bool {

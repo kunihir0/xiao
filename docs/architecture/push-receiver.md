@@ -31,3 +31,12 @@ old IDs are evicted, a redelivery is emitted again and application consumers
 must process notifications idempotently. `RetryPolicy` exposes bounded,
 deterministic exponential delays with injectable jitter values for reconnect
 loops.
+
+## Production transport
+
+`FcmConnector` performs the protobuf check-in and registration HTTP exchanges,
+then establishes a TLS 1.2+/1.3 MCS session to the configured endpoint. The
+connector is injected through `ReceiverConnector`; tests can provide a local
+loopback implementation without credentials or external network access.
+`start_connected` owns the session, heartbeat, reconnect backoff, dedupe
+redelivery state, bounded notification queue, and joined cancellation path.

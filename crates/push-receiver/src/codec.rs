@@ -41,87 +41,127 @@ impl TryFrom<u8> for FrameTag {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McsFrame {
-    pub tag: FrameTag,
-    pub payload: Vec<u8>,
+pub(crate) struct McsFrame {
+    pub(crate) tag: FrameTag,
+    pub(crate) payload: Vec<u8>,
 }
 
 impl McsFrame {
     #[must_use]
-    pub const fn new(tag: FrameTag, payload: Vec<u8>) -> Self {
+    pub(crate) const fn new(tag: FrameTag, payload: Vec<u8>) -> Self {
         Self { tag, payload }
     }
 }
 
-#[derive(Debug, Default)]
-pub struct McsCodec {
-    first: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodecDirection {
+    Client,
+    Server,
+}
+
+#[derive(Debug)]
+pub(crate) struct McsCodec {
+    direction: CodecDirection,
+    decode_first: bool,
+    encode_first: bool,
     in_frame: bool,
     unknown_frames: u8,
 }
 
+impl Default for McsCodec {
+    fn default() -> Self {
+        Self::client()
+    }
+}
+
 impl McsCodec {
     #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            first: true,
+            direction: CodecDirection::Server,
+            decode_first: true,
+            encode_first: false,
             in_frame: false,
             unknown_frames: 0,
         }
     }
 
-    pub fn decode_frame(&mut self, src: &mut BytesMut) -> Result<Option<McsFrame>> {
-        if self.first {
-            let Some(version) = src.first().copied() else {
-                return Ok(None);
-            };
-            if version != MCS_VERSION && version != LEGACY_MCS_VERSION {
-                return Err(Error::UnsupportedVersion(version));
-            }
-            src.advance(1);
-            self.first = false;
-            self.in_frame = true;
+    #[must_use]
+    pub(crate) const fn client() -> Self {
+        Self {
+            direction: CodecDirection::Client,
+            decode_first: false,
+            encode_first: true,
+            in_frame: false,
+            unknown_frames: 0,
         }
-        let Some(tag) = src.first().copied() else {
-            return Ok(None);
-        };
-        let Some((size, consumed)) = decode_varint(src.get(1..).unwrap_or_default())? else {
-            return Ok(None);
-        };
-        if size > MAX_FRAME_SIZE {
-            return Err(Error::FrameTooLarge {
-                actual: size,
-                max: MAX_FRAME_SIZE,
-            });
-        }
-        let header = 1usize.checked_add(consumed).ok_or(Error::InvalidVarint)?;
-        if src.len()
-            < header.checked_add(size).ok_or(Error::FrameTooLarge {
-                actual: usize::MAX,
-                max: MAX_FRAME_SIZE,
-            })?
-        {
-            return Ok(None);
-        }
-        src.advance(header);
-        let payload = src.split_to(size).to_vec();
-        let tag = match FrameTag::try_from(tag) {
-            Ok(tag) => tag,
-            Err(Error::UnsupportedTag(_)) => {
-                self.unknown_frames = self.unknown_frames.saturating_add(1);
-                if self.unknown_frames > 64 {
-                    return Err(Error::UnsupportedTag(tag));
-                }
-                return self.decode_frame(src);
-            }
-            Err(error) => return Err(error),
-        };
-        self.in_frame = false;
-        self.unknown_frames = 0;
-        Ok(Some(McsFrame { tag, payload }))
     }
 
-    pub fn encode_frame(&mut self, frame: &McsFrame, dst: &mut BytesMut) -> Result<()> {
+    pub(crate) const fn server() -> Self {
+        Self {
+            direction: CodecDirection::Server,
+            decode_first: false,
+            encode_first: false,
+            in_frame: false,
+            unknown_frames: 0,
+        }
+    }
+
+    pub(crate) fn decode_frame(&mut self, src: &mut BytesMut) -> Result<Option<McsFrame>> {
+        loop {
+            if self.decode_first {
+                let Some(version) = src.first().copied() else {
+                    return Ok(None);
+                };
+                if version != MCS_VERSION && version != LEGACY_MCS_VERSION {
+                    return Err(Error::UnsupportedVersion(version));
+                }
+                src.advance(1);
+                self.decode_first = false;
+                self.in_frame = true;
+            }
+            let Some(tag_byte) = src.first().copied() else {
+                return Ok(None);
+            };
+            let Some((size, consumed)) = decode_varint(src.get(1..).unwrap_or_default())? else {
+                self.in_frame = true;
+                return Ok(None);
+            };
+            if size > MAX_FRAME_SIZE {
+                return Err(Error::FrameTooLarge {
+                    actual: size,
+                    max: MAX_FRAME_SIZE,
+                });
+            }
+            let header = 1usize.checked_add(consumed).ok_or(Error::InvalidVarint)?;
+            let total = header.checked_add(size).ok_or(Error::FrameTooLarge {
+                actual: usize::MAX,
+                max: MAX_FRAME_SIZE,
+            })?;
+            if src.len() < total {
+                self.in_frame = true;
+                return Ok(None);
+            }
+            src.advance(header);
+            let payload = src.split_to(size).to_vec();
+            self.in_frame = false;
+            let tag = match FrameTag::try_from(tag_byte) {
+                Ok(tag) => tag,
+                Err(Error::UnsupportedTag(_)) => {
+                    self.unknown_frames = self.unknown_frames.saturating_add(1);
+                    if self.unknown_frames > 64 {
+                        return Err(Error::UnsupportedTag(tag_byte));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            self.unknown_frames = 0;
+            return Ok(Some(McsFrame { tag, payload }));
+        }
+    }
+
+    pub(crate) fn encode_frame(&mut self, frame: &McsFrame, dst: &mut BytesMut) -> Result<()> {
         if frame.payload.len() > MAX_FRAME_SIZE {
             return Err(Error::FrameTooLarge {
                 actual: frame.payload.len(),
@@ -129,9 +169,14 @@ impl McsCodec {
             });
         }
         dst.reserve(frame.payload.len() + 7);
-        if frame.tag == FrameTag::LoginRequest {
+        if self.encode_first {
+            if self.direction != CodecDirection::Client || frame.tag != FrameTag::LoginRequest {
+                return Err(Error::InvalidState(
+                    "first client frame must be LoginRequest",
+                ));
+            }
             dst.put_u8(MCS_VERSION);
-            self.first = false;
+            self.encode_first = false;
         }
         dst.put_u8(frame.tag as u8);
         encode_varint(frame.payload.len(), dst);
@@ -229,6 +274,38 @@ mod tests {
         assert_eq!(
             decoded.ok().flatten(),
             Some(McsFrame::new(FrameTag::DataMessage, vec![1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn consumes_independent_client_and_server_framing_fixtures() {
+        let parse = |value: &str| {
+            value
+                .split_whitespace()
+                .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+                .collect::<Vec<_>>()
+        };
+        let mut client = McsCodec::new();
+        let client_fixture = parse(include_str!("../fixtures/client_login_frame.hex"));
+        let mut client_bytes = BytesMut::from(client_fixture.as_slice());
+        assert_eq!(
+            client
+                .decode_frame(&mut client_bytes)
+                .ok()
+                .flatten()
+                .map(|frame| frame.tag),
+            Some(FrameTag::LoginRequest)
+        );
+        let mut server = McsCodec::server();
+        let server_fixture = parse(include_str!("../fixtures/server_login_response_frame.hex"));
+        let mut server_bytes = BytesMut::from(server_fixture.as_slice());
+        assert_eq!(
+            server
+                .decode_frame(&mut server_bytes)
+                .ok()
+                .flatten()
+                .map(|frame| frame.tag),
+            Some(FrameTag::LoginResponse)
         );
     }
 }

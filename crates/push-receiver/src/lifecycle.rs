@@ -1,8 +1,18 @@
-use std::fmt;
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Duration;
 
-use crate::{Error, Notification, PersistentIdWindow, Result, RetryPolicy};
+use crate::{
+    Error, Notification, PersistentIdWindow, Result, RetryPolicy,
+    transport::{ReceiverConnector, SessionEvent},
+};
 
 pub const DEFAULT_QUEUE_CAPACITY: usize = 64;
 pub const DEFAULT_DEDUPE_CAPACITY: usize = 256;
@@ -21,6 +31,7 @@ pub struct ReceiverHandle {
     readiness: watch::Receiver<Readiness>,
     readiness_tx: watch::Sender<Readiness>,
     task: Option<JoinHandle<Result<()>>>,
+    queued_bytes: Arc<AtomicUsize>,
 }
 impl fmt::Debug for ReceiverHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -39,7 +50,12 @@ impl ReceiverHandle {
         self.readiness.clone()
     }
     pub async fn recv(&mut self) -> Option<Notification> {
-        self.notifications.recv().await
+        let notification = self.notifications.recv().await;
+        if let Some(value) = &notification {
+            self.queued_bytes
+                .fetch_sub(notification_bytes(value), Ordering::AcqRel);
+        }
+        notification
     }
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(sender) = self.shutdown.take() {
@@ -104,6 +120,8 @@ pub fn start_with_policy(
         mpsc::channel(queue_capacity.clamp(1, MAX_QUEUE_CAPACITY));
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let (readiness_tx, readiness) = watch::channel(Readiness::Starting);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let task_queued_bytes = Arc::clone(&queued_bytes);
     let task_readiness = readiness_tx.clone();
     let task = tokio::spawn(async move {
         let mut source = source.input;
@@ -129,7 +147,20 @@ pub fn start_with_policy(
                         }
                     };
                     if notification.persistent_id.as_deref().is_some_and(|id| dedupe.observe(id)) { continue; }
-                    if notifications_tx.send(notification).await.is_err() { let _ = task_readiness.send(Readiness::Stopped); return Err(Error::ChannelClosed); }
+                    let bytes = notification_bytes(&notification);
+                    if bytes > MAX_NOTIFICATION_BYTES || !reserve_queue_bytes(&task_queued_bytes, bytes) {
+                        let _ = task_readiness.send(Readiness::Stopped);
+                        return Err(if bytes > MAX_NOTIFICATION_BYTES {
+                            Error::NotificationTooLarge
+                        } else {
+                            Error::QueueByteBudget
+                        });
+                    }
+                    if notifications_tx.send(notification).await.is_err() {
+                        task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                        let _ = task_readiness.send(Readiness::Stopped);
+                        return Err(Error::ChannelClosed);
+                    }
                 }
             }
         }
@@ -140,7 +171,154 @@ pub fn start_with_policy(
         readiness,
         readiness_tx,
         task: Some(task),
+        queued_bytes,
     }
+}
+
+/// Starts the production check-in/registration/MCS reconnect loop.
+#[must_use]
+pub fn start_connected(
+    connector: Arc<dyn ReceiverConnector>,
+    queue_capacity: usize,
+    dedupe_capacity: usize,
+    policy: RetryPolicy,
+) -> ReceiverHandle {
+    let (notifications_tx, notifications) =
+        mpsc::channel(queue_capacity.clamp(1, MAX_QUEUE_CAPACITY));
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let (readiness_tx, readiness) = watch::channel(Readiness::Starting);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let task_queued_bytes = Arc::clone(&queued_bytes);
+    let task_readiness = readiness_tx.clone();
+    let task = tokio::spawn(async move {
+        let mut dedupe = PersistentIdWindow::new(dedupe_capacity);
+        let mut attempts = 0_u32;
+        loop {
+            let mut session = match connector.connect(&dedupe.ids()).await {
+                Ok(session) => {
+                    attempts = 0;
+                    let _ = task_readiness.send(Readiness::Ready);
+                    session
+                }
+                Err(error) => {
+                    attempts = attempts.saturating_add(1);
+                    if attempts > policy.max_attempts() {
+                        let _ = task_readiness.send(Readiness::Stopped);
+                        return Err(error);
+                    }
+                    let _ = task_readiness.send(Readiness::Starting);
+                    let delay = policy.delay(attempts, attempts);
+                    tokio::select! {
+                        _ = &mut shutdown_rx => {
+                            let _ = task_readiness.send(Readiness::Stopped);
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
+            };
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(300));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        let _ = task_readiness.send(Readiness::Stopped);
+                        return Ok(());
+                    }
+                    _ = heartbeat.tick() => {
+                        if let Err(error) = session.send_heartbeat().await {
+                            attempts = attempts.saturating_add(1);
+                            if attempts > policy.max_attempts() {
+                                let _ = task_readiness.send(Readiness::Stopped);
+                                return Err(error);
+                            }
+                            let _ = task_readiness.send(Readiness::Starting);
+                            break;
+                        }
+                    }
+                    event = session.receive() => {
+                        match event {
+                            Ok(SessionEvent::Notification(notification)) => {
+                                attempts = 0;
+                                let bytes = notification_bytes(&notification);
+                                if bytes > MAX_NOTIFICATION_BYTES || !reserve_queue_bytes(&task_queued_bytes, bytes) {
+                                    let _ = task_readiness.send(Readiness::Stopped);
+                                    return Err(if bytes > MAX_NOTIFICATION_BYTES {
+                                        Error::NotificationTooLarge
+                                    } else {
+                                        Error::QueueByteBudget
+                                    });
+                                }
+                                if notification.persistent_id.as_deref().is_some_and(|id| dedupe.observe(id)) {
+                                    task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                                    continue;
+                                }
+                                if notifications_tx.send(notification).await.is_err() {
+                                    task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                                    let _ = task_readiness.send(Readiness::Stopped);
+                                    return Err(Error::ChannelClosed);
+                                }
+                            }
+                            Ok(SessionEvent::Closed) | Err(_) => {
+                                attempts = attempts.saturating_add(1);
+                                if attempts > policy.max_attempts() {
+                                    let _ = task_readiness.send(Readiness::Stopped);
+                                    return Err(Error::TransportClosed);
+                                }
+                                let _ = task_readiness.send(Readiness::Starting);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let delay = policy.delay(attempts, attempts);
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    let _ = task_readiness.send(Readiness::Stopped);
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    });
+    ReceiverHandle {
+        notifications,
+        shutdown: Some(shutdown_tx),
+        readiness,
+        readiness_tx,
+        task: Some(task),
+        queued_bytes,
+    }
+}
+
+pub const MAX_NOTIFICATION_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+
+fn reserve_queue_bytes(current: &AtomicUsize, bytes: usize) -> bool {
+    let mut previous = current.load(Ordering::Acquire);
+    loop {
+        let Some(next) = previous.checked_add(bytes) else {
+            return false;
+        };
+        if next > MAX_QUEUE_BYTES {
+            return false;
+        }
+        match current.compare_exchange_weak(previous, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(value) => previous = value,
+        }
+    }
+}
+fn notification_bytes(notification: &Notification) -> usize {
+    notification.payload.len()
+        + notification.persistent_id.as_ref().map_or(0, String::len)
+        + notification
+            .app_data
+            .iter()
+            .map(|entry| entry.key.len() + entry.value.len())
+            .sum::<usize>()
 }
 
 #[cfg(test)]

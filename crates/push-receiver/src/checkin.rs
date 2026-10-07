@@ -127,15 +127,30 @@ pub fn parse_registration_response(body: &str) -> Result<RegistrationToken> {
     RegistrationToken::new(value)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct SubscriptionResponse {
     pub endpoint: Option<String>,
     pub keys: Option<SubscriptionKeys>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct SubscriptionKeys {
     pub p256dh: Option<String>,
     pub auth: Option<String>,
+}
+
+impl std::fmt::Debug for SubscriptionResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubscriptionResponse")
+            .field("endpoint", &self.endpoint.as_ref().map(|_| "<redacted>"))
+            .field("keys", &self.keys.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+impl std::fmt::Debug for SubscriptionKeys {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SubscriptionKeys(<redacted>)")
+    }
 }
 
 pub fn validate_subscription_response(value: &SubscriptionResponse) -> Result<()> {
@@ -227,5 +242,22 @@ mod tests {
         assert_eq!(token.ok().map(|value| value.0), Some("abc.def".to_owned()));
         assert!(parse_registration_response("Error=INVALID").is_err());
         assert!(parse_registration_response("token=").is_err());
+    }
+
+    #[test]
+    fn consumes_independent_checkin_and_registration_fixtures() {
+        let bytes = include_str!("../fixtures/checkin_response.hex")
+            .split_whitespace()
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .collect::<Vec<_>>();
+        let result = parse_checkin_response(&bytes);
+        assert!(result.is_ok());
+        let registration = include_str!("../fixtures/registration_response.txt").trim();
+        assert_eq!(
+            parse_registration_response(registration)
+                .ok()
+                .map(|token| token.as_str().to_owned()),
+            Some("legacy-registration-token".to_owned())
+        );
     }
 }

@@ -2,8 +2,20 @@ use std::num::TryFromIntError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid protocol state: {0}")]
+    InvalidState(&'static str),
+    #[error("transport closed")]
+    TransportClosed,
+    #[error("TLS transport failed: {0}")]
+    Tls(String),
+    #[error("HTTP transport failed: {0}")]
+    Http(String),
     #[error("frame version {0} is not supported")]
     UnsupportedVersion(u8),
+    #[error("receiver queue byte budget exceeded")]
+    QueueByteBudget,
+    #[error("notification exceeds byte budget")]
+    NotificationTooLarge,
     #[error("frame tag {0} is not supported")]
     UnsupportedTag(u8),
     #[error("frame payload is too large ({actual} bytes, max {max})")]
