@@ -78,7 +78,7 @@ pub struct FcmConnector {
     registration_url: String,
     mcs_host: String,
     mcs_port: u16,
-    credentials: Option<CheckinCredentials>,
+    credentials: Arc<tokio::sync::Mutex<Option<CheckinCredentials>>>,
     registration_token: String,
 }
 
@@ -90,7 +90,7 @@ impl std::fmt::Debug for FcmConnector {
             .field("registration_url", &self.registration_url)
             .field("mcs_host", &self.mcs_host)
             .field("mcs_port", &self.mcs_port)
-            .field("credentials", &self.credentials)
+            .field("credentials", &"<redacted>")
             .field("registration_token", &"<redacted>")
             .finish()
     }
@@ -112,7 +112,7 @@ impl FcmConnector {
             registration_url: "https://android.clients.google.com/c2dm/register3".into(),
             mcs_host: "mtalk.google.com".into(),
             mcs_port: 5228,
-            credentials: None,
+            credentials: Arc::new(tokio::sync::Mutex::new(None)),
             registration_token,
         })
     }
@@ -135,8 +135,9 @@ impl FcmConnector {
         self
     }
 
-    async fn ensure_registered(&mut self) -> Result<CheckinCredentials> {
-        if let Some(credentials) = self.credentials {
+    async fn ensure_registered(&self) -> Result<CheckinCredentials> {
+        let mut cached = self.credentials.lock().await;
+        if let Some(credentials) = *cached {
             return Ok(credentials);
         }
         let response = self
@@ -174,7 +175,7 @@ impl FcmConnector {
         let registration_body = String::from_utf8(bounded_body(registration, 4096).await?)
             .map_err(|_| Error::InvalidRegistration("registration response is not UTF-8".into()))?;
         parse_registration_response(&registration_body)?;
-        self.credentials = Some(result.credentials);
+        *cached = Some(result.credentials);
         Ok(result.credentials)
     }
 }
@@ -185,16 +186,13 @@ impl ReceiverConnector for FcmConnector {
         persistent_ids: &'a [String],
     ) -> BoxFuture<'a, Result<Box<dyn McsSession>>> {
         Box::pin(async move {
-            // Clone the small connector state so concurrent reconnect attempts cannot race credentials.
-            let mut connector = self.clone();
-            let credentials = connector.ensure_registered().await?;
-            let socket =
-                TcpStream::connect((connector.mcs_host.as_str(), connector.mcs_port)).await?;
+            let credentials = self.ensure_registered().await?;
+            let socket = TcpStream::connect((self.mcs_host.as_str(), self.mcs_port)).await?;
             let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let config = ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
-            let server_name = ServerName::try_from(connector.mcs_host.clone())
+            let server_name = ServerName::try_from(self.mcs_host.clone())
                 .map_err(|_| Error::InvalidState("invalid MCS server name"))?;
             let stream = TlsConnector::from(Arc::new(config))
                 .connect(server_name, socket)
