@@ -174,7 +174,7 @@ impl DiscordHandle {
             })
             .build();
 
-        let intents = serenity::GatewayIntents::non_privileged();
+        let intents = serenity::GatewayIntents::GUILDS;
         let client_builder =
             serenity::ClientBuilder::new(config.token, intents).framework(framework);
         let mut client = tokio::select! {
@@ -264,8 +264,12 @@ async fn run_lifecycle_with_timeout(
                     Ok(SetupStatus::RegistrationFailed(detail)) => {
                         readiness_sender.send_replace(DiscordReadiness::Stopping);
                         shutdown().await;
-                        let _ = await_client_task(&mut client_task, shutdown_timeout).await;
-                        break Err(DiscordError::Registration(detail));
+                        let client_result =
+                            await_client_task(&mut client_task, shutdown_timeout).await;
+                        break match client_result {
+                            Ok(()) => Err(DiscordError::Registration(detail)),
+                            Err(error) => Err(error),
+                        };
                     }
                     Err(_) => {
                         readiness_sender.send_replace(DiscordReadiness::Stopping);
@@ -477,6 +481,33 @@ mod tests {
         assert!(matches!(
             result,
             Err(DiscordError::Registration(message)) if message == "registration failed"
+        ));
+        assert_eq!(*readiness_receiver.borrow(), DiscordReadiness::Stopped);
+    }
+
+    #[tokio::test]
+    async fn registration_failure_propagates_client_gateway_failure() {
+        let (setup_sender, setup_receiver) = oneshot::channel();
+        let _ = setup_sender.send(SetupStatus::RegistrationFailed(
+            "registration failed".to_owned(),
+        ));
+        let client: ClientStartFuture =
+            Box::pin(async { Err(DiscordError::Gateway("gateway failed".to_owned())) });
+        let shutdown: ShutdownFn = Box::new(|| Box::pin(async {}));
+        let (readiness_sender, readiness_receiver) = watch::channel(DiscordReadiness::Starting);
+
+        let result = run_lifecycle(
+            client,
+            setup_receiver,
+            CancellationToken::new(),
+            readiness_sender,
+            shutdown,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(DiscordError::Gateway(message)) if message == "gateway failed"
         ));
         assert_eq!(*readiness_receiver.borrow(), DiscordReadiness::Stopped);
     }
