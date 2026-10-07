@@ -803,11 +803,7 @@ mod tests {
         let result = handle.shutdown().await;
         assert!(matches!(result, Err(Error::TransportClosed)));
     }
-    use std::{
-        collections::VecDeque,
-        sync::Mutex,
-        time::Duration,
-    };
+    use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
     struct SessionConfig {
         events: VecDeque<Result<SessionEvent>>,
@@ -924,7 +920,6 @@ mod tests {
         }
     }
 
-
     enum ConnectPlan {
         Session(SessionConfig),
     }
@@ -959,13 +954,15 @@ mod tests {
         {
             self.calls.fetch_add(1, Ordering::AcqRel);
             self.call_notify.notify_waiters();
-            let plan = self.plans.lock().ok().and_then(|mut plans| plans.pop_front());
+            let plan = self
+                .plans
+                .lock()
+                .ok()
+                .and_then(|mut plans| plans.pop_front());
             Box::pin(async move {
                 match plan {
-                    Some(ConnectPlan::Session(config)) => {
-                        Ok(Box::new(ScriptSession::from(config))
-                            as Box<dyn crate::transport::McsSession>)
-                    }
+                    Some(ConnectPlan::Session(config)) => Ok(Box::new(ScriptSession::from(config))
+                        as Box<dyn crate::transport::McsSession>),
                     None => Err(Error::TransportClosed),
                 }
             })
@@ -1018,8 +1015,10 @@ mod tests {
         let second = SessionConfig::new(vec![Ok(SessionEvent::Notification(
             second_notification.clone(),
         ))]);
-        let (connector, calls, call_notify) =
-            ScriptConnector::new(vec![ConnectPlan::Session(first), ConnectPlan::Session(second)]);
+        let (connector, calls, call_notify) = ScriptConnector::new(vec![
+            ConnectPlan::Session(first),
+            ConnectPlan::Session(second),
+        ]);
         let connector = Arc::new(connector);
         let mut handle = start_connected(connector, 2, 2, no_jitter_policy(3));
         let readiness = handle.readiness_watch();
@@ -1042,11 +1041,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn login_then_receive_errors_use_growing_backoff_and_stop() {
         let plans = (0..4)
-            .map(|_| {
-                ConnectPlan::Session(SessionConfig::new(vec![Err(
-                    Error::TransportClosed,
-                )]))
-            })
+            .map(|_| ConnectPlan::Session(SessionConfig::new(vec![Err(Error::TransportClosed)])))
             .collect();
         let (connector, calls, call_notify) = ScriptConnector::new(plans);
         let connector = Arc::new(connector);
@@ -1089,6 +1084,7 @@ mod tests {
         let connector = Arc::new(connector);
         let handle = start_connected(connector, 1, 1, no_jitter_policy(2));
         wait_for_count(&calls, &call_notify, 1).await;
+        tokio::task::yield_now().await;
         for expected in 1..=3 {
             tokio::time::advance(Duration::from_secs(1)).await;
             wait_for_count_without_notify(&heartbeat_count, expected).await;
@@ -1109,6 +1105,7 @@ mod tests {
         let connector = Arc::new(connector);
         let handle = start_connected(connector, 1, 1, no_jitter_policy(2));
         wait_for_count(&calls, &call_notify, 1).await;
+        tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -1124,14 +1121,10 @@ mod tests {
         let events = notification_events(9);
         let mut config = SessionConfig::new(events);
         config.acknowledgements = Some(Arc::clone(&acknowledgements));
-        let (connector, calls, call_notify) = ScriptConnector::new(vec![ConnectPlan::Session(config)]);
+        let (connector, calls, call_notify) =
+            ScriptConnector::new(vec![ConnectPlan::Session(config)]);
         let connector = Arc::new(connector);
-        let mut handle = start_connected(
-            connector,
-            MAX_QUEUE_CAPACITY,
-            16,
-            no_jitter_policy(1),
-        );
+        let mut handle = start_connected(connector, MAX_QUEUE_CAPACITY, 16, no_jitter_policy(1));
         wait_for_count(&calls, &call_notify, 1).await;
         wait_for_count_without_notify(&acknowledgements, 8).await;
         assert_eq!(acknowledgements.load(Ordering::Acquire), 8);
@@ -1148,14 +1141,10 @@ mod tests {
         let acknowledgements = Arc::new(AtomicUsize::new(0));
         let mut config = SessionConfig::new(notification_events(9));
         config.acknowledgements = Some(Arc::clone(&acknowledgements));
-        let (connector, calls, call_notify) = ScriptConnector::new(vec![ConnectPlan::Session(config)]);
+        let (connector, calls, call_notify) =
+            ScriptConnector::new(vec![ConnectPlan::Session(config)]);
         let connector = Arc::new(connector);
-        let handle = start_connected(
-            connector,
-            MAX_QUEUE_CAPACITY,
-            16,
-            no_jitter_policy(1),
-        );
+        let handle = start_connected(connector, MAX_QUEUE_CAPACITY, 16, no_jitter_policy(1));
         let readiness = handle.readiness_watch();
         wait_for_count(&calls, &call_notify, 1).await;
         wait_for_count_without_notify(&acknowledgements, 8).await;
@@ -1177,7 +1166,8 @@ mod tests {
         ]);
         config.force_acknowledgements = Some(Arc::clone(&force_acknowledgements));
         config.acknowledgements = Some(Arc::clone(&acknowledgements));
-        let (connector, calls, call_notify) = ScriptConnector::new(vec![ConnectPlan::Session(config)]);
+        let (connector, calls, call_notify) =
+            ScriptConnector::new(vec![ConnectPlan::Session(config)]);
         let connector = Arc::new(connector);
         let mut handle = start_connected(connector, 2, 2, no_jitter_policy(1));
         wait_for_count(&calls, &call_notify, 1).await;
@@ -1206,7 +1196,8 @@ mod tests {
         config.ack_started = Some(Arc::clone(&ack_started));
         config.acknowledgements = Some(Arc::clone(&acknowledgements));
         config.stall_ack = true;
-        let (connector, calls, call_notify) = ScriptConnector::new(vec![ConnectPlan::Session(config)]);
+        let (connector, calls, call_notify) =
+            ScriptConnector::new(vec![ConnectPlan::Session(config)]);
         let connector = Arc::new(connector);
         let mut handle = start_connected(connector, 1, 1, no_jitter_policy(1));
         let readiness = handle.readiness_watch();
