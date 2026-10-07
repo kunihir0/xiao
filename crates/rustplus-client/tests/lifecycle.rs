@@ -184,9 +184,8 @@ async fn readiness_request_and_bounded_disconnect_use_owned_transport() {
 #[tokio::test]
 async fn dropping_last_owner_cancels_tasks_and_publishes_terminal_readiness() {
     let (endpoint, task) = server(true).await;
-    let client =
-        RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
-            .expect("client");
+    let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
+        .expect("client");
     client.connect().await.expect("connect");
     let mut readiness = client.subscribe_readiness();
     let owner = client.clone();
@@ -240,9 +239,8 @@ async fn readiness_stays_connecting_until_live_confirmation() {
 #[tokio::test]
 async fn disconnect_cancels_stalled_handshake_with_terminal_readiness() {
     let (endpoint, task) = stalled_handshake_server().await;
-    let client =
-        RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
-            .expect("client");
+    let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
+        .expect("client");
     let connecting = {
         let client = client.clone();
         tokio::spawn(async move { client.connect().await })
@@ -291,9 +289,8 @@ async fn malformed_child_error_is_surfaced_by_reconnect() {
 #[tokio::test]
 async fn disconnect_surfaces_child_error_and_keeps_terminal_readiness() {
     let (endpoint, task) = child_error_server().await;
-    let client =
-        RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
-            .expect("client");
+    let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
+        .expect("client");
     client.connect().await.expect("connect");
     tokio::time::sleep(Duration::from_millis(100)).await;
     let result = client.disconnect().await;
@@ -305,9 +302,8 @@ async fn disconnect_surfaces_child_error_and_keeps_terminal_readiness() {
 #[tokio::test]
 async fn oversized_outbound_payloads_are_rejected_before_enqueue() {
     let (endpoint, task) = server(true).await;
-    let client =
-        RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
-            .expect("client");
+    let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
+        .expect("client");
     client.connect().await.expect("connect");
     let oversized = "x".repeat(MAX_REQUEST_SIZE);
     for request in [

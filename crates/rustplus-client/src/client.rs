@@ -347,7 +347,7 @@ impl RustPlusClient {
             self.inner.readiness.send_replace(Readiness::Disconnected);
             return Err(Error::ShuttingDown);
         }
-        
+
         let generation = self
             .inner
             .generation

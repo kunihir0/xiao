@@ -14,7 +14,7 @@ pub mod camera;
 mod error;
 mod types;
 
-pub use client::{ClientConfig, EventReceiver, RustPlusClient, MAX_REQUEST_SIZE};
+pub use client::{ClientConfig, EventReceiver, MAX_REQUEST_SIZE, RustPlusClient};
 pub use error::{Error, Result};
 pub use types::{
     CameraEntity, CameraEntityKind, CameraRays, ChatMessage, ClanInfo, ClanInvite, ClanMember,
