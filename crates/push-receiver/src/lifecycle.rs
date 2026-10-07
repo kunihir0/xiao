@@ -803,6 +803,422 @@ mod tests {
         let result = handle.shutdown().await;
         assert!(matches!(result, Err(Error::TransportClosed)));
     }
+    use std::{
+        collections::VecDeque,
+        sync::Mutex,
+        time::Duration,
+    };
+
+    struct SessionConfig {
+        events: VecDeque<Result<SessionEvent>>,
+        heartbeat_interval: Duration,
+        heartbeat_notify: Option<Arc<Notify>>,
+        heartbeat_count: Option<Arc<AtomicUsize>>,
+        acknowledgements: Option<Arc<AtomicUsize>>,
+        force_acknowledgements: Option<Arc<AtomicUsize>>,
+        ack_started: Option<Arc<Notify>>,
+        stall_ack: bool,
+    }
+
+    impl SessionConfig {
+        fn new(events: Vec<Result<SessionEvent>>) -> Self {
+            Self {
+                events: events.into(),
+                heartbeat_interval: Duration::from_secs(3600),
+                heartbeat_notify: None,
+                heartbeat_count: None,
+                acknowledgements: None,
+                force_acknowledgements: None,
+                ack_started: None,
+                stall_ack: false,
+            }
+        }
+    }
+
+    struct ScriptSession {
+        events: VecDeque<Result<SessionEvent>>,
+        heartbeat_interval: Duration,
+        heartbeat_notify: Option<Arc<Notify>>,
+        heartbeat_count: Option<Arc<AtomicUsize>>,
+        acknowledgements: Option<Arc<AtomicUsize>>,
+        force_acknowledgements: Option<Arc<AtomicUsize>>,
+        ack_started: Option<Arc<Notify>>,
+        stall_ack: bool,
+    }
+
+    impl From<SessionConfig> for ScriptSession {
+        fn from(config: SessionConfig) -> Self {
+            Self {
+                events: config.events,
+                heartbeat_interval: config.heartbeat_interval,
+                heartbeat_notify: config.heartbeat_notify,
+                heartbeat_count: config.heartbeat_count,
+                acknowledgements: config.acknowledgements,
+                force_acknowledgements: config.force_acknowledgements,
+                ack_started: config.ack_started,
+                stall_ack: config.stall_ack,
+            }
+        }
+    }
+
+    impl crate::transport::McsSession for ScriptSession {
+        fn receive<'a>(&'a mut self) -> crate::transport::BoxFuture<'a, Result<SessionEvent>> {
+            if let Some(event) = self.events.pop_front() {
+                return Box::pin(async move { event });
+            }
+            if let Some(notify) = &self.heartbeat_notify {
+                let notify = Arc::clone(notify);
+                return Box::pin(async move {
+                    notify.notified().await;
+                    Ok(SessionEvent::Heartbeat)
+                });
+            }
+            Box::pin(std::future::pending())
+        }
+
+        fn acknowledge<'a>(&'a mut self) -> crate::transport::BoxFuture<'a, Result<()>> {
+            let acknowledgements = self.acknowledgements.clone();
+            let ack_started = self.ack_started.clone();
+            let stall = self.stall_ack;
+            Box::pin(async move {
+                if let Some(notify) = ack_started {
+                    notify.notify_one();
+                }
+                if stall {
+                    std::future::pending().await
+                } else {
+                    if let Some(counter) = acknowledgements {
+                        counter.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Ok(())
+                }
+            })
+        }
+
+        fn force_acknowledge<'a>(&'a mut self) -> crate::transport::BoxFuture<'a, Result<()>> {
+            let acknowledgements = self.force_acknowledgements.clone();
+            Box::pin(async move {
+                if let Some(counter) = acknowledgements {
+                    counter.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(())
+            })
+        }
+
+        fn send_heartbeat<'a>(&'a mut self) -> crate::transport::BoxFuture<'a, Result<()>> {
+            let notify = self.heartbeat_notify.clone();
+            let heartbeat_count = self.heartbeat_count.clone();
+            Box::pin(async move {
+                if let Some(counter) = heartbeat_count {
+                    counter.fetch_add(1, Ordering::AcqRel);
+                }
+                if let Some(notify) = notify {
+                    notify.notify_one();
+                }
+                Ok(())
+            })
+        }
+
+        fn heartbeat_interval(&self) -> Duration {
+            self.heartbeat_interval
+        }
+    }
+
+
+    enum ConnectPlan {
+        Session(SessionConfig),
+    }
+
+    struct ScriptConnector {
+        plans: Mutex<VecDeque<ConnectPlan>>,
+        calls: Arc<AtomicUsize>,
+        call_notify: Arc<Notify>,
+    }
+
+    impl ScriptConnector {
+        fn new(plans: Vec<ConnectPlan>) -> (Self, Arc<AtomicUsize>, Arc<Notify>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let call_notify = Arc::new(Notify::new());
+            (
+                Self {
+                    plans: Mutex::new(plans.into()),
+                    calls: Arc::clone(&calls),
+                    call_notify: Arc::clone(&call_notify),
+                },
+                calls,
+                call_notify,
+            )
+        }
+    }
+
+    impl ReceiverConnector for ScriptConnector {
+        fn connect<'a>(
+            &'a self,
+            _persistent_ids: &'a [String],
+        ) -> crate::transport::BoxFuture<'a, Result<Box<dyn crate::transport::McsSession>>>
+        {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.call_notify.notify_waiters();
+            let plan = self.plans.lock().ok().and_then(|mut plans| plans.pop_front());
+            Box::pin(async move {
+                match plan {
+                    Some(ConnectPlan::Session(config)) => {
+                        Ok(Box::new(ScriptSession::from(config))
+                            as Box<dyn crate::transport::McsSession>)
+                    }
+                    None => Err(Error::TransportClosed),
+                }
+            })
+        }
+    }
+
+    async fn wait_for_count(counter: &AtomicUsize, notify: &Notify, expected: usize) {
+        loop {
+            if counter.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            let notified = notify.notified();
+            if counter.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_count_without_notify(counter: &AtomicUsize, expected: usize) {
+        for _ in 0..1000 {
+            if counter.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(counter.load(Ordering::Acquire) >= expected);
+    }
+
+    fn notification_events(count: usize) -> Vec<Result<SessionEvent>> {
+        (0..count)
+            .map(|_| {
+                Ok(SessionEvent::Notification(Notification::new(
+                    vec![0; MAX_NOTIFICATION_BYTES],
+                    None,
+                )))
+            })
+            .collect()
+    }
+
+    fn no_jitter_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy::new(Duration::from_millis(100), Duration::from_secs(1), 0)
+            .with_max_attempts(max_attempts)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receive_error_reconnects_and_next_session_delivers() {
+        let first = SessionConfig::new(vec![Err(Error::TransportClosed)]);
+        let second_notification = Notification::new(vec![7], Some("next".into()));
+        let second = SessionConfig::new(vec![Ok(SessionEvent::Notification(
+            second_notification.clone(),
+        ))]);
+        let (connector, calls, call_notify) =
+            ScriptConnector::new(vec![ConnectPlan::Session(first), ConnectPlan::Session(second)]);
+        let connector = Arc::new(connector);
+        let mut handle = start_connected(connector, 2, 2, no_jitter_policy(3));
+        let readiness = handle.readiness_watch();
+        assert_eq!(*readiness.borrow(), Readiness::Starting);
+
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_count(&calls, &call_notify, 2).await;
+        let received = handle.recv().await;
+        assert_eq!(received, Some(second_notification));
+        assert_eq!(*readiness.borrow(), Readiness::Ready);
+        assert_ne!(*readiness.borrow(), Readiness::Stopped);
+        assert!(handle.shutdown().await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn login_then_receive_errors_use_growing_backoff_and_stop() {
+        let plans = (0..4)
+            .map(|_| {
+                ConnectPlan::Session(SessionConfig::new(vec![Err(
+                    Error::TransportClosed,
+                )]))
+            })
+            .collect();
+        let (connector, calls, call_notify) = ScriptConnector::new(plans);
+        let connector = Arc::new(connector);
+        let handle = start_connected(connector, 1, 1, no_jitter_policy(3));
+        let readiness = handle.readiness_watch();
+
+        wait_for_count(&calls, &call_notify, 1).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*readiness.borrow(), Readiness::Starting);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_count(&calls, &call_notify, 2).await;
+        tokio::time::advance(Duration::from_millis(199)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_count(&calls, &call_notify, 3).await;
+        tokio::time::advance(Duration::from_millis(399)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_count(&calls, &call_notify, 4).await;
+        let result = handle.shutdown().await;
+        assert!(matches!(result, Err(Error::TransportClosed)));
+        assert_eq!(*readiness.borrow(), Readiness::Stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_liveness_prevents_reconnect_and_silence_reconnects() {
+        let heartbeat_count = Arc::new(AtomicUsize::new(0));
+        let heartbeat_notify = Arc::new(Notify::new());
+        let mut live_config = SessionConfig::new(Vec::new());
+        live_config.heartbeat_interval = Duration::from_secs(1);
+        live_config.heartbeat_notify = Some(Arc::clone(&heartbeat_notify));
+        live_config.heartbeat_count = Some(Arc::clone(&heartbeat_count));
+        let (connector, calls, call_notify) =
+            ScriptConnector::new(vec![ConnectPlan::Session(live_config)]);
+        let connector = Arc::new(connector);
+        let handle = start_connected(connector, 1, 1, no_jitter_policy(2));
+        wait_for_count(&calls, &call_notify, 1).await;
+        for expected in 1..=3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            wait_for_count_without_notify(&heartbeat_count, expected).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(handle.shutdown().await.is_ok());
+
+        let silent_config = {
+            let mut config = SessionConfig::new(Vec::new());
+            config.heartbeat_interval = Duration::from_secs(1);
+            config
+        };
+        let (connector, calls, call_notify) = ScriptConnector::new(vec![
+            ConnectPlan::Session(silent_config),
+            ConnectPlan::Session(SessionConfig::new(Vec::new())),
+        ]);
+        let connector = Arc::new(connector);
+        let handle = start_connected(connector, 1, 1, no_jitter_policy(2));
+        wait_for_count(&calls, &call_notify, 1).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        wait_for_count(&calls, &call_notify, 2).await;
+        assert!(handle.shutdown().await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_byte_budget_waits_for_consumer_and_shutdown_does_not_ack() {
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        let events = notification_events(9);
+        let mut config = SessionConfig::new(events);
+        config.acknowledgements = Some(Arc::clone(&acknowledgements));
+        let (connector, calls, call_notify) = ScriptConnector::new(vec![ConnectPlan::Session(config)]);
+        let connector = Arc::new(connector);
+        let mut handle = start_connected(
+            connector,
+            MAX_QUEUE_CAPACITY,
+            16,
+            no_jitter_policy(1),
+        );
+        wait_for_count(&calls, &call_notify, 1).await;
+        wait_for_count_without_notify(&acknowledgements, 8).await;
+        assert_eq!(acknowledgements.load(Ordering::Acquire), 8);
+        assert!(handle.recv().await.is_some());
+        for _ in 0..100 {
+            if acknowledgements.load(Ordering::Acquire) == 9 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(acknowledgements.load(Ordering::Acquire), 9);
+        assert!(handle.shutdown().await.is_ok());
+
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        let mut config = SessionConfig::new(notification_events(9));
+        config.acknowledgements = Some(Arc::clone(&acknowledgements));
+        let (connector, calls, call_notify) = ScriptConnector::new(vec![ConnectPlan::Session(config)]);
+        let connector = Arc::new(connector);
+        let handle = start_connected(
+            connector,
+            MAX_QUEUE_CAPACITY,
+            16,
+            no_jitter_policy(1),
+        );
+        let readiness = handle.readiness_watch();
+        wait_for_count(&calls, &call_notify, 1).await;
+        wait_for_count_without_notify(&acknowledgements, 8).await;
+        let result = handle.shutdown().await;
+        assert!(result.is_ok());
+        assert_eq!(acknowledgements.load(Ordering::Acquire), 8);
+        assert_eq!(*readiness.borrow(), Readiness::Stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_notification_is_force_acked_and_next_is_delivered() {
+        let force_acknowledgements = Arc::new(AtomicUsize::new(0));
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        let oversized = Notification::new(vec![0; MAX_NOTIFICATION_BYTES + 1], None);
+        let next = Notification::new(vec![9], Some("next".into()));
+        let mut config = SessionConfig::new(vec![
+            Ok(SessionEvent::Notification(oversized)),
+            Ok(SessionEvent::Notification(next.clone())),
+        ]);
+        config.force_acknowledgements = Some(Arc::clone(&force_acknowledgements));
+        config.acknowledgements = Some(Arc::clone(&acknowledgements));
+        let (connector, calls, call_notify) = ScriptConnector::new(vec![ConnectPlan::Session(config)]);
+        let connector = Arc::new(connector);
+        let mut handle = start_connected(connector, 2, 2, no_jitter_policy(1));
+        wait_for_count(&calls, &call_notify, 1).await;
+        let received = handle.recv().await;
+        assert_eq!(received, Some(next));
+        for _ in 0..100 {
+            if force_acknowledgements.load(Ordering::Acquire) == 1
+                && acknowledgements.load(Ordering::Acquire) == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(force_acknowledgements.load(Ordering::Acquire), 1);
+        assert_eq!(acknowledgements.load(Ordering::Acquire), 1);
+        assert!(handle.shutdown().await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_stalled_acknowledgement() {
+        let ack_started = Arc::new(Notify::new());
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        let mut config = SessionConfig::new(vec![Ok(SessionEvent::Notification(
+            Notification::new(vec![1], Some("stall".into())),
+        ))]);
+        config.ack_started = Some(Arc::clone(&ack_started));
+        config.acknowledgements = Some(Arc::clone(&acknowledgements));
+        config.stall_ack = true;
+        let (connector, calls, call_notify) = ScriptConnector::new(vec![ConnectPlan::Session(config)]);
+        let connector = Arc::new(connector);
+        let mut handle = start_connected(connector, 1, 1, no_jitter_policy(1));
+        let readiness = handle.readiness_watch();
+        wait_for_count(&calls, &call_notify, 1).await;
+        assert!(handle.recv().await.is_some());
+        ack_started.notified().await;
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.shutdown()).await;
+        assert!(matches!(result, Ok(Ok(()))));
+        assert_eq!(acknowledgements.load(Ordering::Acquire), 0);
+        assert_eq!(*readiness.borrow(), Readiness::Stopped);
+    }
+
     #[test]
     fn rejects_zero_source_capacity() {
         assert!(ReceiverSource::channel(0).is_err());
