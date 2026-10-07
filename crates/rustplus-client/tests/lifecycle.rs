@@ -99,6 +99,29 @@ async fn child_error_server() -> (String, tokio::task::JoinHandle<()>) {
     (endpoint, task)
 }
 
+async fn flapping_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
+    let endpoint = format!("ws://{}/", listener.local_addr().expect("address"));
+    let task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            if let Some(Ok(Message::Binary(data))) = socket.next().await {
+                let mut response = fixture("response_success");
+                if let Some(sequence) = data.get(1) {
+                    response[3] = *sequence;
+                }
+                let _ = socket.send(Message::Binary(response.into())).await;
+            }
+        }
+    });
+    (endpoint, task)
+}
+
 #[tokio::test]
 async fn readiness_request_and_bounded_disconnect_use_owned_transport() {
     let (endpoint, task) = server(true).await;
@@ -140,6 +163,21 @@ async fn malformed_child_error_is_surfaced_by_reconnect() {
         .expect("reconnect must terminate")
         .expect_err("malformed child must surface");
     assert!(matches!(error, Error::Decode));
+    task.abort();
+}
+
+#[tokio::test]
+async fn reconnects_after_established_loss_with_hard_attempt_cap() {
+    let (endpoint, task) = flapping_server().await;
+    let mut config = ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests();
+    config.reconnect.max_attempts = 1;
+    config.reconnect.initial_delay = Duration::from_millis(1);
+    config.reconnect.max_delay = Duration::from_millis(2);
+    let client = RustPlusClient::new(config);
+    let result = tokio::time::timeout(Duration::from_secs(8), client.connect_with_reconnect())
+        .await
+        .expect("reconnect attempts must be bounded");
+    assert!(result.is_err());
     task.abort();
 }
 

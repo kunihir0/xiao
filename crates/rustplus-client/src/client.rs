@@ -429,6 +429,18 @@ impl RustPlusClient {
             self.inner.readiness.send_replace(Readiness::Disconnected);
             return Err(error);
         }
+        if cancellation.is_cancelled() {
+            let error = self
+                .inner
+                .child_error
+                .lock()
+                .ok()
+                .and_then(|mut error| error.take())
+                .unwrap_or(Error::Disconnected);
+            self.abort_supervisor().await;
+            self.inner.readiness.send_replace(Readiness::Disconnected);
+            return Err(error);
+        }
         self.inner.readiness.send_replace(Readiness::Ready);
         Ok(())
     }
@@ -740,7 +752,18 @@ where
     S: futures_util::Sink<WsMessage, Error = WsError> + Unpin,
 {
     loop {
-        tokio::select! { _ = cancellation.cancelled() => { let _ = timeout(SHUTDOWN_TIMEOUT, write.send(WsMessage::Close(None))).await; return Ok(()); }, item = outbound.recv() => match item { Some(item) => { let request = to_proto_request(item.sequence, item.player_id, item.player_token, item.request); let mut bytes = Vec::new(); request.encode(&mut bytes).map_err(|_| Error::Encode)?; write.send(WsMessage::Binary(bytes.into())).await.map_err(|_| Error::Transport)?; }, None => return Ok(()) } }
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            item = outbound.recv() => match item {
+                Some(item) => {
+                    let request = to_proto_request(item.sequence, item.player_id, item.player_token, item.request);
+                    let mut bytes = Vec::new();
+                    request.encode(&mut bytes).map_err(|_| Error::Encode)?;
+                    write.send(WsMessage::Binary(bytes.into())).await.map_err(|_| Error::Transport)?;
+                }
+                None => return Ok(()),
+            }
+        }
     }
 }
 fn fail_pending_generation(pending: &Mutex<PendingMap>, generation: u64, error: Error) {
