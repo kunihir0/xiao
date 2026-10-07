@@ -19,6 +19,7 @@ mod lifecycle;
 mod mcs;
 mod retry;
 mod transport;
+mod wire;
 
 pub use checkin::{
     CheckinCredentials, CheckinResult, RegistrationToken, SubscriptionKeys, SubscriptionResponse,

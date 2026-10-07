@@ -26,7 +26,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{
-    connect_async_with_config,
+    Connector, connect_async_tls_with_config,
     tungstenite::{
         Error as WsError,
         protocol::{Message as WsMessage, WebSocketConfig},
@@ -47,6 +47,17 @@ const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 pub const MAX_REQUEST_SIZE: usize = 2 * 1024 * 1024;
 const MAX_FRAME: usize = MAX_REQUEST_SIZE;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+fn rustls_connector() -> Result<Connector> {
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| Error::InvalidConfig("ring provider lacks safe TLS versions"))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(Connector::Rustls(Arc::new(config)))
+}
 
 type PendingKey = (u64, u32);
 type PendingMap = HashMap<PendingKey, oneshot::Sender<Result<Response>>>;
@@ -334,11 +345,13 @@ impl RustPlusClient {
         let ws_config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_FRAME));
+        let connector = rustls_connector()?;
         let mut stream = tokio::select! {
-            result = connect_async_with_config(
+            result = connect_async_tls_with_config(
                 self.inner.config.endpoint.as_str(),
                 Some(ws_config),
                 false,
+                Some(connector),
             ) => match result {
                 Ok((stream, _)) => stream,
                 Err(_) => {
@@ -1363,5 +1376,16 @@ mod tests {
         readiness.send_replace(Readiness::Ready);
         mark_disconnected_unless_closing(&readiness);
         assert_eq!(*receiver.borrow(), Readiness::Disconnected);
+    }
+
+    #[test]
+    fn explicit_ring_connector_does_not_require_process_provider() {
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let result = std::panic::catch_unwind(rustls_connector);
+        assert!(result.is_ok(), "TLS connector construction must not panic");
+        assert!(matches!(
+            result.expect("panic already checked"),
+            Ok(Connector::Rustls(_))
+        ));
     }
 }

@@ -51,6 +51,12 @@ impl PersistentIdWindow {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+    /// Returns whether `id` is already retained in the bounded window.
+    #[must_use]
+    pub fn contains(&self, id: &str) -> bool {
+        self.seen.contains(id)
+    }
+
     /// Returns true when `id` was already observed; new IDs are retained up to
     /// both the configured count and the hard byte bound.
     pub fn observe(&mut self, id: &str) -> bool {

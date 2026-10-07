@@ -1,11 +1,14 @@
 use prost::Message;
 
-use crate::{Error, Notification, Result, checkin::CheckinCredentials, proto};
+use crate::{Error, Notification, Result, checkin::CheckinCredentials};
+use crate::{proto, wire::preflight_repeated_len_delimited};
 
 pub const MAX_PERSISTENT_ID_BYTES: usize = crate::dedupe::MAX_PERSISTENT_ID_BYTES;
 pub const MAX_APP_DATA_ITEMS: usize = 128;
 pub const MAX_APP_DATA_BYTES: usize = 64 * 1024;
 pub const MAX_APP_DATA_ENTRY_BYTES: usize = 16 * 1024;
+pub const MAX_LOGIN_SETTINGS: usize = 128;
+pub const MAX_SETTING_ENTRY_BYTES: usize = 16 * 1024;
 pub const MAX_RAW_DATA_BYTES: usize = crate::MAX_NOTIFICATION_BYTES;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -85,6 +88,7 @@ pub(crate) fn decode_login_response_details(payload: &[u8]) -> Result<LoginRespo
             max: crate::MAX_FRAME_SIZE,
         });
     }
+    preflight_repeated_len_delimited(payload, 4, MAX_LOGIN_SETTINGS, MAX_SETTING_ENTRY_BYTES)?;
     let response =
         proto::LoginResponse::decode(payload).map_err(|error| Error::Decode(error.to_string()))?;
     if response.id.is_empty() {
@@ -131,6 +135,13 @@ pub(crate) fn decode_data_message_with_metadata(payload: &[u8]) -> Result<Decode
             max: crate::MAX_FRAME_SIZE,
         });
     }
+    preflight_repeated_len_delimited(payload, 7, MAX_APP_DATA_ITEMS, MAX_APP_DATA_ENTRY_BYTES * 2)
+        .map_err(|error| match error {
+            Error::Decode(message) if message == "protobuf repeated field exceeds item bound" => {
+                Error::NotificationTooLarge
+            }
+            error => error,
+        })?;
     let message = proto::DataMessageStanza::decode(payload)
         .map_err(|error| Error::Decode(error.to_string()))?;
     if message.from.is_empty() || message.category.is_empty() {
@@ -284,6 +295,28 @@ mod tests {
         };
         let payload = message.encode_to_vec();
         assert!(payload.len() < crate::MAX_FRAME_SIZE);
+        assert!(matches!(
+            decode_data_message(&payload),
+            Err(Error::NotificationTooLarge)
+        ));
+    }
+
+    #[test]
+    fn rejects_many_empty_login_settings_before_prost_decode() {
+        let mut payload = vec![0x0a, 0x01, b'x'];
+        payload.extend(std::iter::repeat_n([0x22, 0x00], MAX_LOGIN_SETTINGS + 1).flatten());
+        assert!(payload.len() < 1024 * 1024);
+        assert!(matches!(
+            decode_login_response(&payload),
+            Err(Error::Decode(message)) if message.contains("repeated field")
+        ));
+    }
+
+    #[test]
+    fn rejects_many_empty_app_data_before_prost_decode() {
+        let mut payload = vec![0x1a, 0x01, b'f', 0x2a, 0x01, b'c'];
+        payload.extend(std::iter::repeat_n([0x3a, 0x00], MAX_APP_DATA_ITEMS + 1).flatten());
+        assert!(payload.len() < 1024 * 1024);
         assert!(matches!(
             decode_data_message(&payload),
             Err(Error::NotificationTooLarge)

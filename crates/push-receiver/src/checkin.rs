@@ -4,8 +4,10 @@ use prost::Message;
 use serde::Deserialize;
 use url::Url;
 
-use crate::{Error, Result, proto};
+use crate::{Error, Result, proto, wire::preflight_repeated_len_delimited};
 
+const MAX_CHECKIN_SETTINGS: usize = 128;
+const MAX_CHECKIN_SETTING_ENTRY_BYTES: usize = 16 * 1024;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct CheckinCredentials {
     android_id: u64,
@@ -79,6 +81,18 @@ pub fn parse_checkin_response(bytes: &[u8]) -> Result<CheckinResult> {
             max: 64 * 1024,
         });
     }
+    preflight_repeated_len_delimited(
+        bytes,
+        5,
+        MAX_CHECKIN_SETTINGS,
+        MAX_CHECKIN_SETTING_ENTRY_BYTES,
+    )?;
+    preflight_repeated_len_delimited(
+        bytes,
+        10,
+        MAX_CHECKIN_SETTINGS,
+        MAX_CHECKIN_SETTING_ENTRY_BYTES,
+    )?;
     let response = proto::AndroidCheckinResponse::decode(bytes)
         .map_err(|error| Error::Decode(error.to_string()))?;
     if !response.stats_ok {
@@ -276,6 +290,17 @@ mod tests {
                 .map(|token| token.as_str().to_owned()),
             Some("APA91bFcmLegacyReferenceRegistrationToken-7f3a".to_owned())
         );
+    }
+
+    #[test]
+    fn rejects_many_empty_settings_before_prost_decode() {
+        let mut bytes = vec![0x08, 0x01];
+        bytes.extend(std::iter::repeat_n([0x2a, 0x00], MAX_CHECKIN_SETTINGS + 1).flatten());
+        assert!(bytes.len() < 1024 * 1024);
+        assert!(matches!(
+            parse_checkin_response(&bytes),
+            Err(Error::Decode(message)) if message.contains("repeated field")
+        ));
     }
 
     #[test]

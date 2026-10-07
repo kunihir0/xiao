@@ -8,6 +8,8 @@ pub enum Error {
     Protocol(String),
     #[error("operation timed out: {0}")]
     Timeout(&'static str),
+    #[error("heartbeat liveness deadline exceeded")]
+    LivenessTimeout,
     #[error("transport closed")]
     TransportClosed,
     #[error("TLS transport failed: {0}")]

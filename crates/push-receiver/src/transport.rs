@@ -83,6 +83,12 @@ async fn bounded_body(mut response: Response, maximum: usize) -> Result<Vec<u8>>
 /// and must not spawn work outside the returned futures.
 pub trait McsSession: Send {
     fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<SessionEvent>>;
+    /// Acknowledge the most recently received notification after its
+    /// application queue admission succeeds. A failed admission must not
+    /// acknowledge the wire message so MCS can redeliver it.
+    fn acknowledge<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
     fn send_heartbeat<'a>(&'a mut self) -> BoxFuture<'a, Result<()>>;
     fn heartbeat_interval(&self) -> Duration {
         Duration::from_secs(300)
@@ -367,6 +373,7 @@ struct TlsMcsSession {
     heartbeat: Duration,
     last_stream_id_received: i32,
     unacknowledged_messages: usize,
+    ack_requested: bool,
 }
 
 impl TlsMcsSession {
@@ -379,6 +386,7 @@ impl TlsMcsSession {
             heartbeat: Duration::from_secs(300),
             last_stream_id_received: 0,
             unacknowledged_messages: 0,
+            ack_requested: false,
         }
     }
     fn read_timeout(&self) -> Duration {
@@ -475,14 +483,7 @@ impl McsSession for TlsMcsSession {
                             self.unacknowledged_messages =
                                 self.unacknowledged_messages.saturating_add(1);
                         }
-                        if data.immediate_ack
-                            || self.unacknowledged_messages >= STREAM_ACK_THRESHOLD
-                        {
-                            let payload = encode_stream_ack(self.last_stream_id_received)?;
-                            self.send_frame(McsFrame::new(FrameTag::Iq, payload))
-                                .await?;
-                            self.unacknowledged_messages = 0;
-                        }
+                        self.ack_requested |= data.immediate_ack;
                         return Ok(SessionEvent::Notification(data.notification));
                     }
                     FrameEvent::HeartbeatPing => {
@@ -500,6 +501,19 @@ impl McsSession for TlsMcsSession {
             }
         })
     }
+    fn acknowledge<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.ack_requested || self.unacknowledged_messages >= STREAM_ACK_THRESHOLD {
+                let payload = encode_stream_ack(self.last_stream_id_received)?;
+                self.send_frame(McsFrame::new(FrameTag::Iq, payload))
+                    .await?;
+                self.unacknowledged_messages = 0;
+                self.ack_requested = false;
+            }
+            Ok(())
+        })
+    }
+
     fn send_heartbeat<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let payload = encode_heartbeat_ping(
