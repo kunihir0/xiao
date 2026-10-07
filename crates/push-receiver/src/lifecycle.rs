@@ -545,12 +545,16 @@ mod tests {
         let policy = RetryPolicy::new(std::time::Duration::ZERO, std::time::Duration::ZERO, 0)
             .with_max_attempts(1);
         let handle = start_connected(connector, 1, 1, policy);
-        for _ in 0..100 {
-            if calls.load(Ordering::Acquire) >= 3 {
-                break;
+        let wait = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if calls.load(Ordering::Acquire) >= 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await;
+        assert!(wait.is_ok());
         assert_eq!(calls.load(Ordering::Acquire), 3);
         let result = handle.shutdown().await;
         assert!(matches!(result, Err(Error::TransportClosed)));
