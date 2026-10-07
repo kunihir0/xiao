@@ -45,50 +45,140 @@ where
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BotMode {
+    Run { migrate_on_startup: bool },
+    MigrateOnly,
+}
+
+pub fn parse_bot_mode(
+    args: &[String],
+    default_migrate_on_startup: bool,
+) -> Result<BotMode, String> {
+    let mut migrate_only = false;
+    let mut migrate_on_startup = default_migrate_on_startup;
+
+    for arg in args {
+        match arg.as_str() {
+            "migrate" | "--migrate" => {
+                migrate_only = true;
+            }
+            "--no-startup-migrations" | "--no-migrate" | "--skip-migrations" => {
+                migrate_on_startup = false;
+            }
+            "--startup-migrations" | "--migrate-on-startup" => {
+                migrate_on_startup = true;
+            }
+            _ => {
+                return Err(format!("unknown command line argument: {arg}"));
+            }
+        }
+    }
+
+    if migrate_only {
+        Ok(BotMode::MigrateOnly)
+    } else {
+        Ok(BotMode::Run { migrate_on_startup })
+    }
+}
+
+fn create_db_config(
+    database_url: &str,
+    tls_config: &bot_config::DatabaseTlsConfig,
+) -> Result<DbConfig, BoxError> {
+    let mut config = DbConfig::new(database_url)?;
+    config = match tls_config {
+        bot_config::DatabaseTlsConfig::VerifyFull { ca_file } => {
+            config.with_tls_verify_full(ca_file)?
+        }
+        bot_config::DatabaseTlsConfig::Insecure => config.with_insecure_tls(),
+    };
+    Ok(config)
+}
+
+async fn run_migrations_command(config: &Config) -> Result<(), BoxError> {
+    let migration_url = config
+        .migration_database_url()
+        .unwrap_or_else(|| config.database_url());
+    let db_config = create_db_config(migration_url, config.database_tls())?;
+    let database = Db::connect(&db_config).await?;
+    info!("running database migrations");
+    let report = database.run_migrations().await?;
+    info!(
+        applied = report.applied(),
+        "database migrations completed successfully"
+    );
+    database.verify_schema_current().await?;
+    info!("verified database schema is current");
+    Ok(())
+}
+
 async fn run() -> Result<(), BoxError> {
     let config = Config::from_env().map_err(|error| Box::new(error) as BoxError)?;
     let _telemetry = init_from_config(&config).map_err(|error| Box::new(error) as BoxError)?;
-    let database_config = DbConfig::new(config.database_url())?;
-    let database = Db::connect(&database_config).await?;
-    database.initialize().await?;
 
-    // Database startup is complete before Discord is constructed.
-    let mut composition = Composition::new(CtrlCSignal);
-    if let Some(rustplus_config) = config.rustplus() {
-        let fcm = Arc::new(FcmConnector::new(rustplus_config.fcm_sender_id())?);
-        let receiver_config = ProductionConfig::default();
-        let receiver = push_receiver::start_connected(
-            fcm,
-            receiver_config.queue_capacity,
-            receiver_config.dedupe_capacity,
-            receiver_config.retry,
-        );
-        let source = PushPairingSource::new(receiver, ParseConfig::default());
-        let connector = RustPlusSessionConnector::new(ReconnectPolicy::default())?;
-        let (service, _service_handle) = PairingService::new(
-            source,
-            connector,
-            MemoryPairingStore::default(),
-            SessionConfig::default(),
-        );
-        register_pairing_service(&mut composition, true, service)?;
-    } else {
-        info!("Rust+ pairing disabled: no RUSTPLUS_FCM_SENDER_ID configured");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = parse_bot_mode(&args, config.database_migrate_on_startup())
+        .map_err(|msg| Box::<dyn std::error::Error + Send + Sync>::from(msg))?;
+
+    match mode {
+        BotMode::MigrateOnly => run_migrations_command(&config).await,
+        BotMode::Run { migrate_on_startup } => {
+            let database_config = create_db_config(config.database_url(), config.database_tls())?;
+            let database = Db::connect(&database_config).await?;
+            if migrate_on_startup {
+                info!("startup migrations enabled: initializing database");
+                let report = database.initialize().await?;
+                info!(
+                    applied = report.applied(),
+                    "startup database initialization complete"
+                );
+            } else {
+                info!("startup migrations disabled: verifying schema is current");
+                database.verify_and_ping().await?;
+                info!("database schema verified current and readiness ping succeeded");
+            }
+
+            // Database startup is complete before Discord is constructed.
+            let mut composition = Composition::new(CtrlCSignal);
+            if let Some(rustplus_config) = config.rustplus() {
+                let fcm = Arc::new(FcmConnector::new(rustplus_config.fcm_sender_id())?);
+                let receiver_config = ProductionConfig::default();
+                let receiver = push_receiver::start_connected(
+                    fcm,
+                    receiver_config.queue_capacity,
+                    receiver_config.dedupe_capacity,
+                    receiver_config.retry,
+                );
+                let source = PushPairingSource::new(receiver, ParseConfig::default());
+                let connector = RustPlusSessionConnector::new(ReconnectPolicy::default())?;
+                let (service, _service_handle) = PairingService::new(
+                    source,
+                    connector,
+                    MemoryPairingStore::default(),
+                    SessionConfig::default(),
+                );
+                register_pairing_service(&mut composition, true, service)?;
+            } else {
+                info!("Rust+ pairing disabled: no RUSTPLUS_FCM_SENDER_ID configured");
+            }
+            let discord =
+                DiscordHandle::new(DiscordConfig::new(config.discord_token().to_owned())?);
+            let cancellation = composition.cancellation_token();
+
+            composition.register("discord", async move {
+                discord
+                    .run(cancellation)
+                    .await
+                    .map_err(|error| Box::new(error) as BoxError)
+            })?;
+            composition
+                .run()
+                .await
+                .map(|_| ())
+                .map_err(|error| Box::new(error) as BoxError)
+        }
     }
-    let discord = DiscordHandle::new(DiscordConfig::new(config.discord_token().to_owned())?);
-    let cancellation = composition.cancellation_token();
-
-    composition.register("discord", async move {
-        discord
-            .run(cancellation)
-            .await
-            .map_err(|error| Box::new(error) as BoxError)
-    })?;
-    composition
-        .run()
-        .await
-        .map(|_| ())
-        .map_err(|error| Box::new(error) as BoxError)
 }
 
 #[cfg(test)]
@@ -138,5 +228,70 @@ mod tests {
         assert!(report.shutdown_requested);
         assert_eq!(report.joined_tasks, 0);
         Ok(())
+    }
+
+    #[test]
+    fn parse_bot_mode_defaults_to_config_setting() {
+        assert_eq!(
+            parse_bot_mode(&[], true).unwrap(),
+            BotMode::Run {
+                migrate_on_startup: true
+            }
+        );
+        assert_eq!(
+            parse_bot_mode(&[], false).unwrap(),
+            BotMode::Run {
+                migrate_on_startup: false
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bot_mode_migrate_subcommand_selects_migrate_only() {
+        for arg in ["migrate", "--migrate"] {
+            assert_eq!(
+                parse_bot_mode(&[arg.to_owned()], true).unwrap(),
+                BotMode::MigrateOnly
+            );
+            assert_eq!(
+                parse_bot_mode(&[arg.to_owned()], false).unwrap(),
+                BotMode::MigrateOnly
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bot_mode_startup_migration_flags_override_default() {
+        for arg in [
+            "--no-startup-migrations",
+            "--no-migrate",
+            "--skip-migrations",
+        ] {
+            assert_eq!(
+                parse_bot_mode(&[arg.to_owned()], true).unwrap(),
+                BotMode::Run {
+                    migrate_on_startup: false
+                }
+            );
+        }
+        for arg in ["--startup-migrations", "--migrate-on-startup"] {
+            assert_eq!(
+                parse_bot_mode(&[arg.to_owned()], false).unwrap(),
+                BotMode::Run {
+                    migrate_on_startup: true
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bot_mode_rejects_unknown_argument() {
+        let result = parse_bot_mode(&["--invalid-arg".to_owned()], true);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("unknown command line argument")
+        );
     }
 }

@@ -8,6 +8,11 @@ All notable externally meaningful changes are documented here. Releases follow S
 
 ## Unreleased
 
+- Hardened database persistence with strict TLS verify-full default requiring a
+  CA bundle file, explicit dev/local insecure opt-in, separate DDL migration
+  role execution (`MIGRATION_DATABASE_URL`), one-shot `migrate` command,
+  startup migration separation for least-privilege runtime (`DATABASE_URL`),
+  and schema currency verification before process readiness.
 - Added a digest-pinned multi-architecture production OCI artifact with a
   non-root runtime, bounded Compose resources, runtime-only secret injection,
   process-state health semantics, and SIGTERM propagation.

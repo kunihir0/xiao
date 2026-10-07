@@ -1,23 +1,56 @@
 # Production application only. PostgreSQL is provisioned and backed up separately.
-# Set XIAO_IMAGE to an immutable registry reference (tag plus digest), never :latest.
+# Set XIAO_IMAGE to an immutable registry reference, never :latest.
+secrets:
+  discord_token:
+    file: "${DISCORD_TOKEN_FILE:?set DISCORD_TOKEN_FILE to a secret-manager-mounted file}"
+  database_url:
+    file: "${DATABASE_URL_FILE:?set DATABASE_URL_FILE to a secret-manager-mounted file}"
+  migration_database_url:
+    file: "${MIGRATION_DATABASE_URL_FILE:-/dev/null}"
+  database_ca:
+    file: "${DATABASE_CA_FILE:-/dev/null}"
+  rustplus_fcm_sender_id:
+    # /dev/null means disabled until #16 credential persistence is deployed.
+    file: "${RUSTPLUS_FCM_SENDER_ID_FILE:-/dev/null}"
 services:
   bot:
     image: "${XIAO_IMAGE:?set XIAO_IMAGE to an immutable image digest}"
     init: true
-    restart: unless-stopped
+    restart: "on-failure:5"
     read_only: true
+    cap_drop:
+      - ALL
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
-    # The pids limit is defined in deploy.resources for Compose/Swarm parity.
-    # pids_limit must not also be set: Compose rejects conflicting forms.
     security_opt:
       - no-new-privileges:true
+    entrypoint: ["/usr/local/bin/xiao-entrypoint"]
     environment:
-      DISCORD_TOKEN: "${DISCORD_TOKEN:?set DISCORD_TOKEN through the deployment secret manager}"
-      DATABASE_URL: "${DATABASE_URL:?set DATABASE_URL through the deployment secret manager}"
+      DISCORD_TOKEN_FILE: /run/secrets/discord_token
+      DATABASE_URL_FILE: /run/secrets/database_url
+      MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_database_url
+      DATABASE_CA_FILE: "${DATABASE_CA_FILE:-/run/secrets/database_ca}"
+      DATABASE_TLS_MODE: "${DATABASE_TLS_MODE:-verify-full}"
+      DATABASE_MIGRATE_ON_STARTUP: "${DATABASE_MIGRATE_ON_STARTUP:-false}"
+      RUSTPLUS_FCM_SENDER_ID_FILE: /run/secrets/rustplus_fcm_sender_id
       RUST_LOG: "${RUST_LOG:-info}"
       TELEMETRY_FORMAT: "${TELEMETRY_FORMAT:-json}"
-      RUSTPLUS_FCM_SENDER_ID: "${RUSTPLUS_FCM_SENDER_ID:-}"
+    secrets:
+      - source: discord_token
+        target: discord_token
+        mode: 0444
+      - source: database_url
+        target: database_url
+        mode: 0444
+      - source: migration_database_url
+        target: migration_database_url
+        mode: 0444
+      - source: database_ca
+        target: database_ca
+        mode: 0444
+      - source: rustplus_fcm_sender_id
+        target: rustplus_fcm_sender_id
+        mode: 0444
     stop_grace_period: 30s
     deploy:
       resources:
@@ -30,7 +63,7 @@ services:
           memory: 128M
     healthcheck:
       # There is deliberately no HTTP health server. PID 1 is healthy while alive;
-      # migration/readiness failures make the process exit and trigger a restart.
+      # migration/readiness failures make the process exit and trigger finite retries.
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 30s
       timeout: 3s

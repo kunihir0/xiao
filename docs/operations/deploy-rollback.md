@@ -15,37 +15,55 @@ evidence before rollout. Never rebuild a rollback image from a moving tag.
   application secrets in layers, and the expected `STOPSIGNAL SIGTERM`.
 - Verify PostgreSQL backups and the most recent restore rehearsal are current.
   Confirm the release's migration has an owner-approved compatibility plan.
-- Check Discord and Rust+/FCM credentials are available from the secret
-  manager without printing them. For the current runtime, `DISCORD_TOKEN` and
-  `DATABASE_URL` are required. `RUSTPLUS_FCM_SENDER_ID` is optional while #16
-  credential persistence/companion registration is pending.
+  The migration job uses a short-lived DDL role from `MIGRATION_DATABASE_URL`;
+  the bot uses a separate least-privilege `DATABASE_URL` role with startup
+  migrations disabled in production. Revoke the DDL role after the job.
+- Check Discord and Rust+/FCM credentials are available from read-only secret
+  files without printing them. For the current runtime, `DISCORD_TOKEN_FILE`
+  and `DATABASE_URL_FILE` are required. `RUSTPLUS_FCM_SENDER_ID_FILE` is
+  optional while #16 credential persistence/companion registration is pending.
 
 ## Expand/migrate/contract rollout
 
 1. **Expand:** add nullable columns, tables, indexes, or compatibility data
    without removing or renaming fields used by the previous image. Keep
    changes backward-compatible with the currently running release.
-2. **Migrate:** deploy the immutable image. Its startup executes embedded
-   pending migrations, then a PostgreSQL readiness ping, then constructs the
-   Discord adapter. Run one rollout at a time; do not run a second migration
-   process in parallel. Watch process state and database migration logs.
-3. **Contract:** only in a later release, after all old images are stopped and
+2. **Migrate:** run the same immutable image once as the migration job with
+   `MIGRATION_DATABASE_URL` and the DDL role. It applies embedded migrations,
+   verifies the schema version, and exits. Do not run this job in parallel.
+   Start the bot only after it succeeds.
+3. **Start:** deploy the immutable image with `DATABASE_URL`, TLS
+   `verify-full`, and startup migrations disabled. The bot verifies that the
+   expected schema is current, runs a PostgreSQL readiness ping, and then
+   constructs the Discord adapter. Run one rollout at a time; watch process
+   state and database logs.
+4. **Contract:** only in a later release, after all old images are stopped and
    data has been backfilled and verified, remove old columns or constraints.
    Contract migrations MUST be separately reviewable and reversible by backup
    restore, not bundled with an incompatible application rollout.
 
-The current database adapter applies migrations before Discord startup and
-marks internal readiness only after the migration pass and `SELECT 1` succeed.
-There is no HTTP readiness endpoint. A failed migration exits before Discord is
-constructed; `restart: unless-stopped` must not be used to hide the failure.
-Pause rollout, capture logs, and follow the failed-migration section below.
-
+The bot binary includes a built-in `migrate` command (also callable via
+`--migrate`) that runs embedded migrations using `MIGRATION_DATABASE_URL` (or
+falling back to `DATABASE_URL` locally), verifies the schema is current, and
+exits. In production runtime mode, the bot connects using `DATABASE_URL` with
+TLS `verify-full` and `DATABASE_CA_FILE`. With startup migrations disabled
+(`DATABASE_MIGRATE_ON_STARTUP=false` or `--no-startup-migrations`), the bot
+verifies that the schema is current and runs the PostgreSQL readiness ping
+before constructing Discord. If migrations are missing or unapplied, it exits
+with a typed `SchemaPending` error before Discord is constructed. Local
+development preserves default startup migrations and provides an explicit
+opt-in for unencrypted connections via `DATABASE_TLS_MODE=insecure`.
+There is no HTTP readiness endpoint. A failed migration or schema check exits
+before Discord is constructed; `restart: unless-stopped` must not be used to
+hide the failure. Pause rollout, capture logs, and follow the failed-migration
+section below.
 ## Rolling out
 
 ```console
-export RELEASE_IMAGE='registry.example.invalid/xiao/bot:0.2.0@sha256:<manifest>'
+export XIAO_IMAGE='registry.example.invalid/xiao/bot:0.2.0@sha256:<manifest>'
+scripts/validate-production-env.sh
 docker compose --env-file /run/secrets/xiao-production.env \
-  -f deploy/production/compose.yml pull bot
+  -f deploy/production/compose.yml run --rm bot migrate
 docker compose --env-file /run/secrets/xiao-production.env \
   -f deploy/production/compose.yml up -d bot
 docker compose --env-file /run/secrets/xiao-production.env \
@@ -54,11 +72,17 @@ docker compose --env-file /run/secrets/xiao-production.env \
   -f deploy/production/compose.yml logs --since=10m bot
 ```
 
+The migration job MUST receive only the DDL-role `MIGRATION_DATABASE_URL`;
+the long-running bot MUST receive only the runtime `DATABASE_URL`. The exact
+secret-manager/orchestrator job override is platform-specific, but it must
+mount the files and never put values in command arguments. Confirm the bot
+remains running through the migration window, its process health check is
+healthy, Discord reconnects, and alerts return to baseline. Save `docker
+inspect` output without environment values and release metadata.
+ 
 Set `XIAO_IMAGE` to the recorded digest in the secret environment before these
-commands. Confirm the container remains running through the migration window,
-its process health check is healthy, Discord reconnects, and the alert dashboard
-returns to baseline. Save the `docker inspect` output (without environment
-values) and release metadata to the incident/release record.
+commands. Compose rejects missing secret-file paths; the validator rejects
+mutable image tags.
 
 ## Rollback
 
@@ -71,7 +95,6 @@ to the previous immutable digest and restart:
 docker compose --env-file /run/secrets/xiao-production.env \
   -f deploy/production/compose.yml up -d --no-build --force-recreate bot
 ```
-
 Do **not** run a Diesel `down` migration as an emergency shortcut: destructive
 or contract changes can lose data and leave the previous binary incompatible.
 For an incompatible migration, stop the rollout, preserve logs and a database
