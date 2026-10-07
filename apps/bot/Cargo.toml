@@ -13,4 +13,5 @@ workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 bot-config = { path = "../../crates/config", version = "0.1.0" }
+bot-db = { path = "../../crates/db", version = "0.1.0" }
 bot-telemetry = { path = "../../crates/telemetry", version = "0.1.0" }

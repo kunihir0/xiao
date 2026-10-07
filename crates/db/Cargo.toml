@@ -8,3 +8,15 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+tokio = { version = "1.53.2", features = ["sync"] }
+deadpool = { version = "0.13.1", features = ["rt_tokio_1"] }
+diesel = { version = "2.3.13", features = ["postgres"] }
+diesel-async = { version = "0.9.2", features = ["postgres", "migrations", "deadpool"] }
+diesel_migrations = "2.3.2"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "time"] }
+uuid = { version = "1.27.0", features = ["v4"] }
