@@ -147,6 +147,7 @@ dependencies = [
  "bot-db",
  "bot-discord",
  "bot-telemetry",
+ "bot-test-support",
  "push-receiver",
  "rustplus-adapter",
  "rustplus-client",

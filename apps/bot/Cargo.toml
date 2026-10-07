@@ -21,3 +21,7 @@ rustplus-adapter = { version = "0.1.0", path = "../../crates/rustplus-adapter" }
 push-receiver = { version = "0.1.0", path = "../../crates/push-receiver" }
 rustplus-client = { version = "0.1.0", path = "../../crates/rustplus-client" }
 tracing.workspace = true
+
+[dev-dependencies]
+bot-test-support = { path = "../../crates/test-support" }
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "sync", "time"] }

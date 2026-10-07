@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
-use bot::{BoxError, Composition, CtrlCSignal};
-use bot_application::{MemoryPairingStore, PairingService, SessionConfig};
+use bot::{BoxError, Composition, CompositionError, CtrlCSignal, ShutdownSignal};
+use bot_application::{
+    MemoryPairingStore, PairingService, PairingSource, SessionConfig, SessionConnector,
+};
 use bot_config::Config;
 use bot_db::{Db, DbConfig};
 use bot_discord::{DiscordConfig, DiscordHandle};
@@ -19,6 +21,28 @@ async fn main() {
         eprintln!("bot startup or lifecycle failure: {error}");
         std::process::exit(1);
     }
+}
+
+fn register_pairing_service<Signal, Source, Connector>(
+    composition: &mut Composition<Signal>,
+    enabled: bool,
+    service: PairingService<Source, Connector>,
+) -> Result<(), CompositionError>
+where
+    Signal: ShutdownSignal,
+    Source: PairingSource + Sync + 'static,
+    Connector: SessionConnector + 'static,
+{
+    if !enabled {
+        return Ok(());
+    }
+    let cancellation = composition.cancellation_token();
+    composition.register("rustplus-pairing", async move {
+        service
+            .run(cancellation)
+            .await
+            .map_err(|error| Box::new(error) as BoxError)
+    })
 }
 
 async fn run() -> Result<(), BoxError> {
@@ -47,13 +71,7 @@ async fn run() -> Result<(), BoxError> {
             MemoryPairingStore::default(),
             SessionConfig::default(),
         );
-        let cancellation = composition.cancellation_token();
-        composition.register("rustplus-pairing", async move {
-            service
-                .run(cancellation)
-                .await
-                .map_err(|error| Box::new(error) as BoxError)
-        })?;
+        register_pairing_service(&mut composition, true, service)?;
     } else {
         info!("Rust+ pairing disabled: no RUSTPLUS_FCM_SENDER_ID configured");
     }
@@ -71,4 +89,52 @@ async fn run() -> Result<(), BoxError> {
         .await
         .map(|_| ())
         .map_err(|error| Box::new(error) as BoxError)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bot::{Readiness, channel_signal};
+    use bot_test_support::{FakePairingSource, FakeSessionConnector};
+
+    fn service() -> (
+        PairingService<FakePairingSource, FakeSessionConnector>,
+        bot_test_support::FakePairingSender,
+    ) {
+        let (source, sender) = FakePairingSource::new(1);
+        let (service, _) = PairingService::new(
+            source,
+            FakeSessionConnector::new(),
+            MemoryPairingStore::default(),
+            SessionConfig::default(),
+        );
+        (service, sender)
+    }
+
+    #[tokio::test]
+    async fn enabled_pairing_service_is_joined_on_channel_shutdown() {
+        let (mut trigger, signal) = channel_signal();
+        let mut composition = Composition::new(signal);
+        let (service, _sender) = service();
+        register_pairing_service(&mut composition, true, service).expect("registration");
+        let task = tokio::spawn(composition.run());
+        trigger.trigger().expect("shutdown trigger");
+        let report = task.await.expect("composition task").expect("run report");
+        assert_eq!(report.readiness, Readiness::Stopped);
+        assert!(report.shutdown_requested);
+        assert_eq!(report.joined_tasks, 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_pairing_service_is_not_registered() {
+        let (mut trigger, signal) = channel_signal();
+        let mut composition = Composition::new(signal);
+        let (service, _sender) = service();
+        register_pairing_service(&mut composition, false, service).expect("registration");
+        trigger.trigger().expect("shutdown trigger");
+        let report = composition.run().await.expect("run report");
+        assert_eq!(report.readiness, Readiness::Stopped);
+        assert!(report.shutdown_requested);
+        assert_eq!(report.joined_tasks, 0);
+    }
 }
