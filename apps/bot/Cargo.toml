@@ -8,3 +8,9 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+bot-config = { version = "0.1.0", path = "../../crates/config" }
+bot-db = { version = "0.1.0", path = "../../crates/db" }
+bot-telemetry = { version = "0.1.0", path = "../../crates/telemetry" }
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
