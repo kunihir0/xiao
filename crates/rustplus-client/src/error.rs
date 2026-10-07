@@ -16,6 +16,8 @@ pub enum Error {
     Timeout(Duration),
     #[error("client is disconnected")]
     Disconnected,
+    #[error("a connection attempt is already in progress")]
+    AlreadyConnecting,
     #[error("client is shutting down")]
     ShuttingDown,
     #[error("outbound queue is full")]

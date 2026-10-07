@@ -32,7 +32,7 @@ use tokio_tungstenite::{
         protocol::{Message as WsMessage, WebSocketConfig},
     },
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use url::Url;
 
 const DEFAULT_QUEUE: usize = 64;
@@ -297,9 +297,11 @@ impl RustPlusClient {
     pub async fn connect(&self) -> Result<()> {
         self.inner.config.validate()?;
         let disconnect_signal = {
-            let _transition = self.inner.lifecycle.lock().await;
             if self.is_ready() {
                 return Ok(());
+            }
+            if self.readiness() == Readiness::Connecting {
+                return Err(Error::AlreadyConnecting);
             }
             self.inner.stopped.store(false, Ordering::Release);
             if let Ok(mut child_error) = self.inner.child_error.lock() {
@@ -365,25 +367,22 @@ impl RustPlusClient {
         let supervisor_token = cancellation.clone();
         let pending = Arc::clone(&self.inner.pending);
         let events = self.inner.events.clone();
-        let reader = tokio::spawn(async move {
+        let reader = AbortOnDropHandle::new(tokio::spawn(async move {
             reader_loop(read, pending, events, reader_token, generation).await
-        });
-        let writer =
-            tokio::spawn(async move { writer_loop(write, outbound_rx, writer_token).await });
+        }));
+        let writer = AbortOnDropHandle::new(tokio::spawn(async move {
+            writer_loop(write, outbound_rx, writer_token).await
+        }));
         if let Ok(mut sender) = self.inner.outbound.lock() {
             *sender = Some((generation, outbound_tx));
         } else {
             cancellation.cancel();
-            reader.abort();
-            writer.abort();
             return Err(Error::ShuttingDown);
         }
         if let Ok(mut token) = self.inner.cancellation.lock() {
             *token = Some((generation, cancellation.clone()));
         } else {
             cancellation.cancel();
-            reader.abort();
-            writer.abort();
             return Err(Error::ShuttingDown);
         }
         let weak = Arc::downgrade(&self.inner);
@@ -780,10 +779,16 @@ where
             _ = cancellation.cancelled() => return Ok(()),
             item = outbound.recv() => match item {
                 Some(item) => {
-                    let request = to_proto_request(item.sequence, item.player_id, item.player_token, item.request);
-                    let mut bytes = Vec::new();
+                    let request =
+                        to_proto_request(item.sequence, item.player_id, item.player_token, item.request);
+                    let mut bytes = Vec::with_capacity(request.encoded_len());
                     request.encode(&mut bytes).map_err(|_| Error::Encode)?;
-                    write.send(WsMessage::Binary(bytes.into())).await.map_err(|_| Error::Transport)?;
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return Ok(()),
+                        result = write.send(WsMessage::Binary(bytes.into())) => {
+                            result.map_err(|_| Error::Transport)?;
+                        }
+                    }
                 }
                 None => return Ok(()),
             }

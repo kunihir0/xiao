@@ -241,6 +241,24 @@ async fn flapping_server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
+async fn concurrent_connects_keep_one_owned_transport() {
+    let (endpoint, task) = delayed_handshake_server(Duration::from_millis(100)).await;
+    let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
+        .expect("client");
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move { client.connect().await })
+    };
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second = client.connect().await;
+    assert!(matches!(second, Err(Error::AlreadyConnecting)));
+    first.await.expect("first connect task").expect("connect");
+    assert_eq!(client.readiness(), Readiness::Ready);
+    client.disconnect().await.expect("disconnect");
+    task.abort();
+}
+
+#[tokio::test]
 async fn readiness_request_and_bounded_disconnect_use_owned_transport() {
     let (endpoint, task) = server(true).await;
     let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
