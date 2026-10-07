@@ -135,4 +135,4 @@ jobs:
         with:
           tool: cargo-nextest
           fallback: none
-      - run: cargo nextest run -p bot-db --all-features --no-tests=pass
+      - run: cargo nextest run -p bot-db --all-features --run-ignored all

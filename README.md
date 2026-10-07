@@ -15,7 +15,7 @@ The `bot-db` crate owns the PostgreSQL adapter, deadpool pool, and embedded
 Diesel migrations. Local database integration tests use `DATABASE_URL`:
 
 ```bash
-DATABASE_URL=postgres://bot:bot@127.0.0.1:5432/bot cargo test -p bot-db
+DATABASE_URL=postgres://bot:bot@127.0.0.1:5432/bot cargo test -p bot-db -- --include-ignored
 ```
 
 The baseline migration is intentionally empty of domain tables; future

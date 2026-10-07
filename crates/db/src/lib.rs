@@ -4,14 +4,15 @@
 //! private to this crate. Callers interact with the typed [`Db`] lifecycle
 //! methods and [`DbError`] only.
 
-use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use diesel::sql_query;
 use diesel_async::pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool};
 use diesel_async::{AsyncMigrationHarness, AsyncPgConnection, RunQueryDsl};
 use diesel_migrations::{MigrationHarness, embed_migrations};
+use std::fmt::{Debug, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 const MIGRATIONS: diesel_migrations::EmbeddedMigrations = embed_migrations!("../../migrations");
 
@@ -117,6 +118,7 @@ impl MigrationReport {
 /// An owned PostgreSQL connection pool and readiness state.
 pub struct Db {
     pool: DatabasePool,
+    lifecycle: Mutex<()>,
     migrations_complete: AtomicBool,
     ready: AtomicBool,
 }
@@ -141,6 +143,11 @@ impl Db {
         let manager = PoolManager::new(config.database_url.clone());
         let pool_config = deadpool::managed::PoolConfig {
             max_size: config.max_connections,
+            timeouts: deadpool::managed::Timeouts {
+                wait: Some(Duration::from_secs(5)),
+                create: Some(Duration::from_secs(10)),
+                recycle: Some(Duration::from_secs(2)),
+            },
             ..deadpool::managed::PoolConfig::default()
         };
         let pool = Pool::builder(manager)
@@ -150,6 +157,7 @@ impl Db {
 
         let database = Self {
             pool,
+            lifecycle: Mutex::new(()),
             migrations_complete: AtomicBool::new(false),
             ready: AtomicBool::new(false),
         };
@@ -159,6 +167,7 @@ impl Db {
 
     /// Applies all embedded pending migrations and records migration readiness.
     pub async fn run_migrations(&self) -> Result<MigrationReport, DbError> {
+        let _lifecycle = self.lifecycle.lock().await;
         self.ready.store(false, Ordering::Release);
         self.migrations_complete.store(false, Ordering::Release);
 
@@ -180,6 +189,7 @@ impl Db {
     /// Pings PostgreSQL and marks the adapter ready only after migrations have
     /// completed successfully.
     pub async fn ping(&self) -> Result<(), DbError> {
+        let _lifecycle = self.lifecycle.lock().await;
         let mut connection = self.pool.get().await.map_err(|error| {
             self.ready.store(false, Ordering::Release);
             DbError::ConnectionAcquisition(Box::new(error))
@@ -216,5 +226,30 @@ impl Db {
             .await
             .map(|_| ())
             .map_err(|error| DbError::Connection(Box::new(error)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and a real PostgreSQL service"]
+    async fn pool_exhaustion_returns_typed_timeout_error() -> Result<(), BoxError> {
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| "DATABASE_URL is required for the PostgreSQL pool test")?;
+        let config = DbConfig::new(database_url)?.with_max_connections(1)?;
+        let database = Db::connect(&config).await?;
+        let _held_connection = database
+            .pool
+            .get()
+            .await
+            .map_err(|error| Box::new(error) as BoxError)?;
+
+        let result = database.ping().await;
+        if !matches!(result, Err(DbError::ConnectionAcquisition(_))) {
+            return Err("pool exhaustion did not return ConnectionAcquisition".into());
+        }
+        Ok(())
     }
 }

@@ -1,5 +1,6 @@
 # Changelog
 
+- Added validated environment configuration, one-time tracing setup, and an owned Tokio shutdown lifecycle for the bot runtime.
 - Added the typed PostgreSQL `bot-db` adapter with deadpool pooling, embedded
   migrations, readiness ping, and real PostgreSQL integration coverage.
 
