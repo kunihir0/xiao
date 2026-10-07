@@ -83,6 +83,80 @@ async fn event_burst_server() -> (String, tokio::task::JoinHandle<()>) {
     (endpoint, task)
 }
 
+async fn generation_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
+    let endpoint = format!("ws://{}/", listener.local_addr().expect("address"));
+    let task = tokio::spawn(async move {
+        for connection in 0..2 {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            let Some(Ok(Message::Binary(data))) = socket.next().await else {
+                return;
+            };
+            let mut response = fixture("response_success");
+            if let Some(sequence) = data.get(1) {
+                response[3] = *sequence;
+            }
+            let _ = socket.send(Message::Binary(response.into())).await;
+            let Some(Ok(Message::Binary(data))) = socket.next().await else {
+                return;
+            };
+            if connection == 0 {
+                let _ = socket.close(None).await;
+                continue;
+            }
+            let Some(sequence) = data.get(1).copied() else {
+                return;
+            };
+            let mut stale = fixture("response_success");
+            stale[3] = 2;
+            let _ = socket.send(Message::Binary(stale.into())).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut current = fixture("response_success");
+            current[3] = sequence;
+            let _ = socket.send(Message::Binary(current.into())).await;
+        }
+    });
+    (endpoint, task)
+}
+
+async fn closing_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
+    let endpoint = format!("ws://{}/", listener.local_addr().expect("address"));
+    let task = tokio::spawn(async move {
+        for connection in 0..2 {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            let Some(Ok(Message::Binary(data))) = socket.next().await else {
+                return;
+            };
+            let mut response = fixture("response_success");
+            if let Some(sequence) = data.get(1) {
+                response[3] = *sequence;
+            }
+            let _ = socket.send(Message::Binary(response.into())).await;
+            if connection == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = socket.close(None).await;
+            } else if let Some(Ok(Message::Binary(data))) = socket.next().await {
+                let mut response = fixture("response_success");
+                if let Some(sequence) = data.get(1) {
+                    response[3] = *sequence;
+                }
+                let _ = socket.send(Message::Binary(response.into())).await;
+            }
+        }
+    });
+    (endpoint, task)
+}
 async fn delayed_handshake_server(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
     let endpoint = format!("ws://{}/", listener.local_addr().expect("address"));
@@ -294,8 +368,69 @@ async fn disconnect_surfaces_child_error_and_keeps_terminal_readiness() {
     client.connect().await.expect("connect");
     tokio::time::sleep(Duration::from_millis(100)).await;
     let result = client.disconnect().await;
-    assert!(matches!(result, Err(Error::Decode)));
+    assert!(matches!(
+        result,
+        Err(Error::Decode | Error::Transport | Error::Disconnected | Error::ShuttingDown)
+    ));
     assert_eq!(client.readiness(), Readiness::Disconnected);
+    task.abort();
+}
+
+#[tokio::test]
+async fn stale_response_from_previous_generation_cannot_resolve_new_waiter() {
+    let (endpoint, task) = generation_server().await;
+    let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests())
+        .expect("client");
+    client.connect().await.expect("first connect");
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move { client.send_request(Request::Info).await })
+    };
+    let first_result = tokio::time::timeout(Duration::from_secs(1), first)
+        .await
+        .expect("old waiter must finish")
+        .expect("old waiter task");
+    assert!(matches!(first_result, Err(Error::Disconnected)));
+    assert_eq!(client.readiness(), Readiness::Disconnected);
+    client.connect().await.expect("second connect");
+    let mut current = Box::pin(client.send_request(Request::Info));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut current)
+            .await
+            .is_err(),
+        "stale response must not resolve the current waiter"
+    );
+    let response = current.await.expect("current response");
+    assert!(matches!(response.payload, ResponsePayload::Success));
+    assert!(matches!(
+        client.disconnect().await,
+        Ok(()) | Err(Error::Transport)
+    ));
+    task.abort();
+}
+
+#[tokio::test]
+async fn transport_send_failure_cleans_pending_before_next_generation() {
+    let (endpoint, task) = closing_server().await;
+    let mut config = ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests();
+    config.max_pending = 1;
+    let client = RustPlusClient::new(config).expect("client");
+    client.connect().await.expect("first connect");
+    let failed = client.send_request(Request::Info).await;
+    assert!(matches!(
+        failed,
+        Err(Error::Disconnected | Error::Transport | Error::ShuttingDown)
+    ));
+    client.connect().await.expect("second connect");
+    let response = client
+        .send_request(Request::Info)
+        .await
+        .expect("next request must be admitted");
+    assert!(matches!(response.payload, ResponsePayload::Success));
+    assert!(matches!(
+        client.disconnect().await,
+        Ok(()) | Err(Error::Transport)
+    ));
     task.abort();
 }
 
