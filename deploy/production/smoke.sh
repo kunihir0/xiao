@@ -39,13 +39,13 @@ docker run --rm --user 0:0 \
   alpine:3.22.2@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1 \
   chown -R "$smoke_uid:$smoke_gid" /secrets
 chmod 0400 "$secret_dir"/*
-
-XIAO_IMAGE="$IMAGE" \
-XIAO_RUNTIME_UID="$smoke_uid" \
-DISCORD_TOKEN_FILE="$secret_dir/discord_token" \
-DATABASE_URL_FILE="$secret_dir/database_url" \
-MIGRATION_DATABASE_URL_FILE="$secret_dir/migration_database_url" \
-DATABASE_TLS_MODE=insecure \
+env -u DISCORD_TOKEN -u DATABASE_URL -u MIGRATION_DATABASE_URL \
+  XIAO_IMAGE="$IMAGE" \
+  XIAO_RUNTIME_UID="$smoke_uid" \
+  DISCORD_TOKEN_FILE="$secret_dir/discord_token" \
+  DATABASE_URL_FILE="$secret_dir/database_url" \
+  MIGRATION_DATABASE_URL_FILE="$secret_dir/migration_database_url" \
+  DATABASE_TLS_MODE=insecure \
   "$repo_root/scripts/validate-production-env.sh"
 
 printf '%s\n' \
