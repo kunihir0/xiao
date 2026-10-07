@@ -182,29 +182,24 @@ fn is_special_use(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_special_v4(address),
         IpAddr::V6(address) => {
-            let octets = address.octets();
-            let mapped = address.to_ipv4();
-            let compatible = octets[..12] == [0; 12];
-            let six_to_four = address.segments()[0] == 0x2002;
-            let teredo = address.segments()[0] == 0x2001 && address.segments()[1] == 0;
-            address.is_loopback()
+            let segments = address.segments();
+            // Any IPv6 form that embeds or translates an IPv4 address
+            // (IPv4-mapped/compatible ::/96, NAT64 64:ff9b::/96, 6to4
+            // 2002::/16, Teredo 2001:0::/32) is rejected outright: these can
+            // reach IPv4 destinations whose policy was never evaluated, and
+            // Rust+ servers publish plain IPv4 or native IPv6 addresses.
+            let embeds_ipv4 = address.to_ipv4().is_some()
+                || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0; 4])
+                || segments[0] == 0x2002
+                || (segments[0] == 0x2001 && segments[1] == 0);
+            embeds_ipv4
+                || address.is_loopback()
                 || address.is_unspecified()
                 || address.is_multicast()
-                || (address.segments()[0] & 0xfe00) == 0xfc00
-                || (address.segments()[0] & 0xffc0) == 0xfe80
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
                 || (u128::from(address) >> 96) == u128::from(0x2001_0db8_u32)
-                || mapped.is_some_and(is_special_v4)
-                || (compatible
-                    && is_special_v4(Ipv4Addr::from(octets[12..].try_into().unwrap_or([0; 4]))))
-                || (six_to_four
-                    && is_special_v4(Ipv4Addr::from([octets[2], octets[3], octets[4], octets[5]])))
-                || (teredo
-                    && is_special_v4(Ipv4Addr::from([
-                        !octets[12],
-                        !octets[13],
-                        !octets[14],
-                        !octets[15],
-                    ])))
+                || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
         }
     }
 }
@@ -216,9 +211,12 @@ fn is_special_v4(address: Ipv4Addr) -> bool {
         || address.is_link_local()
         || address.is_unspecified()
         || address.is_multicast()
-        || address == Ipv4Addr::BROADCAST
+        || octets[0] == 0
+        || octets[0] >= 240
         || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
         || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
         || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
         || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
 }
@@ -435,7 +433,18 @@ mod tests {
             "ff02::1",
             "2001:db8::1",
             "::ffff:10.0.0.1",
+            "::ffff:8.8.8.8",
+            "::8.8.8.8",
+            "64:ff9b::808:808",
             "2002:0a00:0001::1",
+            "2002:0808:0808::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "0.1.2.3",
+            "192.0.0.8",
+            "198.18.0.1",
+            "198.19.255.1",
+            "240.0.0.1",
+            "2001:2::1",
         ] {
             assert_eq!(
                 parse_public_ip(host),
