@@ -248,6 +248,7 @@ fn encode_varint(mut value: usize, dst: &mut BytesMut) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn rejects_overlong_and_overflow_varints() {
@@ -366,5 +367,34 @@ mod tests {
             BytesMut::from(parse(include_str!("../fixtures/truncated_frame.hex")).as_slice());
         assert!(truncated.decode_frame(&mut truncated_bytes).is_ok());
         assert!(truncated.decode_eof(&mut truncated_bytes).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_wire_bytes_never_panic_or_exceed_frame_budget(
+            bytes in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let mut codec = McsCodec::new();
+            let mut source = BytesMut::from(bytes.as_slice());
+            let decoded = codec.decode_frame(&mut source);
+            if let Ok(Some(frame)) = decoded {
+                prop_assert!(frame.payload.len() <= MAX_FRAME_SIZE);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_frame_is_distinct_from_malformed_varint() {
+        let mut incomplete = McsCodec::new();
+        let mut bytes = BytesMut::from(&[MCS_VERSION, FrameTag::DataMessage as u8, 4, 1, 2][..]);
+        assert!(matches!(incomplete.decode_frame(&mut bytes), Ok(None)));
+        assert!(incomplete.decode_eof(&mut bytes).is_err());
+
+        let mut malformed = McsCodec::new();
+        let mut bytes = BytesMut::from(&[MCS_VERSION, FrameTag::DataMessage as u8, 0x80, 0][..]);
+        assert!(matches!(
+            malformed.decode_frame(&mut bytes),
+            Err(Error::InvalidVarint)
+        ));
     }
 }

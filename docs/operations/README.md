@@ -21,13 +21,17 @@ same CI and review treatment as any other change.
 
 ## Releases
 
-Release automation is intentionally not enabled yet. The previous
-`release-plz.toml` was only configuration without a runnable workflow, and a
-safe end-to-end release flow requires permissions and review policy that are
-not available through the repository's current `GITHUB_TOKEN` setup. Releases
-therefore remain an explicit maintainer operation; when release automation is
-introduced, it MUST define its permissions, review boundary, tag behavior,
-and rollback path before being enabled.
+The trusted `.github/workflows/release.yml` workflow runs only for protected
+`v*` tags or an explicit maintainer dispatch. It builds the pinned Rust
+toolchain's source and Linux binary artifacts, writes SHA-256 checksums, emits
+an SPDX SBOM, uploads the release bundle, and creates GitHub artifact
+provenance. The workflow grants `id-token: write` and `attestations: write`
+only in this trusted release context; it has no pull-request trigger and no
+production secrets.
+
+Stable artifact names, OCI promotion guidance, and rollback/exception policy
+are documented in `docs/quality-and-supply-chain.md`. Issue #8 owns OCI build
+and deployment files; this workflow does not modify `deploy/`.
 
 ## Runbooks
 

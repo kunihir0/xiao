@@ -154,6 +154,7 @@ fn decode(value: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use aes_gcm::aead::{Aead, KeyInit};
+    use proptest::prelude::*;
 
     #[test]
     fn malformed_base64_and_padding_fail_closed() {
@@ -355,5 +356,141 @@ mod tests {
             ),
             Err(Error::InvalidPadding)
         ));
+    }
+
+    struct TestContext {
+        material: WebPushKeyMaterial,
+        dh: String,
+        salt: String,
+        peer_secret: [u8; 32],
+        salt_bytes: [u8; 16],
+    }
+
+    fn test_context() -> Option<TestContext> {
+        let material = WebPushKeyMaterial::from_bytes([1; 32], [2; 16]);
+        let peer_secret = [2; 32];
+        let secret = SecretKey::from_slice(&peer_secret).ok()?;
+        let peer = URL_SAFE_NO_PAD.encode(secret.public_key().to_sec1_point(false).as_bytes());
+        let salt_bytes = [3; 16];
+        let salt = URL_SAFE_NO_PAD.encode(salt_bytes);
+        Some(TestContext {
+            material,
+            dh: format!("dh={peer}"),
+            salt: format!("salt={salt}"),
+            peer_secret,
+            salt_bytes,
+        })
+    }
+
+    fn build_plaintext_record(padding_len: u16, data: &[u8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(2 + usize::from(padding_len) + data.len());
+        record.extend_from_slice(&padding_len.to_be_bytes());
+        record.resize(2 + usize::from(padding_len), 0u8);
+        record.extend_from_slice(data);
+        record
+    }
+
+    proptest! {
+        #[test]
+        fn valid_records_round_trip_with_bounded_output(
+            padding_len in 0u16..64,
+            data in prop::collection::vec(any::<u8>(), 1..256)
+        ) {
+            let Some(ctx) = test_context() else {
+                return Ok(());
+            };
+            let plaintext = build_plaintext_record(padding_len, &data);
+            let ciphertext = encrypt_record(&ctx.material, ctx.peer_secret, ctx.salt_bytes, &plaintext);
+            let decrypted = decrypt_web_push(&ctx.material, &ctx.dh, &ctx.salt, &ciphertext)?;
+            prop_assert_eq!(decrypted.as_slice(), data.as_slice());
+            prop_assert!(decrypted.len() <= ciphertext.len());
+        }
+
+        #[test]
+        fn padding_length_overflow_fails_closed_as_invalid_padding(
+            padding_len in 0u16..64,
+            excess in 0usize..32
+        ) {
+            let Some(ctx) = test_context() else {
+                return Ok(());
+            };
+            let mut record = Vec::new();
+            record.extend_from_slice(&padding_len.to_be_bytes());
+            let actual_len = usize::from(padding_len).saturating_sub(excess);
+            record.resize(2 + actual_len, 0u8);
+
+            let ciphertext = encrypt_record(&ctx.material, ctx.peer_secret, ctx.salt_bytes, &record);
+            let result = decrypt_web_push(&ctx.material, &ctx.dh, &ctx.salt, &ciphertext);
+            prop_assert!(matches!(result, Err(Error::InvalidPadding)));
+        }
+
+        #[test]
+        fn nonzero_padding_byte_fails_closed_as_invalid_padding(
+            padding_len in 1u16..64,
+            data in prop::collection::vec(any::<u8>(), 1..64),
+            bad_byte in 1u8..=255,
+            offset_ratio in 0.0f32..1.0f32
+        ) {
+            let Some(ctx) = test_context() else {
+                return Ok(());
+            };
+            let mut record = build_plaintext_record(padding_len, &data);
+            let bad_idx = 2 + ((offset_ratio * (padding_len as f32 - 1.0)) as usize).min(padding_len as usize - 1);
+            record[bad_idx] = bad_byte;
+
+            let ciphertext = encrypt_record(&ctx.material, ctx.peer_secret, ctx.salt_bytes, &record);
+            let result = decrypt_web_push(&ctx.material, &ctx.dh, &ctx.salt, &ciphertext);
+            prop_assert!(matches!(result, Err(Error::InvalidPadding)));
+        }
+
+        #[test]
+        fn truncated_plaintext_header_fails_as_invalid_padding(
+            header_len in 0usize..2
+        ) {
+            let Some(ctx) = test_context() else {
+                return Ok(());
+            };
+            let record = vec![0u8; header_len];
+            let ciphertext = encrypt_record(&ctx.material, ctx.peer_secret, ctx.salt_bytes, &record);
+            let result = decrypt_web_push(&ctx.material, &ctx.dh, &ctx.salt, &ciphertext);
+            prop_assert!(matches!(result, Err(Error::InvalidPadding)));
+        }
+
+        #[test]
+        fn truncated_ciphertext_record_boundary_fails_as_decryption_failed(
+            padding_len in 0u16..32,
+            data in prop::collection::vec(any::<u8>(), 1..128),
+            truncate_bytes in 1usize..32
+        ) {
+            let Some(ctx) = test_context() else {
+                return Ok(());
+            };
+            let record = build_plaintext_record(padding_len, &data);
+            let ciphertext = encrypt_record(&ctx.material, ctx.peer_secret, ctx.salt_bytes, &record);
+            let cut = truncate_bytes.min(ciphertext.len());
+            let truncated = &ciphertext[..ciphertext.len() - cut];
+            let result = decrypt_web_push(&ctx.material, &ctx.dh, &ctx.salt, truncated);
+            prop_assert!(matches!(result, Err(Error::DecryptionFailed)));
+        }
+
+        #[test]
+        fn tampered_ciphertext_byte_fails_as_decryption_failed(
+            padding_len in 0u16..32,
+            data in prop::collection::vec(any::<u8>(), 1..128),
+            offset_ratio in 0.0f32..1.0f32,
+            tamper_mask in 1u8..=255
+        ) {
+            let Some(ctx) = test_context() else {
+                return Ok(());
+            };
+            let record = build_plaintext_record(padding_len, &data);
+            let mut ciphertext = encrypt_record(&ctx.material, ctx.peer_secret, ctx.salt_bytes, &record);
+            if !ciphertext.is_empty() {
+                let bad_idx = ((offset_ratio * (ciphertext.len() as f32 - 1.0)) as usize).min(ciphertext.len() - 1);
+                ciphertext[bad_idx] ^= tamper_mask;
+                let result = decrypt_web_push(&ctx.material, &ctx.dh, &ctx.salt, &ciphertext);
+                prop_assert!(matches!(result, Err(Error::DecryptionFailed)));
+            }
+        }
     }
 }
