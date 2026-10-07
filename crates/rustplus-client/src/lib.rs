@@ -83,7 +83,11 @@ mod tests {
     }
     #[test]
     fn malformed_varints_and_lengths_are_rejected() {
-        for name in ["malformed_varint", "malformed_length", "malformed_dimension"] {
+        for name in [
+            "malformed_varint",
+            "malformed_length",
+            "malformed_dimension",
+        ] {
             assert!(
                 proto::AppMessage::decode(fixture(name).as_slice()).is_err(),
                 "{name} fixture must be rejected"

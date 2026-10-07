@@ -51,9 +51,7 @@ async fn server(respond: bool) -> (String, tokio::task::JoinHandle<()>) {
     (endpoint, task)
 }
 
-async fn delayed_handshake_server(
-    delay: Duration,
-) -> (String, tokio::task::JoinHandle<()>) {
+async fn delayed_handshake_server(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
     let endpoint = format!("ws://{}/", listener.local_addr().expect("address"));
     let task = tokio::spawn(async move {
@@ -95,9 +93,7 @@ async fn child_error_server() -> (String, tokio::task::JoinHandle<()>) {
             }
             let _ = socket.send(Message::Binary(response.into())).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let _ = socket
-                .send(Message::Binary(vec![0x0a, 0x80].into()))
-                .await;
+            let _ = socket.send(Message::Binary(vec![0x0a, 0x80].into())).await;
         }
     });
     (endpoint, task)
@@ -120,8 +116,7 @@ async fn readiness_request_and_bounded_disconnect_use_owned_transport() {
 #[tokio::test]
 async fn readiness_stays_connecting_until_live_confirmation() {
     let (endpoint, task) = delayed_handshake_server(Duration::from_millis(100)).await;
-    let client =
-        RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests());
+    let client = RustPlusClient::new(ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests());
     let connecting = {
         let client = client.clone();
         tokio::spawn(async move { client.connect().await })
@@ -140,13 +135,10 @@ async fn malformed_child_error_is_surfaced_by_reconnect() {
     let mut config = ClientConfig::new(endpoint, 42, 7).allow_insecure_for_tests();
     config.reconnect.max_attempts = 0;
     let client = RustPlusClient::new(config);
-    let error = tokio::time::timeout(
-        Duration::from_secs(1),
-        client.connect_with_reconnect(),
-    )
-    .await
-    .expect("reconnect must terminate")
-    .expect_err("malformed child must surface");
+    let error = tokio::time::timeout(Duration::from_secs(1), client.connect_with_reconnect())
+        .await
+        .expect("reconnect must terminate")
+        .expect_err("malformed child must surface");
     assert!(matches!(error, Error::Decode));
     task.abort();
 }

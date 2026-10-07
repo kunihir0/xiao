@@ -1,7 +1,4 @@
-use std::{
-    fmt,
-    time::Duration,
-};
+use std::{fmt, time::Duration};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraRays {

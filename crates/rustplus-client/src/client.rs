@@ -5,7 +5,8 @@ use crate::{
         CameraEntity, CameraEntityKind, ChatMessage, ClanInfo, ClanInvite, ClanMember, ClanRole,
         EntityInfo, EntityItem, EntityPayload, Event, EventReceiveError, MapNote, Marker,
         MarkerKind, MonitorPolicy, Monument, PlayerToken, RatePolicy, Readiness, ReconnectPolicy,
-        Request, Response, ResponsePayload, SellOrder, ServerInfo, ServerTime, TeamInfo, TeamMember,
+        Request, Response, ResponsePayload, SellOrder, ServerInfo, ServerTime, TeamInfo,
+        TeamMember,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -132,7 +133,9 @@ impl ClientConfig {
             || self.reconnect.max_delay > MAX_RECONNECT_DELAY
             || self.reconnect.jitter_percent > 100
         {
-            return Err(Error::InvalidConfig("reconnect policy is outside the supported bounds"));
+            return Err(Error::InvalidConfig(
+                "reconnect policy is outside the supported bounds",
+            ));
         }
         Ok(())
     }
@@ -272,11 +275,11 @@ impl RustPlusClient {
     pub fn new(config: ClientConfig) -> Self {
         let event_capacity = config.event_capacity.clamp(1, MAX_EVENTS);
         let rate_policy = config.rate_policy;
-        let rate_policy = rate_policy
-            .validate()
-            .is_ok()
-            .then_some(rate_policy)
-            .unwrap_or_default();
+        let rate_policy = if rate_policy.validate().is_ok() {
+            rate_policy
+        } else {
+            RatePolicy::default()
+        };
         let (events, _) = broadcast::channel(event_capacity);
         let (readiness, _) = watch::channel(Readiness::Disconnected);
         Self {
@@ -337,7 +340,9 @@ impl RustPlusClient {
         let generation = self
             .inner
             .generation
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
             .map_err(|_| Error::SequenceExhausted)?
             .checked_add(1)
             .ok_or(Error::SequenceExhausted)?;
@@ -352,7 +357,8 @@ impl RustPlusClient {
         let reader = tokio::spawn(async move {
             reader_loop(read, pending, events, reader_token, generation).await
         });
-        let writer = tokio::spawn(async move { writer_loop(write, outbound_rx, writer_token).await });
+        let writer =
+            tokio::spawn(async move { writer_loop(write, outbound_rx, writer_token).await });
         if let Ok(mut sender) = self.inner.outbound.lock() {
             *sender = Some((generation, outbound_tx));
         } else {
@@ -388,8 +394,7 @@ impl RustPlusClient {
                 error.clone().unwrap_or(Error::Disconnected),
             );
             if let Some(inner) = weak.upgrade() {
-                let current_generation =
-                    inner.generation.load(Ordering::Acquire) == generation;
+                let current_generation = inner.generation.load(Ordering::Acquire) == generation;
                 if current_generation
                     && let Some(error) = &error
                     && let Ok(mut child_error) = inner.child_error.lock()
@@ -435,15 +440,12 @@ impl RustPlusClient {
         }
         let _transition = self.inner.lifecycle.lock().await;
         self.inner.readiness.send_replace(Readiness::Closing);
-        let generation = self
-            .inner
-            .cancellation
-            .lock()
-            .ok()
-            .and_then(|mut token| token.take().map(|(generation, token)| {
+        let generation = self.inner.cancellation.lock().ok().and_then(|mut token| {
+            token.take().map(|(generation, token)| {
                 token.cancel();
                 generation
-            }));
+            })
+        });
         let mut task = self
             .inner
             .supervisor
@@ -606,8 +608,7 @@ impl RustPlusClient {
         self.inner.config.validate()?;
         let mut last_error = Error::Disconnected;
         for attempt in 0..=policy.max_attempts {
-            if self.inner.stopped.load(Ordering::Acquire)
-                || self.inner.owner_cancel.is_cancelled()
+            if self.inner.stopped.load(Ordering::Acquire) || self.inner.owner_cancel.is_cancelled()
             {
                 return Ok(());
             }
