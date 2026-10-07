@@ -89,6 +89,10 @@ pub trait McsSession: Send {
     fn acknowledge<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Ok(()) })
     }
+    /// Force an acknowledgement for a notification that cannot be admitted.
+    fn force_acknowledge<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
+        self.acknowledge()
+    }
     fn send_heartbeat<'a>(&'a mut self) -> BoxFuture<'a, Result<()>>;
     fn heartbeat_interval(&self) -> Duration {
         Duration::from_secs(300)
@@ -98,6 +102,8 @@ pub trait McsSession: Send {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     Notification(Notification),
+    /// Any inbound heartbeat stanza proves the session is still live.
+    Heartbeat,
     Closed,
 }
 
@@ -493,8 +499,10 @@ impl McsSession for TlsMcsSession {
                         )?;
                         self.send_frame(McsFrame::new(FrameTag::HeartbeatAck, payload))
                             .await?;
+                        return Ok(SessionEvent::Heartbeat);
                     }
-                    FrameEvent::HeartbeatAck | FrameEvent::Iq => {}
+                    FrameEvent::HeartbeatAck => return Ok(SessionEvent::Heartbeat),
+                    FrameEvent::Iq => return Ok(SessionEvent::Heartbeat),
                     FrameEvent::Close => return Ok(SessionEvent::Closed),
                     FrameEvent::Login => {}
                 }
@@ -523,6 +531,11 @@ impl McsSession for TlsMcsSession {
                 .await
         })
     }
+    fn force_acknowledge<'a>(&'a mut self) -> BoxFuture<'a, Result<()>> {
+        self.ack_requested = true;
+        self.acknowledge()
+    }
+
     fn heartbeat_interval(&self) -> Duration {
         self.heartbeat
     }

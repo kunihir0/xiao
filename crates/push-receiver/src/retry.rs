@@ -4,6 +4,7 @@ use rand::RngExt;
 
 pub const MAX_RETRY_ATTEMPTS: u32 = 32;
 pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
+pub const MIN_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -13,13 +14,10 @@ pub struct RetryPolicy {
     max_attempts: u32,
 }
 impl RetryPolicy {
+    /// Creates a policy with a non-zero minimum initial backoff.
     pub fn new(initial: Duration, maximum: Duration, jitter_percent: u8) -> Self {
-        let maximum = if maximum > MAX_RETRY_DELAY {
-            MAX_RETRY_DELAY
-        } else {
-            maximum
-        };
-        let initial = if initial > maximum { maximum } else { initial };
+        let maximum = maximum.clamp(MIN_RETRY_DELAY, MAX_RETRY_DELAY);
+        let initial = initial.clamp(MIN_RETRY_DELAY, maximum);
         Self {
             initial,
             maximum,
@@ -96,6 +94,12 @@ mod tests {
         let policy = RetryPolicy::new(Duration::from_secs(1), Duration::from_secs(8), 25);
         assert_eq!(policy.delay(2, 7), policy.delay(2, 7));
         assert!(policy.delay(20, 99) <= Duration::from_secs(8));
+    }
+
+    #[test]
+    fn minimum_initial_backoff_is_non_zero() {
+        let policy = RetryPolicy::new(Duration::ZERO, Duration::ZERO, 0);
+        assert_eq!(policy.delay(0, 0), MIN_RETRY_DELAY);
     }
     #[test]
     fn attempts_are_hard_bounded() {

@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -33,6 +33,7 @@ pub struct ReceiverHandle {
     readiness_tx: watch::Sender<Readiness>,
     task: Option<JoinHandle<Result<()>>>,
     queued_bytes: Arc<AtomicUsize>,
+    queue_notify: Arc<Notify>,
 }
 impl fmt::Debug for ReceiverHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -55,6 +56,7 @@ impl ReceiverHandle {
         if let Some(value) = &notification {
             self.queued_bytes
                 .fetch_sub(notification_bytes(value), Ordering::AcqRel);
+            self.queue_notify.notify_waiters();
         }
         notification
     }
@@ -164,7 +166,9 @@ pub fn start_with_policy(
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let (readiness_tx, readiness) = watch::channel(Readiness::Starting);
     let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let queue_notify = Arc::new(Notify::new());
     let task_queued_bytes = Arc::clone(&queued_bytes);
+    let task_queue_notify = Arc::clone(&queue_notify);
     let task_readiness = readiness_tx.clone();
     let task = tokio::spawn(async move {
         let ReceiverSource {
@@ -218,15 +222,21 @@ pub fn start_with_policy(
                         continue;
                     }
                     let bytes = notification_bytes(&notification);
-                    if bytes > MAX_NOTIFICATION_BYTES
-                        || !reserve_queue_bytes(&task_queued_bytes, bytes)
-                    {
-                        let _ = task_readiness.send(Readiness::Stopped);
-                        return Err(if bytes > MAX_NOTIFICATION_BYTES {
-                            Error::NotificationTooLarge
-                        } else {
-                            Error::QueueByteBudget
-                        });
+                    if bytes > MAX_NOTIFICATION_BYTES {
+                        continue;
+                    }
+                    loop {
+                        let notified = task_queue_notify.notified();
+                        if reserve_queue_bytes(&task_queued_bytes, bytes) {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = &mut shutdown_rx => {
+                                let _ = task_readiness.send(Readiness::Stopped);
+                                return Ok(());
+                            }
+                            _ = notified => {}
+                        }
                     }
                     let send_result = tokio::select! {
                         _ = &mut shutdown_rx => {
@@ -238,6 +248,7 @@ pub fn start_with_policy(
                     };
                     if send_result.is_err() {
                         task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                        task_queue_notify.notify_waiters();
                         let _ = task_readiness.send(Readiness::Stopped);
                         return Err(Error::ChannelClosed);
                     }
@@ -252,6 +263,7 @@ pub fn start_with_policy(
         readiness_tx,
         task: Some(task),
         queued_bytes,
+        queue_notify,
     }
 }
 
@@ -268,7 +280,9 @@ pub fn start_connected(
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let (readiness_tx, readiness) = watch::channel(Readiness::Starting);
     let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let queue_notify = Arc::new(Notify::new());
     let task_queued_bytes = Arc::clone(&queued_bytes);
+    let task_queue_notify = Arc::clone(&queue_notify);
     let task_readiness = readiness_tx.clone();
     let task = tokio::spawn(async move {
         let mut dedupe = PersistentIdWindow::new(dedupe_capacity);
@@ -305,9 +319,9 @@ pub fn start_connected(
                     }
                 }
             };
-            // A connection that completed login is a successful session. Any
-            // later reconnect budget counts only failures in this session.
-            attempts = 0;
+            // Login success alone does not reset the reconnect budget. A
+            // session must process an inbound event before it is healthy.
+            let mut processed_event = false;
             let _ = task_readiness.send(Readiness::Ready);
             let heartbeat_interval = session
                 .heartbeat_interval()
@@ -320,7 +334,15 @@ pub fn start_connected(
                     }
                     result = tokio::time::timeout(heartbeat_interval, session.receive()) => {
                         match result {
-                            Ok(event) => event?,
+                            Ok(Ok(event)) => event,
+                            Ok(Err(error)) => {
+                                if let Some(error) =
+                                    session_failure(error, &mut attempts, policy, &task_readiness)
+                                {
+                                    return Err(error);
+                                }
+                                break;
+                            }
                             Err(_) => {
                                 let heartbeat_result = tokio::select! {
                                     _ = &mut shutdown_rx => {
@@ -330,12 +352,11 @@ pub fn start_connected(
                                     result = session.send_heartbeat() => result,
                                 };
                                 if let Err(error) = heartbeat_result {
-                                    attempts = attempts.saturating_add(1);
-                                    if attempts > policy.max_attempts() {
-                                        let _ = task_readiness.send(Readiness::Stopped);
+                                    if let Some(error) =
+                                        session_failure(error, &mut attempts, policy, &task_readiness)
+                                    {
                                         return Err(error);
                                     }
-                                    let _ = task_readiness.send(Readiness::Starting);
                                     break;
                                 }
                                 match tokio::time::timeout(HEARTBEAT_GRACE, async {
@@ -344,7 +365,18 @@ pub fn start_connected(
                                         result = session.receive() => Some(result),
                                     }
                                 }).await {
-                                    Ok(Some(result)) => result?,
+                                    Ok(Some(Ok(event))) => event,
+                                    Ok(Some(Err(error))) => {
+                                        if let Some(error) = session_failure(
+                                            error,
+                                            &mut attempts,
+                                            policy,
+                                            &task_readiness,
+                                        ) {
+                                            return Err(error);
+                                        }
+                                        break;
+                                    }
                                     Ok(None) => {
                                         let _ = task_readiness.send(Readiness::Stopped);
                                         return Ok(());
@@ -365,65 +397,110 @@ pub fn start_connected(
                 };
                 match event {
                     SessionEvent::Notification(notification) => {
+                        if !processed_event {
+                            attempts = 0;
+                            processed_event = true;
+                        }
                         let bytes = notification_bytes(&notification);
-                        if bytes > MAX_NOTIFICATION_BYTES
-                            || !reserve_queue_bytes(&task_queued_bytes, bytes)
-                        {
-                            let _ = task_readiness.send(Readiness::Stopped);
-                            return Err(if bytes > MAX_NOTIFICATION_BYTES {
-                                Error::NotificationTooLarge
-                            } else {
-                                Error::QueueByteBudget
-                            });
+                        if bytes > MAX_NOTIFICATION_BYTES {
+                            let ack_result = tokio::select! {
+                                _ = &mut shutdown_rx => {
+                                    let _ = task_readiness.send(Readiness::Stopped);
+                                    return Ok(());
+                                }
+                                result = session.force_acknowledge() => result,
+                            };
+                            if let Err(error) = ack_result {
+                                if let Some(error) =
+                                    session_failure(error, &mut attempts, policy, &task_readiness)
+                                {
+                                    return Err(error);
+                                }
+                                break;
+                            }
+                            continue;
                         }
                         if notification
                             .persistent_id
                             .as_deref()
                             .is_some_and(|id| dedupe.contains(id))
                         {
-                            task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
-                            if let Err(error) = session.acknowledge().await {
-                                attempts = attempts.saturating_add(1);
-                                if attempts > policy.max_attempts() {
+                            let ack_result = tokio::select! {
+                                _ = &mut shutdown_rx => {
                                     let _ = task_readiness.send(Readiness::Stopped);
+                                    return Ok(());
+                                }
+                                result = session.force_acknowledge() => result,
+                            };
+                            if let Err(error) = ack_result {
+                                if let Some(error) =
+                                    session_failure(error, &mut attempts, policy, &task_readiness)
+                                {
                                     return Err(error);
                                 }
-                                let _ = task_readiness.send(Readiness::Starting);
                                 break;
                             }
                             continue;
                         }
                         let permit = tokio::select! {
                             _ = &mut shutdown_rx => {
-                                task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                                 let _ = task_readiness.send(Readiness::Stopped);
                                 return Ok(());
                             }
                             result = notifications_tx.reserve() => result,
                         };
                         let Ok(permit) = permit else {
-                            task_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                             let _ = task_readiness.send(Readiness::Stopped);
                             return Err(Error::ChannelClosed);
                         };
+                        loop {
+                            let notified = task_queue_notify.notified();
+                            if reserve_queue_bytes(&task_queued_bytes, bytes) {
+                                break;
+                            }
+                            tokio::select! {
+                                _ = &mut shutdown_rx => {
+                                    let _ = task_readiness.send(Readiness::Stopped);
+                                    return Ok(());
+                                }
+                                _ = notified => {}
+                            }
+                        }
                         if let Some(id) = notification.persistent_id.as_deref() {
                             dedupe.observe(id);
                         }
                         permit.send(notification);
-                        if let Err(error) = session.acknowledge().await {
-                            attempts = attempts.saturating_add(1);
-                            if attempts > policy.max_attempts() {
+                        // Admission succeeded; if shutdown wins here the
+                        // unacknowledged persistent ID is redelivered and
+                        // deduplicated by the window on the next session.
+                        let ack_result = tokio::select! {
+                            _ = &mut shutdown_rx => {
                                 let _ = task_readiness.send(Readiness::Stopped);
+                                return Ok(());
+                            }
+                            result = session.acknowledge() => result,
+                        };
+                        if let Err(error) = ack_result {
+                            if let Some(error) =
+                                session_failure(error, &mut attempts, policy, &task_readiness)
+                            {
                                 return Err(error);
                             }
-                            let _ = task_readiness.send(Readiness::Starting);
                             break;
                         }
                     }
+                    SessionEvent::Heartbeat => {
+                        if !processed_event {
+                            attempts = 0;
+                            processed_event = true;
+                        }
+                    }
                     SessionEvent::Closed => {
-                        // A clean session close follows a successful
-                        // session, so reconnect failures start fresh.
-                        attempts = 0;
+                        // A clean session close follows a successfully
+                        // processed event, so reconnect failures start fresh.
+                        if processed_event {
+                            attempts = 0;
+                        }
                         let _ = task_readiness.send(Readiness::Starting);
                         break;
                     }
@@ -446,6 +523,7 @@ pub fn start_connected(
         readiness_tx,
         task: Some(task),
         queued_bytes,
+        queue_notify,
     }
 }
 
@@ -475,6 +553,22 @@ fn notification_bytes(notification: &Notification) -> usize {
             .iter()
             .map(|entry| entry.key.len() + entry.value.len())
             .sum::<usize>()
+}
+
+fn session_failure(
+    error: Error,
+    attempts: &mut u32,
+    policy: RetryPolicy,
+    readiness: &watch::Sender<Readiness>,
+) -> Option<Error> {
+    *attempts = attempts.saturating_add(1);
+    if *attempts > policy.max_attempts() {
+        let _ = readiness.send(Readiness::Stopped);
+        Some(error)
+    } else {
+        let _ = readiness.send(Readiness::Starting);
+        None
+    }
 }
 
 #[cfg(test)]
