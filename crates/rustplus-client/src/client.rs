@@ -1253,32 +1253,39 @@ pub(crate) fn convert_event(raw: Option<proto::AppBroadcast>) -> Option<Event> {
 mod tests {
     use super::*;
 
+    fn lock_pending(pending: &Mutex<PendingMap>) -> std::sync::MutexGuard<'_, PendingMap> {
+        match pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     #[test]
     fn generation_cleanup_does_not_touch_new_waiters() {
         let pending = Mutex::new(HashMap::new());
         let (old_tx, mut old_rx) = oneshot::channel();
         let (new_tx, mut new_rx) = oneshot::channel();
-        pending.lock().expect("pending lock").insert((1, 1), old_tx);
-        pending.lock().expect("pending lock").insert((2, 1), new_tx);
+        lock_pending(&pending).insert((1, 1), old_tx);
+        lock_pending(&pending).insert((2, 1), new_tx);
 
         fail_pending_generation(&pending, 1, Error::Transport);
 
         assert!(old_rx.try_recv().is_ok());
         assert!(new_rx.try_recv().is_err());
-        assert!(pending.lock().expect("pending lock").contains_key(&(2, 1)));
+        assert!(lock_pending(&pending).contains_key(&(2, 1)));
     }
 
     #[test]
     fn pending_guard_removes_waiter_after_send_failure() {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = oneshot::channel();
-        pending.lock().expect("pending lock").insert((1, 1), tx);
+        lock_pending(&pending).insert((1, 1), tx);
         let guard = PendingGuard {
             pending: Arc::clone(&pending),
             key: (1, 1),
             armed: true,
         };
         drop(guard);
-        assert!(!pending.lock().expect("pending lock").contains_key(&(1, 1)));
+        assert!(!lock_pending(&pending).contains_key(&(1, 1)));
     }
 }
