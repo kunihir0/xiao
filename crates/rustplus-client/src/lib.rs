@@ -42,6 +42,17 @@ mod tests {
         let response = message.response.expect("response"); assert_eq!(response.seq, 1); assert!(response.success.is_some());
     }
     #[test]
+    fn monitor_fixture_preserves_marker_payload() {
+        let message = proto::AppMessage::decode(fixture("monitor_markers").as_slice()).expect("monitor fixture decode");
+        let response = crate::client::convert_response(&message.response.expect("monitor response")).expect("marker conversion");
+        assert!(matches!(response.payload, ResponsePayload::MapMarkers(markers) if markers.len() == 1 && markers[0].id == 42 && markers[0].name.as_deref() == Some("Joe")));
+    }
+    #[test]
+    fn event_fixture_preserves_camera_payload() {
+        let message = proto::AppMessage::decode(fixture("event_camera").as_slice()).expect("event fixture decode");
+        assert!(matches!(crate::client::convert_event(message.broadcast), Some(Event::CameraRays(_))));
+    }
+    #[test]
     fn malformed_wire_is_typed_error() { assert!(proto::AppMessage::decode(fixture("malformed_truncated").as_slice()).is_err()); }
     #[test]
     fn malformed_varints_and_lengths_are_rejected() {
@@ -49,8 +60,16 @@ mod tests {
         for bytes in malformed { assert!(proto::AppMessage::decode(bytes.as_slice()).is_err()); }
     }
     #[test]
+    fn camera_fixture_preserves_legacy_sample_position() {
+        let mut frame = camera::FrameBuilder::new(2, 2).expect("valid dimensions");
+        let rays = CameraRays { vertical_fov: 1.0, sample_offset: 0, ray_data: fixture("camera_2x2_single_ray"), distance: 1.0, entities: Vec::new() };
+        assert_eq!(frame.ingest(&rays).expect("camera sample"), 1);
+        assert_eq!(frame.image().rgba[7], 255);
+        assert_eq!(frame.image().rgba.iter().filter(|&&channel| channel == 255).count(), 1);
+    }
+    #[test]
     fn camera_boundaries_and_excess_tokens_are_rejected() {
-        assert!(camera::FrameBuilder::new(0, 1).is_err()); assert!(camera::FrameBuilder::new(2049, 1).is_err());
+        assert!(camera::FrameBuilder::new(0, 1).is_err()); assert!(camera::FrameBuilder::new(4097, 1).is_err());
         let mut frame = camera::FrameBuilder::new(1, 1).expect("valid dimensions");
         let rays = CameraRays { vertical_fov: 1.0, sample_offset: 0, ray_data: vec![255], distance: 1.0, entities: Vec::new() };
         assert!(frame.ingest(&rays).is_err());
