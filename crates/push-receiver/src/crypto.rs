@@ -343,7 +343,7 @@ mod tests {
             let peer = if let Ok(secret) = SecretKey::from_slice(&[2; 32]) {
                 URL_SAFE_NO_PAD.encode(secret.public_key().to_sec1_point(false).as_bytes())
             } else {
-                return;
+                return Ok(());
             };
             let salt = URL_SAFE_NO_PAD.encode([3_u8; 16]);
             let result = decrypt_web_push(
