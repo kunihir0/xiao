@@ -56,19 +56,33 @@ async fn applies_pending_migrations_idempotently_and_sets_readiness()
     let result = async {
         let config = DbConfig::new(schema_url(&base_url, &schema))?;
         let db = Db::connect(&config).await?;
-        assert!(!db.is_ready());
+        if db.is_ready() {
+            return Err("database should not be ready before migrations".into());
+        }
 
         let first = db.run_migrations().await?;
-        assert_eq!(first.applied(), 1);
-        assert!(!db.is_ready());
+        if first.applied() != 1 {
+            return Err(format!("expected one pending migration, got {}", first.applied()).into());
+        }
+        if db.is_ready() {
+            return Err("database should not be ready before ping".into());
+        }
         db.ping().await?;
-        assert!(db.is_ready());
+        if !db.is_ready() {
+            return Err("database should be ready after migration and ping".into());
+        }
 
         let second = db.run_migrations().await?;
-        assert_eq!(second.applied(), 0);
-        assert!(!db.is_ready());
+        if second.applied() != 0 {
+            return Err(format!("expected no pending migrations, got {}", second.applied()).into());
+        }
+        if db.is_ready() {
+            return Err("rerunning migrations should clear readiness until ping".into());
+        }
         db.ping().await?;
-        assert!(db.is_ready());
+        if !db.is_ready() {
+            return Err("database should be ready after idempotent ping".into());
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
