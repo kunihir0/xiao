@@ -1,0 +1,7 @@
+# Source: kunihir0/rustplus master @ 5b9a0803ac404a00b7f58e298c91b1130504d5c7
+# AppRequest(seq=1, playerId=42, playerToken=7, getInfo={})
+request_info = 08 01 10 2a 18 07 42 00
+# AppMessage(response(AppResponse(seq=1, success={})))
+response_success = 0a 04 08 01 22 00
+# Truncated AppMessage (must return Decode error, never panic)
+malformed_truncated = 0a 04 08
