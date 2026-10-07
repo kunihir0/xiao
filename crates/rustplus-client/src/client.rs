@@ -342,23 +342,23 @@ impl RustPlusClient {
             ) => match result {
                 Ok((stream, _)) => stream,
                 Err(_) => {
-                    self.inner.readiness.send_replace(Readiness::Disconnected);
+                    mark_disconnected_unless_closing(&self.inner.readiness);
                     return Err(Error::Transport);
                 }
             },
             _ = self.inner.owner_cancel.cancelled() => {
-                self.inner.readiness.send_replace(Readiness::Disconnected);
+                mark_disconnected_unless_closing(&self.inner.readiness);
                 return Err(Error::ShuttingDown);
             },
             _ = disconnect_signal.cancelled() => {
-                self.inner.readiness.send_replace(Readiness::Disconnected);
+                mark_disconnected_unless_closing(&self.inner.readiness);
                 return Err(Error::ShuttingDown);
             }
         };
         let transition = self.inner.lifecycle.lock().await;
         if disconnect_signal.is_cancelled() || self.inner.stopped.load(Ordering::Acquire) {
             let _ = stream.close(None).await;
-            self.inner.readiness.send_replace(Readiness::Disconnected);
+            mark_disconnected_unless_closing(&self.inner.readiness);
             return Err(Error::ShuttingDown);
         }
 
@@ -434,7 +434,7 @@ impl RustPlusClient {
                     {
                         *token = None;
                     }
-                    readiness.send_replace(Readiness::Disconnected);
+                    mark_disconnected_unless_closing(&readiness);
                 }
             }
             error.map_or(Ok(()), Err)
@@ -449,7 +449,7 @@ impl RustPlusClient {
         if let Err(error) = self.send_request_inner(Request::Info, false).await {
             cancellation.cancel();
             self.abort_supervisor().await;
-            self.inner.readiness.send_replace(Readiness::Disconnected);
+            mark_disconnected_unless_closing(&self.inner.readiness);
             return Err(error);
         }
         if cancellation.is_cancelled() {
@@ -461,11 +461,29 @@ impl RustPlusClient {
                 .and_then(|mut error| error.take())
                 .unwrap_or(Error::Disconnected);
             self.abort_supervisor().await;
-            self.inner.readiness.send_replace(Readiness::Disconnected);
+            mark_disconnected_unless_closing(&self.inner.readiness);
             return Err(error);
         }
-        self.inner.readiness.send_replace(Readiness::Ready);
-        Ok(())
+        // A concurrent `disconnect()` (Closing) or a child loss observed by the
+        // supervisor (Disconnected) after the Info round-trip must not be
+        // overwritten by a stale Ready.
+        let mut observed = Readiness::Connecting;
+        let promoted = self.inner.readiness.send_if_modified(|state| {
+            observed = *state;
+            if *state == Readiness::Connecting {
+                *state = Readiness::Ready;
+                true
+            } else {
+                false
+            }
+        });
+        if promoted {
+            Ok(())
+        } else if observed == Readiness::Closing {
+            Err(Error::ShuttingDown)
+        } else {
+            Err(Error::Disconnected)
+        }
     }
 
     pub async fn disconnect(&self) -> Result<()> {
@@ -812,6 +830,22 @@ where
             }
         }
     }
+}
+
+/// Publishes `Disconnected` for a failed or lost connection attempt unless a
+/// concurrent `disconnect()` owns the transition. `disconnect()` publishes
+/// `Closing` under the admission guard and is the only writer allowed to leave
+/// it; overwriting it early would let a new `connect()` be admitted while
+/// teardown is still running.
+fn mark_disconnected_unless_closing(readiness: &watch::Sender<Readiness>) {
+    readiness.send_if_modified(|state| {
+        if matches!(*state, Readiness::Closing | Readiness::Disconnected) {
+            false
+        } else {
+            *state = Readiness::Disconnected;
+            true
+        }
+    });
 }
 fn fail_pending_generation(pending: &Mutex<PendingMap>, generation: u64, error: Error) {
     if let Ok(mut pending) = pending.lock() {
@@ -1310,5 +1344,20 @@ mod tests {
         };
         drop(guard);
         assert!(!lock_pending(&pending).contains_key(&(1, 1)));
+    }
+
+    #[test]
+    fn failed_attempt_never_clears_closing_owned_by_disconnect() {
+        let (readiness, receiver) = watch::channel(Readiness::Closing);
+        mark_disconnected_unless_closing(&readiness);
+        assert_eq!(*receiver.borrow(), Readiness::Closing);
+
+        readiness.send_replace(Readiness::Connecting);
+        mark_disconnected_unless_closing(&readiness);
+        assert_eq!(*receiver.borrow(), Readiness::Disconnected);
+
+        readiness.send_replace(Readiness::Ready);
+        mark_disconnected_unless_closing(&readiness);
+        assert_eq!(*receiver.borrow(), Readiness::Disconnected);
     }
 }
