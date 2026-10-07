@@ -235,6 +235,7 @@ mod tests {
     use super::{parse_notification, parse_public_ip};
     use crate::{ParseConfig, ParseError};
     use bot_domain::{MAX_ENTITY_KIND_BYTES, MAX_ENTITY_NAME_BYTES};
+    use proptest::prelude::*;
 
     #[test]
     fn parses_number_and_string_forms_from_any_app_data_key() -> Result<(), ParseError> {
@@ -523,6 +524,28 @@ mod tests {
             assert_eq!(result, Err(ParseError::Domain(field)));
             assert!(!format!("{result:?}").contains(kind));
             assert!(!format!("{result:?}").contains(name));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_push_values_are_panic_free_and_size_bounded(
+            bytes in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let value = String::from_utf8_lossy(&bytes).into_owned();
+            let mut push = push_receiver::Notification::new(Vec::new(), None);
+            push.app_data.push(push_receiver::AppData {
+                key: "property".to_owned(),
+                value: value.clone(),
+            });
+            let config = ParseConfig {
+                max_value_bytes: 512,
+                ..ParseConfig::default()
+            };
+            let result = parse_notification(&push, &config);
+            if value.len() > config.max_value_bytes {
+                prop_assert_eq!(result, Err(ParseError::TooLarge));
+            }
         }
     }
 }
