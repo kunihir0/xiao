@@ -156,8 +156,10 @@ jobs:
           openssl req -new -x509 -days 1 -nodes \
             -subj "/CN=Untrusted Root CA" \
             -keyout /tmp/pg-tls/wrong_ca.key -out /tmp/pg-tls/wrong_ca.crt
-          # Ensure container user (UID 70 postgres in alpine) can read the key and cert
-          chmod 0644 /tmp/pg-tls/server.key /tmp/pg-tls/ca.key /tmp/pg-tls/server.crt /tmp/pg-tls/ca.crt /tmp/pg-tls/wrong_ca.crt
+          # postgres requires key file to be owned by root (or postgres) and mode 0600 or 0640
+          sudo chown 70:70 /tmp/pg-tls/server.key /tmp/pg-tls/server.crt /tmp/pg-tls/ca.crt /tmp/pg-tls/wrong_ca.crt
+          sudo chmod 0600 /tmp/pg-tls/server.key
+          sudo chmod 0644 /tmp/pg-tls/server.crt /tmp/pg-tls/ca.crt /tmp/pg-tls/wrong_ca.crt
       - name: Start PostgreSQL container with TLS enabled
         shell: bash
         run: |
