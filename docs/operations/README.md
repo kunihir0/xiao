@@ -19,9 +19,24 @@ conversations. That is an external hosting limitation, not a repository policy
 decision: CI remains strict, and maintainers MUST NOT treat this documentation
 as evidence that GitHub is enforcing those checks.
 
-Renovate updates Cargo dependencies and immutable GitHub Actions pins. Renovate
-pull requests still require the same CI and review treatment as any other
-change.
+Renovate is configured in `renovate.json5` to update Cargo dependencies and
+immutable GitHub Actions pins. Renovate's pull requests still require the
+same CI and review treatment as any other change.
+
+## Releases
+
+The trusted `.github/workflows/release.yml` workflow runs only for protected
+`v*` tags or an explicit maintainer dispatch. It builds the pinned Rust
+toolchain's source and Linux binary artifacts, writes SHA-256 checksums, emits
+an SPDX SBOM, uploads the release bundle, and creates GitHub artifact
+provenance. The workflow grants `id-token: write` and `attestations: write`
+only in this trusted release context; it has no pull-request trigger and no
+production secrets. Note that GitHub Free does not support tag protection rules;
+releases remain maintainer-initiated.
+
+Stable artifact names, OCI promotion guidance, and rollback/exception policy
+are documented in `docs/quality-and-supply-chain.md`. Issue #8 owns OCI build
+and deployment files; this workflow does not modify `deploy/`.
 
 ## Runbooks
 
@@ -39,8 +54,3 @@ path. Every release record MUST include the immutable artifact digest, source
 commit, migration compatibility decision, six CI gates, and deployment smoke
 evidence.
 
-## Releases
-
-Release automation is intentionally not enabled yet. Releases remain an
-explicit maintainer operation until a reviewed workflow defines permissions,
-review boundary, tag behavior, artifact attestation, and rollback path.

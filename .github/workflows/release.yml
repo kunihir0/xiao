@@ -1,0 +1,118 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing version tag to release (for example v0.3.0)"
+        required: true
+        type: string
+
+# This workflow has no pull_request trigger. Only a SemVer version tag push or an
+# explicitly requested maintainer dispatch reaches the attesting job. Tag
+# protection is unavailable on the current GitHub plan (rulesets API 403); see
+# docs/quality-and-supply-chain.md for the compensating checks.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+
+jobs:
+  artifact:
+    name: build and attest release artifacts
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Resolve and validate SemVer release tag
+        id: resolve-tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.release_tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid SemVer release tag: ${tag}"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/${tag}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.resolve-tag.outputs.ref }}
+          fetch-depth: 0
+      - name: Verify checked-out commit matches exact tag ref
+        id: verify-tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.resolve-tag.outputs.tag }}"
+          tag_ref="refs/tags/${tag}"
+          tag_sha=$(git rev-list -n 1 "${tag_ref}" 2>/dev/null || true)
+          if [[ -z "${tag_sha}" ]]; then
+            echo "::error::Release tag ${tag_ref} does not exist in repository"
+            exit 1
+          fi
+          head_sha=$(git rev-parse HEAD)
+          if [[ "${tag_sha}" != "${head_sha}" ]]; then
+            echo "::error::Checked out HEAD (${head_sha}) does not match tag ref ${tag_ref} (${tag_sha})"
+            exit 1
+          fi
+          echo "tag_sha=${tag_sha}" >> "$GITHUB_OUTPUT"
+          echo "Verified release tag ${tag} at commit ${tag_sha}"
+      - id: toolchain
+        shell: bash
+        run: echo "channel=$(awk -F '\"' '/^channel/ {print $2}' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build reproducible source and binary artifacts
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "release/xiao-${RELEASE_TAG}-x86_64-unknown-linux-gnu"
+          git archive --format=tar.gz --prefix="xiao-${RELEASE_TAG}/" HEAD \
+            > "release/xiao-source-${RELEASE_TAG}.tar.gz"
+          cargo build --locked --release -p bot
+          install -m 0755 target/release/bot \
+            "release/xiao-${RELEASE_TAG}-x86_64-unknown-linux-gnu/xiao"
+          tar -C release -czf \
+            "release/xiao-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz" \
+            "xiao-${RELEASE_TAG}-x86_64-unknown-linux-gnu"
+          sha256sum release/*.tar.gz > "release/SHA256SUMS-${RELEASE_TAG}.txt"
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: release/xiao-${{ steps.resolve-tag.outputs.tag }}.spdx.json
+          artifact-name: xiao-${{ steps.resolve-tag.outputs.tag }}-sbom.spdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xiao-${{ steps.resolve-tag.outputs.tag }}-release
+          path: release
+          if-no-files-found: error
+          retention-days: 90
+      - name: Attest source, binary, checksums, and SBOM
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release/*

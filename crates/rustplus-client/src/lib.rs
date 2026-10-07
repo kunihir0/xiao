@@ -27,6 +27,7 @@ pub use types::{
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use prost::Message;
     use std::time::Duration;
 
@@ -217,5 +218,33 @@ mod tests {
         );
         assert!(!debug.contains("987654"));
         assert!(debug.contains("REDACTED"));
+    }
+
+    proptest! {
+        #[test]
+        fn camera_boundaries_never_panic_or_allocate_unbounded_buffers(
+            width in 0u32..=64,
+            height in 0u32..=64,
+            ray_data in prop::collection::vec(any::<u8>(), 0..256)
+        ) {
+            let builder = camera::FrameBuilder::new(width, height);
+            if let Ok(mut frame) = builder {
+                prop_assert_eq!(frame.pixels.len(), (width as usize) * (height as usize) * 4);
+                let rays = CameraRays {
+                    vertical_fov: 1.0,
+                    sample_offset: 0,
+                    ray_data,
+                    distance: 1.0,
+                    entities: Vec::new(),
+                };
+                let result = frame.ingest(&rays);
+                if let Ok(decoded) = result {
+                    prop_assert!(decoded <= rays.ray_data.len());
+                    prop_assert!(frame.pixels.len() <= 32 * 1024 * 1024);
+                }
+            } else {
+                prop_assert!(width == 0 || height == 0);
+            }
+        }
     }
 }
