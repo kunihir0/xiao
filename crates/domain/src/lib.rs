@@ -7,7 +7,7 @@ mod pairing;
 use std::fmt;
 
 pub use credentials::{PlayerCredentials, PlayerToken};
-pub use ids::{DeliveryId, EntityId, PlayerId, ServerAddress, ServerId, SessionId};
+pub use ids::{DeliveryId, EntityId, PlayerId, ServerAddress, ServerId, SessionId, SteamId};
 pub use pairing::{EntityPairing, MAX_ENTITY_KIND_BYTES, MAX_ENTITY_NAME_BYTES, Pairing};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -177,10 +177,10 @@ version = "0.1.0"
 dependencies = [
  "bot-domain",
  "bot-test-support",
- "push-receiver",
  "tokio",
  "tokio-util",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
