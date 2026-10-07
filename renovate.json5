@@ -1,5 +1,5 @@
 {
-  extends: ["config:recommended"],
+  enabledManagers: ["cargo", "github-actions"],
   dependencyDashboard: true,
   rangeStrategy: "bump",
   minimumReleaseAge: "3 days",
