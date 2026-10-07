@@ -1,4 +1,5 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use p256::PublicKey;
 use prost::Message;
 use serde::Deserialize;
 use url::Url;
@@ -186,6 +187,8 @@ pub fn validate_subscription_response(value: &SubscriptionResponse) -> Result<()
             "p256dh key must be 65 bytes".into(),
         ));
     }
+    PublicKey::from_sec1_bytes(&p256dh)
+        .map_err(|error| Error::InvalidRegistration(format!("invalid p256dh point: {error}")))?;
     let auth = URL_SAFE_NO_PAD
         .decode(auth)
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(auth))
@@ -234,6 +237,14 @@ mod tests {
             }),
         };
         assert!(validate_subscription_response(&invalid).is_err());
+        let malformed_point = SubscriptionResponse {
+            endpoint: Some("https://push.example.test/send".into()),
+            keys: Some(SubscriptionKeys {
+                p256dh: Some(URL_SAFE_NO_PAD.encode([0_u8; 65])),
+                auth: Some(URL_SAFE_NO_PAD.encode([2_u8; 16])),
+            }),
+        };
+        assert!(validate_subscription_response(&malformed_point).is_err());
     }
     #[test]
     fn parses_reference_registration_response() {
@@ -252,12 +263,11 @@ mod tests {
             .collect::<Vec<_>>();
         let result = parse_checkin_response(&bytes);
         assert!(result.is_ok());
-        let registration = include_str!("../fixtures/registration_response.txt").trim();
         assert_eq!(
             parse_registration_response(registration)
                 .ok()
                 .map(|token| token.as_str().to_owned()),
-            Some("legacy-registration-token".to_owned())
+            Some("APA91bFcmLegacyReferenceRegistrationToken-7f3a".to_owned())
         );
     }
 }

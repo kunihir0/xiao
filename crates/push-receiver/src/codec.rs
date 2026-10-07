@@ -308,4 +308,53 @@ mod tests {
             Some(FrameTag::LoginResponse)
         );
     }
+    #[test]
+    fn consumes_data_and_heartbeat_fixtures() {
+        let parse = |value: &str| {
+            value
+                .split_whitespace()
+                .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+                .collect::<Vec<_>>()
+        };
+        let mut data = McsCodec::new();
+        let data_fixture = parse(include_str!("../fixtures/data_message_frame.hex"));
+        let mut data_bytes = BytesMut::from(data_fixture.as_slice());
+        assert_eq!(
+            data.decode_frame(&mut data_bytes).ok().flatten().map(|frame| frame.tag),
+            Some(FrameTag::DataMessage)
+        );
+        let mut heartbeat = McsCodec::server();
+        let heartbeat_fixture = parse(include_str!("../fixtures/heartbeat_frames.hex"));
+        let mut heartbeat_bytes = BytesMut::from(heartbeat_fixture.as_slice());
+        assert_eq!(
+            heartbeat.decode_frame(&mut heartbeat_bytes).ok().flatten().map(|frame| frame.tag),
+            Some(FrameTag::HeartbeatPing)
+        );
+        assert_eq!(
+            heartbeat.decode_frame(&mut heartbeat_bytes).ok().flatten().map(|frame| frame.tag),
+            Some(FrameTag::HeartbeatAck)
+        );
+    }
+    #[test]
+    fn consumes_malformed_fixtures_as_typed_errors() {
+        let parse = |value: &str| {
+            value
+                .split_whitespace()
+                .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+                .collect::<Vec<_>>()
+        };
+        let mut varint = McsCodec::new();
+        let mut varint_bytes = BytesMut::from(
+            parse(include_str!("../fixtures/malformed_varint.hex")).as_slice(),
+        );
+        assert!(matches!(
+            varint.decode_frame(&mut varint_bytes),
+            Err(Error::InvalidVarint)
+        ));
+        let mut truncated = McsCodec::new();
+        let mut truncated_bytes =
+            BytesMut::from(parse(include_str!("../fixtures/truncated_frame.hex")).as_slice());
+        assert!(truncated.decode_frame(&mut truncated_bytes).is_ok());
+        assert!(truncated.decode_eof(&mut truncated_bytes).is_err());
+    }
 }

@@ -28,19 +28,20 @@ pub use checkin::{
 pub const LEGACY_MCS_VERSION: u8 = codec::LEGACY_MCS_VERSION;
 pub const MAX_FRAME_SIZE: usize = codec::MAX_FRAME_SIZE;
 pub const MCS_VERSION: u8 = codec::MCS_VERSION;
-pub use crypto::{WebPushKeyMaterial, decrypt_web_push};
-pub use dedupe::{MAX_DEDUPE_CAPACITY, PersistentIdWindow};
+pub use dedupe::{
+    MAX_DEDUPE_BYTES, MAX_DEDUPE_CAPACITY, MAX_PERSISTENT_ID_BYTES, PersistentIdWindow,
+};
 pub use error::{Error, Result};
 pub use lifecycle::{
     DEFAULT_DEDUPE_CAPACITY, DEFAULT_QUEUE_CAPACITY, MAX_NOTIFICATION_BYTES, MAX_QUEUE_BYTES,
-    MAX_QUEUE_CAPACITY, Readiness, ReceiverHandle, ReceiverSource, start, start_connected,
-    start_with_policy,
+    MAX_QUEUE_CAPACITY, MAX_SOURCE_CAPACITY, Readiness, ReceiverHandle, ReceiverSource, start,
+    start_connected, start_with_policy,
 };
 pub use mcs::{
     DurationConfig, LoginParameters, decode_data_message, decode_login_response,
     encode_heartbeat_ack, encode_login,
 };
-pub use retry::RetryPolicy;
+pub use retry::{MAX_RETRY_ATTEMPTS, MAX_RETRY_DELAY, RetryPolicy};
 pub use transport::{FcmConnector, McsSession, ProductionConfig, ReceiverConnector, SessionEvent};
 
 #[derive(Clone, PartialEq, Eq)]

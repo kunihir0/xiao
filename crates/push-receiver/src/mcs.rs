@@ -1,6 +1,12 @@
+
 use prost::Message;
 
 use crate::{Error, Notification, Result, checkin::CheckinCredentials, proto};
+
+pub const MAX_PERSISTENT_ID_BYTES: usize = crate::dedupe::MAX_PERSISTENT_ID_BYTES;
+pub const MAX_APP_DATA_ITEMS: usize = 128;
+pub const MAX_APP_DATA_BYTES: usize = 64 * 1024;
+pub const MAX_RAW_DATA_BYTES: usize = crate::MAX_NOTIFICATION_BYTES;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LoginParameters {
@@ -80,7 +86,13 @@ pub struct DurationConfig {
     pub heartbeat_millis: u64,
 }
 
-pub fn decode_data_message(payload: &[u8]) -> Result<Notification> {
+pub(crate) struct DecodedDataMessage {
+    pub notification: Notification,
+    pub immediate_ack: bool,
+    pub stream_id: Option<i32>,
+}
+
+pub(crate) fn decode_data_message_with_metadata(payload: &[u8]) -> Result<DecodedDataMessage> {
     if payload.len() > crate::MAX_FRAME_SIZE {
         return Err(Error::FrameTooLarge {
             actual: payload.len(),
@@ -94,6 +106,30 @@ pub fn decode_data_message(payload: &[u8]) -> Result<Notification> {
             "MCS data message missing required fields".into(),
         ));
     }
+    if message.app_data.len() > MAX_APP_DATA_ITEMS {
+        return Err(Error::NotificationTooLarge);
+    }
+    let app_data_bytes = message
+        .app_data
+        .iter()
+        .map(|entry| entry.key.len().saturating_add(entry.value.len()))
+        .sum::<usize>();
+    if app_data_bytes > MAX_APP_DATA_BYTES {
+        return Err(Error::NotificationTooLarge);
+    }
+    let persistent_id = message.persistent_id;
+    if persistent_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty() || id.len() > MAX_PERSISTENT_ID_BYTES)
+    {
+        return Err(Error::InvalidRegistration(
+            "MCS persistent ID is empty or oversized".into(),
+        ));
+    }
+    let payload = message.raw_data.unwrap_or_default();
+    if payload.len() > MAX_RAW_DATA_BYTES {
+        return Err(Error::NotificationTooLarge);
+    }
     let app_data = message
         .app_data
         .into_iter()
@@ -102,17 +138,46 @@ pub fn decode_data_message(payload: &[u8]) -> Result<Notification> {
             value: entry.value,
         })
         .collect();
-    Ok(Notification {
-        payload: message.raw_data.unwrap_or_default(),
-        persistent_id: message.persistent_id,
-        app_data,
-        sent: message.sent,
+    Ok(DecodedDataMessage {
+        notification: Notification {
+            payload,
+            persistent_id,
+            app_data,
+            sent: message.sent,
+        },
+        immediate_ack: message.immediate_ack.unwrap_or(false),
+        stream_id: message.stream_id,
     })
+}
+
+pub fn decode_data_message(payload: &[u8]) -> Result<Notification> {
+    Ok(decode_data_message_with_metadata(payload)?.notification)
 }
 
 pub fn encode_heartbeat_ack(last_stream_id_received: Option<i32>) -> Result<Vec<u8>> {
     Ok(proto::HeartbeatAck {
         last_stream_id_received,
+        ..Default::default()
+    }
+    .encode_to_vec())
+}
+pub(crate) fn encode_heartbeat_ping(last_stream_id_received: Option<i32>) -> Result<Vec<u8>> {
+    Ok(proto::HeartbeatPing {
+        last_stream_id_received,
+        ..Default::default()
+    }
+    .encode_to_vec())
+}
+
+pub(crate) fn encode_stream_ack(last_stream_id_received: i32) -> Result<Vec<u8>> {
+    Ok(proto::IqStanza {
+        r#type: proto::iq_stanza::IqType::Set as i32,
+        id: String::new(),
+        extension: Some(proto::Extension {
+            id: 13,
+            data: Vec::new(),
+        }),
+        last_stream_id_received: Some(last_stream_id_received),
         ..Default::default()
     }
     .encode_to_vec())
@@ -136,7 +201,7 @@ mod tests {
         let notification = decode_data_message(&data);
         assert_eq!(
             notification.ok().map(|value| value.payload),
-            Some(vec![1, 2, 3])
+            Some(b"hello".to_vec())
         );
     }
 }

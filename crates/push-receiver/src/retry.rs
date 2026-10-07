@@ -1,5 +1,10 @@
 use std::time::Duration;
 
+use rand::RngExt;
+
+pub const MAX_RETRY_ATTEMPTS: u32 = 32;
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     initial: Duration,
@@ -10,6 +15,12 @@ pub struct RetryPolicy {
 impl RetryPolicy {
     #[must_use]
     pub const fn new(initial: Duration, maximum: Duration, jitter_percent: u8) -> Self {
+        let maximum = if maximum > MAX_RETRY_DELAY {
+            MAX_RETRY_DELAY
+        } else {
+            maximum
+        };
+        let initial = if initial > maximum { maximum } else { initial };
         Self {
             initial,
             maximum,
@@ -23,7 +34,7 @@ impl RetryPolicy {
     }
     #[must_use]
     pub const fn with_max_attempts(mut self, max_attempts: u32) -> Self {
-        self.max_attempts = max_attempts;
+        self.max_attempts = max_attempts.min(MAX_RETRY_ATTEMPTS);
         self
     }
     #[must_use]
@@ -48,7 +59,26 @@ impl RetryPolicy {
             .saturating_sub(spread)
             .saturating_add(offset)
             .min(self.maximum.as_millis());
-        Duration::from_millis(value as u64)
+        Duration::from_millis(value.min(u128::from(u64::MAX)) as u64)
+    }
+    /// Calculates a delay with fresh OS-seeded randomness for production
+    /// reconnects. Tests can use [`Self::delay`] with a deterministic value.
+    #[must_use]
+    pub fn random_delay(&self, attempt: u32) -> Duration {
+        let base = self.delay(attempt, 0);
+        let spread = base.as_millis().saturating_mul(self.jitter_percent as u128) / 100;
+        if spread == 0 {
+            return base;
+        }
+        let mut rng = rand::rng();
+        let jitter = rng.random_range(0..=spread.saturating_mul(2));
+        let millis = base
+            .as_millis()
+            .saturating_sub(spread)
+            .saturating_add(jitter)
+            .min(self.maximum.as_millis())
+            .min(u128::from(u64::MAX));
+        Duration::from_millis(millis as u64)
     }
     #[must_use]
     pub const fn maximum(&self) -> Duration {
@@ -68,5 +98,14 @@ mod tests {
         let policy = RetryPolicy::new(Duration::from_secs(1), Duration::from_secs(8), 25);
         assert_eq!(policy.delay(2, 7), policy.delay(2, 7));
         assert!(policy.delay(20, 99) <= Duration::from_secs(8));
+    }
+    #[test]
+    fn attempts_are_hard_bounded() {
+        assert_eq!(
+            RetryPolicy::default()
+                .with_max_attempts(u32::MAX)
+                .max_attempts(),
+            MAX_RETRY_ATTEMPTS
+        );
     }
 }

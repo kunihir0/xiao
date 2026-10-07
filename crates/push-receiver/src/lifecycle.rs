@@ -7,7 +7,6 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::Duration;
 
 use crate::{
     Error, Notification, PersistentIdWindow, Result, RetryPolicy,
@@ -17,7 +16,8 @@ use crate::{
 pub const DEFAULT_QUEUE_CAPACITY: usize = 64;
 pub const DEFAULT_DEDUPE_CAPACITY: usize = 256;
 pub const MAX_QUEUE_CAPACITY: usize = 4096;
-
+/// Source capacity is bounded by the byte budget for the largest notification.
+pub const MAX_SOURCE_CAPACITY: usize = MAX_QUEUE_BYTES / MAX_NOTIFICATION_BYTES;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
     Starting,
@@ -67,6 +67,9 @@ impl ReceiverHandle {
         task.await.map_err(|error| Error::Task(error.to_string()))?
     }
 }
+/// Dropping is a synchronous safety fallback: it publishes terminal readiness
+/// and aborts the owned task. Call [`ReceiverHandle::shutdown`] when the
+/// caller needs bounded asynchronous cancellation and surfaced task errors.
 impl Drop for ReceiverHandle {
     fn drop(&mut self) {
         let _ = self.readiness_tx.send(Readiness::Stopped);
@@ -89,7 +92,7 @@ impl ReceiverSource {
                 "receiver source capacity must be non-zero".into(),
             ));
         }
-        let capacity = capacity.min(MAX_QUEUE_CAPACITY);
+        let capacity = capacity.min(MAX_SOURCE_CAPACITY);
         let (sender, input) = mpsc::channel(capacity);
         Ok((sender, Self { input }))
     }
@@ -149,7 +152,7 @@ pub fn start_with_policy(
                                     let _ = task_readiness.send(Readiness::Stopped);
                                     return Ok(());
                                 }
-                                _ = tokio::time::sleep(policy.delay(attempts, 0)) => {}
+                                _ = tokio::time::sleep(policy.random_delay(attempts)) => {}
                             }
                             task_readiness.send(Readiness::Ready).map_err(|_| Error::ChannelClosed)?;
                             continue;
@@ -203,31 +206,40 @@ pub fn start_connected(
         let mut dedupe = PersistentIdWindow::new(dedupe_capacity);
         let mut attempts = 0_u32;
         loop {
-            let mut session = match connector.connect(&dedupe.ids()).await {
-                Ok(session) => {
-                    attempts = 0;
-                    let _ = task_readiness.send(Readiness::Ready);
-                    session
+            let ids = dedupe.ids();
+            let connection = connector.connect(&ids);
+            tokio::pin!(connection);
+            let mut session = tokio::select! {
+                _ = &mut shutdown_rx => {
+                    let _ = task_readiness.send(Readiness::Stopped);
+                    return Ok(());
                 }
-                Err(error) => {
-                    attempts = attempts.saturating_add(1);
-                    if attempts > policy.max_attempts() {
-                        let _ = task_readiness.send(Readiness::Stopped);
-                        return Err(error);
-                    }
-                    let _ = task_readiness.send(Readiness::Starting);
-                    let delay = policy.delay(attempts, attempts);
-                    tokio::select! {
-                        _ = &mut shutdown_rx => {
-                            let _ = task_readiness.send(Readiness::Stopped);
-                            return Ok(());
+                result = &mut connection => {
+                    match result {
+                        Ok(session) => session,
+                        Err(error) => {
+                            attempts = attempts.saturating_add(1);
+                            if attempts > policy.max_attempts() {
+                                let _ = task_readiness.send(Readiness::Stopped);
+                                return Err(error);
+                            }
+                            let _ = task_readiness.send(Readiness::Starting);
+                            let delay = policy.random_delay(attempts);
+                            tokio::select! {
+                                _ = &mut shutdown_rx => {
+                                    let _ = task_readiness.send(Readiness::Stopped);
+                                    return Ok(());
+                                }
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                            continue;
                         }
-                        _ = tokio::time::sleep(delay) => {}
                     }
-                    continue;
                 }
             };
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(300));
+            attempts = 0;
+            let _ = task_readiness.send(Readiness::Ready);
+            let mut heartbeat = tokio::time::interval(session.heartbeat_interval());
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
@@ -249,7 +261,6 @@ pub fn start_connected(
                     event = session.receive() => {
                         match event {
                             Ok(SessionEvent::Notification(notification)) => {
-                                attempts = 0;
                                 let bytes = notification_bytes(&notification);
                                 if bytes > MAX_NOTIFICATION_BYTES || !reserve_queue_bytes(&task_queued_bytes, bytes) {
                                     let _ = task_readiness.send(Readiness::Stopped);
@@ -291,7 +302,7 @@ pub fn start_connected(
                     }
                 }
             }
-            let delay = policy.delay(attempts, attempts);
+            let delay = policy.random_delay(attempts);
             tokio::select! {
                 _ = &mut shutdown_rx => {
                     let _ = task_readiness.send(Readiness::Stopped);

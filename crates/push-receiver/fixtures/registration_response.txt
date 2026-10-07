@@ -1,1 +1,1 @@
-token=legacy-registration-token
+token=APA91bFcmLegacyReferenceRegistrationToken-7f3a

@@ -110,12 +110,9 @@ pub fn decrypt_web_push(
         .map_err(|_| Error::DecryptionFailed)?
         .decrypt(&nonce, ciphertext)
         .map_err(|_| Error::DecryptionFailed)?;
-    if plaintext.len() < 2 {
-        return Err(Error::InvalidPadding);
-    }
     let padding = usize::from(u16::from_be_bytes([plaintext[0], plaintext[1]]));
     let start = 2usize.checked_add(padding).ok_or(Error::InvalidPadding)?;
-    if start > plaintext.len() || plaintext[2..start].iter().any(|byte| *byte != 0) {
+    if start >= plaintext.len() || plaintext[2..start].iter().any(|byte| *byte != 0) {
         return Err(Error::InvalidPadding);
     }
     Ok(plaintext[start..].to_vec())
@@ -170,6 +167,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn decrypts_external_legacy_aesgcm_vector_and_rejects_authenticated_padding() {
+        let material = WebPushKeyMaterial::from_base64(
+            "9FWl15_QUQAWDaD3k3l50ZBZQJ4au27F1V4F0uLSD_M",
+            "R29vIGdvbyBnJyBqb29iIQ",
+        );
+        assert!(material.is_ok());
+        let Ok(material) = material else {
+            return;
+        };
+        let ciphertext = include_str!("../fixtures/web_push_aesgcm.hex")
+            .split_whitespace()
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .collect::<Vec<_>>();
+        let malformed = include_str!("../fixtures/web_push_malformed_padding.hex")
+            .split_whitespace()
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .collect::<Vec<_>>();
+        let all_padding = include_str!("../fixtures/web_push_all_padding.hex")
+            .split_whitespace()
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .collect::<Vec<_>>();
+        let peer = "BNoRDbb84JGm8g5Z5CFxurSqsXWJ11ItfXEWYVLE85Y7CYkDjXsIEc4aqxYaQ1G8BqkXCJ6DPpDrWtdWj_mugHU";
+        let salt = "lngarbyKfMoi9Z75xYXmkg";
+        assert_eq!(
+            decrypt_web_push(&material, &format!("dh={peer}"), &format!("salt={salt}"), &ciphertext)
+                .ok(),
+            Some(b"I am the walrus".to_vec())
+        );
+        assert!(matches!(
+            decrypt_web_push(&material, &format!("dh={peer}"), &format!("salt={salt}"), &malformed),
+            Err(Error::InvalidPadding)
+        ));
+        assert!(matches!(
+            decrypt_web_push(&material, &format!("dh={peer}"), &format!("salt={salt}"), &all_padding),
+            Err(Error::InvalidPadding)
+        ));
     }
 
     #[test]

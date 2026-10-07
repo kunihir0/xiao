@@ -16,3 +16,7 @@ All notable externally meaningful changes are documented here. Releases follow S
 - Added the production FCM check-in/registration and TLS MCS connector with
   injected sessions, reconnect backoff, heartbeat handling, bounded byte
   budgets, and independent protocol fixtures.
+- Completed legacy `register3`/FCM subscribe interoperability with
+  authenticated check-in credentials, generated Web Push key material, MCS
+  stream acknowledgements, negotiated heartbeats, bounded cancellation, and
+  external `aesgcm` compatibility fixtures.

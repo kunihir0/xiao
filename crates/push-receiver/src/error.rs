@@ -4,6 +4,10 @@ use std::num::TryFromIntError;
 pub enum Error {
     #[error("invalid protocol state: {0}")]
     InvalidState(&'static str),
+    #[error("protocol failure: {0}")]
+    Protocol(String),
+    #[error("operation timed out: {0}")]
+    Timeout(&'static str),
     #[error("transport closed")]
     TransportClosed,
     #[error("TLS transport failed: {0}")]
