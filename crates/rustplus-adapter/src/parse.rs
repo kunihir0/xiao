@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use bot_domain::{
-    DeliveryId, EntityId, EntityPairing, Pairing, PlayerCredentials, PlayerId, PlayerToken,
-    ServerAddress,
+    DeliveryId, DomainError, EntityId, EntityPairing, Pairing, PlayerCredentials, PlayerId,
+    PlayerToken, ServerAddress,
 };
 use serde::Deserialize;
 
@@ -100,8 +100,17 @@ pub(crate) fn parse_notification(
                 let id = EntityId::new(parse_u32(id, "entityId")?)
                     .map_err(|_| ParseError::Domain("entityId"))?;
                 Some(
-                    EntityPairing::new(id, raw.entity_type, raw.entity_name)
-                        .map_err(|_| ParseError::Domain("entity"))?,
+                    EntityPairing::new(id, raw.entity_type, raw.entity_name).map_err(|error| {
+                        match error {
+                            DomainError::Invalid {
+                                field: "entity_type",
+                            } => ParseError::Domain("entityType"),
+                            DomainError::Invalid {
+                                field: "entity_name",
+                            } => ParseError::Domain("entityName"),
+                            DomainError::Invalid { .. } => ParseError::Domain("entity"),
+                        }
+                    })?,
                 )
             }
             (Some(_), _) => return Err(ParseError::Invalid("type")),
@@ -225,6 +234,7 @@ fn is_special_v4(address: Ipv4Addr) -> bool {
 mod tests {
     use super::{parse_notification, parse_public_ip};
     use crate::{ParseConfig, ParseError};
+    use bot_domain::{MAX_ENTITY_KIND_BYTES, MAX_ENTITY_NAME_BYTES};
 
     #[test]
     fn parses_number_and_string_forms_from_any_app_data_key() -> Result<(), ParseError> {
@@ -464,5 +474,55 @@ mod tests {
         assert!(parse_public_ip("8.8.8.8").is_ok());
         assert!(parse_public_ip("2001:4860:4860::8888").is_ok());
         assert!(parse_public_ip("[2001:4860:4860::8888]").is_ok());
+    }
+
+    fn entity_body(kind: &str, name: &str) -> String {
+        format!(
+            r#"{{"ip":"8.8.8.8","port":28015,"playerId":42,"playerToken":7,"entityId":1,"entityType":{kind:?},"entityName":{name:?},"type":"entity"}}"#
+        )
+    }
+
+    #[test]
+    fn entity_metadata_accepts_exact_limits_and_rejects_overflow() {
+        let exact = entity_body(
+            &"k".repeat(MAX_ENTITY_KIND_BYTES),
+            &"n".repeat(MAX_ENTITY_NAME_BYTES),
+        );
+        assert!(matches!(
+            parse_notification(&notification(&exact), &ParseConfig::default()),
+            Ok(Some(_))
+        ));
+
+        let kind_overflow = entity_body(
+            &"k".repeat(MAX_ENTITY_KIND_BYTES + 1),
+            &"n".repeat(MAX_ENTITY_NAME_BYTES),
+        );
+        assert_eq!(
+            parse_notification(&notification(&kind_overflow), &ParseConfig::default()),
+            Err(ParseError::Domain("entityType"))
+        );
+
+        let name_overflow = entity_body(
+            &"k".repeat(MAX_ENTITY_KIND_BYTES),
+            &"n".repeat(MAX_ENTITY_NAME_BYTES + 1),
+        );
+        assert_eq!(
+            parse_notification(&notification(&name_overflow), &ParseConfig::default()),
+            Err(ParseError::Domain("entityName"))
+        );
+    }
+
+    #[test]
+    fn entity_metadata_rejects_control_characters_without_values() {
+        for (kind, name, field) in [
+            ("kind\n", "name", "entityType"),
+            ("kind", "name\t", "entityName"),
+        ] {
+            let body = entity_body(kind, name);
+            let result = parse_notification(&notification(&body), &ParseConfig::default());
+            assert_eq!(result, Err(ParseError::Domain(field)));
+            assert!(!format!("{result:?}").contains(kind));
+            assert!(!format!("{result:?}").contains(name));
+        }
     }
 }

@@ -263,6 +263,73 @@ async fn one_pairing_becomes_active_and_readiness_is_truthful() -> Result<(), Do
 }
 
 #[tokio::test(start_paused = true)]
+async fn source_readiness_transition_to_ready_updates_service_without_pairing()
+-> Result<(), DomainError> {
+    let (source, sender) = FakePairingSource::new(8);
+    let source = source.with_readiness(bot_application::SourceReadiness::Starting);
+    let (service, handle) = PairingService::new(
+        source,
+        bot_test_support::FakeSessionConnector::new(),
+        FakePairingStore::default(),
+        config(),
+    );
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(service.run(cancellation.clone()));
+    settle().await;
+    assert_eq!(handle.readiness(), ServiceReadiness::Starting);
+
+    sender.set_readiness(bot_application::SourceReadiness::Ready);
+    settle().await;
+    assert_eq!(handle.readiness(), ServiceReadiness::Ready);
+
+    cancellation.cancel();
+    assert_eq!(
+        task.await
+            .map_err(|_| DomainError::Invalid { field: "join" })?,
+        Ok(())
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_stopped_and_failed_readiness_are_terminal_and_typed() -> Result<(), DomainError> {
+    for terminal in [
+        bot_application::SourceReadiness::Stopped,
+        bot_application::SourceReadiness::Failed,
+    ] {
+        let (source, sender) = FakePairingSource::new(8);
+        let source = source.with_readiness(bot_application::SourceReadiness::Starting);
+        let (service, handle) = PairingService::new(
+            source,
+            bot_test_support::FakeSessionConnector::new(),
+            FakePairingStore::default(),
+            config(),
+        );
+        let task = tokio::spawn(service.run(CancellationToken::new()));
+        settle().await;
+        sender.set_readiness(terminal);
+        let result = task
+            .await
+            .map_err(|_| DomainError::Invalid { field: "join" })?;
+        match terminal {
+            bot_application::SourceReadiness::Stopped => {
+                assert_eq!(result, Ok(()));
+                assert_eq!(handle.readiness(), ServiceReadiness::Stopped);
+            }
+            bot_application::SourceReadiness::Failed => {
+                assert_eq!(
+                    result,
+                    Err(ServiceError::Source(PairingSourceError::Failed))
+                );
+                assert_eq!(handle.readiness(), ServiceReadiness::Failed);
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn duplicate_delivery_and_structural_pairings_do_not_connect_twice() -> Result<(), DomainError>
 {
     let (source, sender) = FakePairingSource::new(8);
@@ -537,6 +604,34 @@ async fn source_failure_sets_failed_readiness_and_returns_typed_error() -> Resul
 }
 
 #[tokio::test(start_paused = true)]
+async fn source_readiness_changes_without_pairings_update_service() -> Result<(), DomainError> {
+    let (source, sender) = FakePairingSource::new(1);
+    let source = source.with_readiness(bot_application::SourceReadiness::Starting);
+    let (service, handle) = PairingService::new(
+        source,
+        bot_test_support::FakeSessionConnector::new(),
+        FakePairingStore::default(),
+        config(),
+    );
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(service.run(cancellation));
+    settle().await;
+    assert_eq!(handle.readiness(), ServiceReadiness::Starting);
+    sender.set_readiness(bot_application::SourceReadiness::Ready);
+    settle().await;
+    assert_eq!(handle.readiness(), ServiceReadiness::Ready);
+    sender.set_readiness(bot_application::SourceReadiness::Failed);
+    assert_eq!(
+        task.await
+            .map_err(|_| DomainError::Invalid { field: "join" })?,
+        Err(bot_application::ServiceError::Source(
+            bot_application::PairingSourceError::Failed,
+        ))
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn connect_timeout_removes_connecting_entry_and_drops_connect_task() -> Result<(), DomainError>
 {
     let (source, sender) = FakePairingSource::new(8);
@@ -693,6 +788,63 @@ async fn dedupe_ttl_expiry_allows_a_later_identical_push() -> Result<(), DomainE
         .await
         .map_err(|_| DomainError::Invalid { field: "sender" })?;
     assert_eq!(calls_at_least(&connector, 2).await.len(), 2);
+    cancellation.cancel();
+    assert_eq!(
+        task.await
+            .map_err(|_| DomainError::Invalid { field: "join" })?,
+        Ok(())
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_server_does_not_consume_max_server_capacity() -> Result<(), DomainError> {
+    let (source, sender) = FakePairingSource::new(8);
+    let connector = bot_test_support::FakeSessionConnector::new();
+    let first = pairing("failed-a.example", 14, 140, None, Some("failed-a"))?;
+    let (session, events) = bot_test_support::FakeSessionHandle::new(8, SessionReadiness::Ready);
+    connector.script(first.server_id().clone(), session).await;
+    let mut test_config = config();
+    test_config.max_servers = 1;
+    let (service, handle) = PairingService::new(
+        source,
+        connector.clone(),
+        FakePairingStore::default(),
+        test_config,
+    );
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(service.run(cancellation.clone()));
+
+    sender
+        .send(first)
+        .await
+        .map_err(|_| DomainError::Invalid { field: "sender" })?;
+    assert_eq!(calls_at_least(&connector, 1).await.len(), 1);
+    events
+        .send(SessionEvent::Terminated {
+            error: Some(SessionError::Transport),
+        })
+        .await
+        .map_err(|_| DomainError::Invalid { field: "event" })?;
+    settle().await;
+    assert_eq!(handle.sessions().len(), 1);
+    assert!(matches!(
+        handle.sessions()[0].state,
+        bot_application::SessionState::Failed { .. }
+    ));
+
+    let second = pairing("failed-b.example", 15, 150, None, Some("failed-b"))?;
+    let second_server = second.server_id().clone();
+    sender
+        .send(second)
+        .await
+        .map_err(|_| DomainError::Invalid { field: "sender" })?;
+    assert_eq!(calls_at_least(&connector, 2).await.len(), 2);
+    settle().await;
+    let snapshots = handle.sessions();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].server_id, second_server);
+
     cancellation.cancel();
     assert_eq!(
         task.await

@@ -13,6 +13,9 @@ pub struct PushPairingSource {
 }
 
 impl PushPairingSource {
+    /// Constructs the source and its readiness bridge on the current Tokio runtime.
+    ///
+    /// Callers must invoke this constructor from within a Tokio runtime.
     pub fn new(receiver: push_receiver::ReceiverHandle, config: ParseConfig) -> Self {
         let mut receiver_readiness = receiver.readiness_watch();
         let (readiness_tx, readiness) = watch::channel(map_readiness(*receiver_readiness.borrow()));
@@ -44,10 +47,10 @@ impl PairingSource for PushPairingSource {
 
     fn next<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<Pairing>, PairingSourceError>> {
         Box::pin(async move {
-            let receiver = self.receiver.as_mut().ok_or(PairingSourceError::Closed)?;
+            let receiver = self.receiver.as_mut().ok_or(PairingSourceError::Failed)?;
             loop {
                 let Some(notification) = receiver.recv().await else {
-                    return Err(PairingSourceError::Closed);
+                    return Err(PairingSourceError::Failed);
                 };
                 match parse_notification(&notification, &self.config) {
                     Ok(pairing) => return Ok(pairing),
@@ -115,6 +118,23 @@ mod tests {
             pairing.delivery_id().map(|delivery| delivery.as_str()),
             Some("delivery-typed")
         );
+        source.shutdown().await.expect("source shutdown");
+    }
+    #[tokio::test]
+    async fn readiness_bridge_tracks_receiver_ready_and_shutdown_joins() {
+        let (_sender, receiver_source) =
+            push_receiver::ReceiverSource::channel(1).expect("channel");
+        let receiver = push_receiver::start(receiver_source, 1, 8);
+        let mut source = PushPairingSource::new(receiver, ParseConfig::default());
+        let mut readiness = source.readiness_watch();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while *readiness.borrow() != SourceReadiness::Ready {
+                readiness.changed().await.expect("readiness bridge");
+            }
+        })
+        .await
+        .expect("receiver reaches ready");
+        assert_eq!(source.readiness(), SourceReadiness::Ready);
         source.shutdown().await.expect("source shutdown");
     }
 }

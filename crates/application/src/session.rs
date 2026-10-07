@@ -14,8 +14,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    PairingSource, PairingStore, ServiceError, ServiceReadiness, SessionConnector, SessionError,
-    SessionEvent, StoreError,
+    PairingSource, PairingSourceError, PairingStore, ServiceError, ServiceReadiness,
+    SessionConnector, SessionError, SessionEvent, StoreError,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +132,7 @@ pub struct PairingService<S, C> {
     workers: JoinSet<()>,
     key_hasher: RandomState,
     sessions: HashMap<ServerId, WorkerRecord>,
+    failed_order: VecDeque<ServerId>,
     dedupe: VecDeque<DedupeEntry>,
     next_session_id: u64,
 }
@@ -163,6 +164,7 @@ where
                 worker_rx,
                 workers: JoinSet::new(),
                 sessions: HashMap::new(),
+                failed_order: VecDeque::new(),
                 dedupe: VecDeque::new(),
                 next_session_id: 0,
                 key_hasher: RandomState::new(),
@@ -183,15 +185,45 @@ where
             self.readiness.send_replace(ServiceReadiness::Failed);
             return Err(ServiceError::Store(error));
         }
-        if self.source.readiness() == crate::SourceReadiness::Ready {
-            self.readiness.send_replace(ServiceReadiness::Ready);
-        }
-        loop {
-            if self.source.readiness() == crate::SourceReadiness::Ready {
+        let mut source_readiness = self.source.readiness_watch();
+        let initial_readiness = *source_readiness.borrow();
+        match initial_readiness {
+            crate::SourceReadiness::Ready => {
                 self.readiness.send_replace(ServiceReadiness::Ready);
             }
+            crate::SourceReadiness::Failed => {
+                return self
+                    .fail(ServiceError::Source(PairingSourceError::Failed))
+                    .await;
+            }
+            crate::SourceReadiness::Stopped => return self.stop().await,
+            crate::SourceReadiness::Starting => {}
+        }
+        loop {
             tokio::select! {
                 _ = cancellation.cancelled() => break self.stop().await,
+                readiness = source_readiness.changed() => match readiness {
+                    Ok(()) => {
+                        let readiness = *source_readiness.borrow();
+                        match readiness {
+                            crate::SourceReadiness::Ready => {
+                                self.readiness.send_replace(ServiceReadiness::Ready);
+                            }
+                            crate::SourceReadiness::Starting => {
+                                self.readiness.send_replace(ServiceReadiness::Starting);
+                            }
+                            crate::SourceReadiness::Stopped => {
+                                break self.stop().await;
+                            }
+                            crate::SourceReadiness::Failed => {
+                                break self
+                                    .fail(ServiceError::Source(PairingSourceError::Failed))
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(_) => break self.fail(ServiceError::SourceClosed).await,
+                },
                 message = self.worker_rx.recv() => if let Some(message) = message { self.handle_worker_message(message).await },
                 result = self.source.next() => match result {
                     Ok(Some(pairing)) => match self.handle_pairing(pairing).await {
@@ -212,6 +244,7 @@ where
         self.record_dedupe(&pairing);
         let server = pairing.server_id().clone();
         if let Some(record) = self.sessions.remove(&server) {
+            self.failed_order.retain(|failed| failed != &server);
             if record.pairing.same_credentials(&pairing)
                 && !matches!(record.state, SessionState::Failed { .. })
             {
@@ -228,8 +261,14 @@ where
             self.publish_snapshots();
             self.stop_record(record, false).await?;
         }
-        if self.sessions.len() >= self.config.max_servers {
+        if self.live_session_count() >= self.config.max_servers {
             return Err(ServiceError::Store(StoreError::Unavailable));
+        }
+        if self.sessions.len() >= self.config.max_servers {
+            self.evict_failed_record().await?;
+            if self.sessions.len() >= self.config.max_servers {
+                return Err(ServiceError::Store(StoreError::Unavailable));
+            }
         }
         self.store
             .upsert(&pairing)
@@ -285,20 +324,31 @@ where
         if record.session_id != session_id {
             return;
         }
-        match event {
-            SessionEvent::Ready => record.state = SessionState::Ready,
-            SessionEvent::Reconnecting => record.state = SessionState::Reconnecting,
+        let failed = match event {
+            SessionEvent::Ready => {
+                record.state = SessionState::Ready;
+                false
+            }
+            SessionEvent::Reconnecting => {
+                record.state = SessionState::Reconnecting;
+                false
+            }
             SessionEvent::Disconnected => {
                 record.state = SessionState::Failed {
                     reason: SessionError::Disconnected,
                 };
+                true
             }
             SessionEvent::Terminated { error } => {
                 record.state = SessionState::Failed {
                     reason: error.unwrap_or(SessionError::Failed),
                 };
+                true
             }
-            SessionEvent::Lagged { .. } => {}
+            SessionEvent::Lagged { .. } => false,
+        };
+        if failed && !self.failed_order.contains(&server) {
+            self.failed_order.push_back(server);
         }
         self.publish_snapshots();
     }
@@ -346,6 +396,36 @@ where
         self.next_session_id = self.next_session_id.wrapping_add(1).max(1);
         SessionId::new(self.next_session_id)
     }
+    fn live_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|record| !matches!(record.state, SessionState::Failed { .. }))
+            .count()
+    }
+
+    async fn evict_failed_record(&mut self) -> Result<(), ServiceError> {
+        let server = loop {
+            let Some(candidate) = self.failed_order.pop_front() else {
+                return Ok(());
+            };
+            if self
+                .sessions
+                .get(&candidate)
+                .is_some_and(|record| matches!(record.state, SessionState::Failed { .. }))
+            {
+                break candidate;
+            }
+        };
+        if let Some(record) = self.sessions.remove(&server) {
+            self.stop_record(record, false).await?;
+            self.store
+                .remove(&server)
+                .await
+                .map_err(ServiceError::Store)?;
+            self.publish_snapshots();
+        }
+        Ok(())
+    }
     async fn stop_record(&self, record: WorkerRecord, shutdown: bool) -> Result<(), ServiceError> {
         record.cancellation.cancel();
         match timeout(self.config.shutdown_timeout, record.finished).await {
@@ -371,6 +451,7 @@ where
     async fn stop(&mut self) -> Result<(), ServiceError> {
         self.readiness.send_replace(ServiceReadiness::Stopping);
         let source_result = timeout(self.config.shutdown_timeout, self.source.shutdown()).await;
+        self.failed_order.clear();
         let records: Vec<_> = self.sessions.drain().map(|(_, record)| record).collect();
         self.publish_snapshots();
         let mut failure = match source_result {
@@ -396,6 +477,7 @@ where
     async fn fail(&mut self, error: ServiceError) -> Result<(), ServiceError> {
         self.readiness.send_replace(ServiceReadiness::Failed);
         let _ = timeout(self.config.shutdown_timeout, self.source.shutdown()).await;
+        self.failed_order.clear();
         let records: Vec<_> = self.sessions.drain().map(|(_, record)| record).collect();
         self.publish_snapshots();
         for record in records {
@@ -512,9 +594,13 @@ async fn run_worker<C: SessionConnector + 'static>(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::structural_key;
-    use bot_domain::{Pairing, PlayerCredentials, PlayerId, PlayerToken, ServerAddress};
+    use bot_domain::{
+        DomainError, EntityId, EntityPairing, MAX_ENTITY_KIND_BYTES, MAX_ENTITY_NAME_BYTES,
+        Pairing, PlayerCredentials, PlayerId, PlayerToken, ServerAddress,
+    };
     use std::hash::RandomState;
 
     #[test]
@@ -533,5 +619,32 @@ mod tests {
         );
         let key = structural_key(&pairing, &RandomState::new());
         assert!(!format!("{key:?}").contains("123456789"));
+    }
+    #[test]
+    fn structural_key_retains_only_bounded_entity_metadata() -> Result<(), DomainError> {
+        let address = ServerAddress::new("8.8.8.8", 28_015)?;
+        let player_id = PlayerId::new(42)?;
+        let entity = EntityPairing::new(
+            EntityId::new(1)?,
+            Some("k".repeat(MAX_ENTITY_KIND_BYTES)),
+            Some("n".repeat(MAX_ENTITY_NAME_BYTES)),
+        )?;
+        let pairing = Pairing::new(
+            address,
+            PlayerCredentials::new(player_id, PlayerToken::new(7)),
+            Some(entity),
+            None,
+        );
+        let key = structural_key(&pairing, &RandomState::new());
+        let entity = key.entity.ok_or(DomainError::Invalid { field: "entity" })?;
+        assert_eq!(
+            entity.kind.as_deref().map(str::len),
+            Some(MAX_ENTITY_KIND_BYTES)
+        );
+        assert_eq!(
+            entity.name.as_deref().map(str::len),
+            Some(MAX_ENTITY_NAME_BYTES)
+        );
+        Ok(())
     }
 }

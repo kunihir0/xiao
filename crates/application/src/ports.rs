@@ -70,6 +70,7 @@ pub trait PairingStore: Send + Sync {
 pub enum PairingSourceError {
     Receiver(String),
     Parse(String),
+    Failed,
     Closed,
     Shutdown(String),
 }
@@ -79,6 +80,7 @@ impl std::fmt::Display for PairingSourceError {
         match self {
             Self::Receiver(message) => write!(formatter, "pairing receiver failure: {message}"),
             Self::Parse(message) => write!(formatter, "pairing parse failure: {message}"),
+            Self::Failed => formatter.write_str("pairing source failed"),
             Self::Closed => formatter.write_str("pairing source closed"),
             Self::Shutdown(message) => {
                 write!(formatter, "pairing source shutdown failure: {message}")
