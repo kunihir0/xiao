@@ -92,7 +92,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE xiao_migrator IN SCHEMA public
 export XIAO_IMAGE='registry.example.invalid/xiao/bot:0.2.0@sha256:<manifest>'
 scripts/validate-production-env.sh
 docker compose --env-file /run/secrets/xiao-production.env \
-  -f deploy/production/compose.yml run --rm bot migrate
+  -f deploy/production/compose.yml run --rm migrate
 docker compose --env-file /run/secrets/xiao-production.env \
   -f deploy/production/compose.yml up -d bot
 docker compose --env-file /run/secrets/xiao-production.env \

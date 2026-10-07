@@ -1,6 +1,11 @@
 name: oci-build
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/oci-build.yml"
+      - "deploy/production/**"
+      - "scripts/validate-production-env.sh"
   workflow_dispatch:
     inputs:
       image_tag:
@@ -38,13 +43,37 @@ jobs:
             --output type=oci,dest=xiao-oci.tar \
             .
       - name: Inspect image metadata and record digests
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
         run: |
           set -euo pipefail
           tar -tf xiao-oci.tar
           tar -xOf xiao-oci.tar index.json | jq . > oci-index.json
-          cat oci-index.json
+          : > oci-metadata.txt
+          count=0
+          while IFS=$'\t' read -r platform digest; do
+            hash=${digest#sha256:}
+            manifest=$(tar -xOf xiao-oci.tar "blobs/sha256/$hash")
+            config_digest=$(jq -r '.config.digest' <<<"$manifest")
+            config_hash=${config_digest#sha256:}
+            config=$(tar -xOf xiao-oci.tar "blobs/sha256/$config_hash")
+            revision=$(jq -r '.config.Labels[\"org.opencontainers.image.revision\"] // empty' <<<"$config")
+            test "$revision" = "$EXPECTED_REVISION"
+            printf '%s manifest=%s config=%s revision=%s\n' \
+              "$platform" "$digest" "$config_digest" "$revision" | tee -a oci-metadata.txt
+            count=$((count + 1))
+          done < <(
+            jq -r '.manifests[]
+              | select(.platform.os == \"linux\")
+              | select(.platform.architecture == \"amd64\" or .platform.architecture == \"arm64\")
+              | [.platform.os + \"/\" + .platform.architecture, .digest]
+              | @tsv' oci-index.json
+          )
+          test "$count" -eq 2
       - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
-          name: oci-metadata
-          path: oci-index.json
+          name: oci-metadata-${{ github.sha }}
+          path: |
+            oci-index.json
+            oci-metadata.txt
           if-no-files-found: error

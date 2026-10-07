@@ -54,11 +54,14 @@ smoke environments; production MUST use `DISCORD_TOKEN_FILE` and
    certificate and hostname verification, a restricted runtime role, a
    separate migration role, automated backups, and enough connections for the
    bot's bounded pool (the current default is eight).
-2. Mount secret-manager files with permissions that are readable by UID 10001
-   but not writable. Copy `.env.example` to an access-controlled, untracked
-   deployment environment file; it contains file paths, never credentials.
-   Kubernetes or another orchestrator MUST mount equivalent read-only files at
-   the `*_FILE` paths and set the same environment variables.
+2. Mount secret-manager files owned by numeric UID/GID `10001:10001`, mode
+   `0400`, regular (not symlinks), and non-empty. Compose's local-file secret
+   implementation may ignore its `uid`/`gid`/`mode` declarations, so the host
+   source files MUST already have this ownership and mode; the validator and
+   application enforce it. Copy `.env.example` to an access-controlled,
+   untracked deployment environment file; it contains file paths, never
+   credentials. Kubernetes or another orchestrator MUST mount equivalent files
+   at the `*_FILE` paths and set the same environment variables.
 3. Set `XIAO_IMAGE` to the promoted immutable digest. Run the validator:
 
    ```console
@@ -72,7 +75,7 @@ smoke environments; production MUST use `DISCORD_TOKEN_FILE` and
 
    ```console
    docker compose --env-file /run/secrets/xiao-production.env \
-     -f deploy/production/compose.yml run --rm bot migrate
+     -f deploy/production/compose.yml run --rm migrate
    ```
 
 5. Start the single bot application container with the same image and its
@@ -88,11 +91,12 @@ smoke environments; production MUST use `DISCORD_TOKEN_FILE` and
    finite startup failures; inspect logs and resolve the cause instead of
    hiding migration, configuration, or outage failures behind an infinite loop.
 
-Compose's `entrypoint.sh` reads required credentials from read-only mounted
-`*_FILE` paths, rejects direct value plus file collisions, rejects missing,
-empty, or writable required files, and then `exec`s the bot. The optional
-Rust+/FCM file may be empty to disable pairing until #16 credential persistence
-lands. Never put tokens in image layers, Git, command arguments, or logs.
+`xiao-bot` itself validates and reads owner-only `*_FILE` mounts without
+copying secret values into its environment. The entrypoint is an `exec`-only
+shim so `migrate` can load only DDL configuration while the bot loads only
+runtime configuration. Optional Rust+ credential mounts are added by #16;
+until then pairing remains disabled. Never put tokens in image layers, Git,
+command arguments, or logs.
 Rotation is documented in `docs/operations/credential-rotation.md`.
 
 ## Runtime semantics

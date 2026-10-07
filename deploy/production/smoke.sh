@@ -6,9 +6,11 @@ set -Eeuo pipefail
 : "${DATABASE_URL:?set DATABASE_URL to a disposable PostgreSQL database}"
 : "${IMAGE:?set IMAGE to the immutable image under test}"
 : "${DISCORD_TOKEN:?set DISCORD_TOKEN to a disposable test token}"
+smoke_uid=$(id -u)
+smoke_gid=$(id -g)
+
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-XIAO_IMAGE="$IMAGE" "$repo_root/scripts/validate-production-env.sh"
 
 printf '%s\n' '== six repository gates =='
 cargo fmt --all -- --check
@@ -17,7 +19,6 @@ cargo nextest run --workspace --all-features --no-tests=pass
 cargo deny check
 cargo shear
 cargo nextest run -p bot-db --all-features --run-ignored all
-
 printf '%s\n' '== startup, process health, and SIGTERM smoke =='
 secret_dir=$(mktemp -d)
 env_file=$(mktemp)
@@ -29,6 +30,24 @@ trap cleanup EXIT
 umask 077
 printf '%s' "$DISCORD_TOKEN" > "$secret_dir/discord_token"
 printf '%s' "$DATABASE_URL" > "$secret_dir/database_url"
+printf '%s' "$DATABASE_URL" > "$secret_dir/migration_database_url"
+# Exercise the owner-only file contract with the smoke process's non-root uid.
+# Production Compose uses uid/gid 10001; Docker Desktop bind mounts preserve the
+# host uid, so the smoke container explicitly runs as that same non-root owner.
+docker run --rm --user 0:0 \
+  --mount "type=bind,src=$secret_dir,dst=/secrets" \
+  alpine:3.22.2@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1 \
+  chown -R "$smoke_uid:$smoke_gid" /secrets
+chmod 0400 "$secret_dir"/*
+
+XIAO_IMAGE="$IMAGE" \
+XIAO_RUNTIME_UID="$smoke_uid" \
+DISCORD_TOKEN_FILE="$secret_dir/discord_token" \
+DATABASE_URL_FILE="$secret_dir/database_url" \
+MIGRATION_DATABASE_URL_FILE="$secret_dir/migration_database_url" \
+DATABASE_TLS_MODE=insecure \
+  "$repo_root/scripts/validate-production-env.sh"
+
 printf '%s\n' \
   'DISCORD_TOKEN_FILE=/run/secrets/discord_token' \
   'DATABASE_URL_FILE=/run/secrets/database_url' \
@@ -38,6 +57,7 @@ printf '%s\n' \
 # Values are written to protected temporary files; they never appear in docker
 # CLI arguments or process listings.
 docker run -d --name xiao-smoke \
+  --user "$smoke_uid:$smoke_gid" \
   --env-file "$env_file" \
   --mount "type=bind,src=$secret_dir/discord_token,dst=/run/secrets/discord_token,readonly" \
   --mount "type=bind,src=$secret_dir/database_url,dst=/run/secrets/database_url,readonly" \

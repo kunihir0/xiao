@@ -7,12 +7,9 @@ secrets:
   database_url:
     file: "${DATABASE_URL_FILE:?set DATABASE_URL_FILE to a secret-manager-mounted file}"
   migration_database_url:
-    file: "${MIGRATION_DATABASE_URL_FILE:-/dev/null}"
+    file: "${MIGRATION_DATABASE_URL_FILE:?set MIGRATION_DATABASE_URL_FILE to the DDL-role secret file}"
   database_ca:
-    file: "${DATABASE_CA_SOURCE:-/dev/null}"
-  rustplus_fcm_sender_id:
-    # /dev/null means disabled until #16 credential persistence is deployed.
-    file: "${RUSTPLUS_FCM_SENDER_ID_FILE:-/dev/null}"
+    file: "${DATABASE_CA_SOURCE:?set DATABASE_CA_SOURCE to the PostgreSQL CA bundle}"
 
 services:
   # One-shot migration job run before deploying the bot container.
@@ -39,10 +36,14 @@ services:
     secrets:
       - source: migration_database_url
         target: migration_database_url
-        mode: 0444
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
       - source: database_ca
         target: database_ca
-        mode: 0444
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
     deploy:
       resources:
         limits:
@@ -69,22 +70,24 @@ services:
       DATABASE_CA_FILE: /run/secrets/database_ca
       DATABASE_TLS_MODE: "${DATABASE_TLS_MODE:-verify-full}"
       DATABASE_MIGRATE_ON_STARTUP: "${DATABASE_MIGRATE_ON_STARTUP:-false}"
-      RUSTPLUS_FCM_SENDER_ID_FILE: /run/secrets/rustplus_fcm_sender_id
       RUST_LOG: "${RUST_LOG:-info}"
       TELEMETRY_FORMAT: "${TELEMETRY_FORMAT:-json}"
     secrets:
       - source: discord_token
         target: discord_token
-        mode: 0444
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
       - source: database_url
         target: database_url
-        mode: 0444
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
       - source: database_ca
         target: database_ca
-        mode: 0444
-      - source: rustplus_fcm_sender_id
-        target: rustplus_fcm_sender_id
-        mode: 0444
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
     stop_grace_period: 30s
     deploy:
       resources:
