@@ -28,6 +28,7 @@ pub use checkin::{
 pub const LEGACY_MCS_VERSION: u8 = codec::LEGACY_MCS_VERSION;
 pub const MAX_FRAME_SIZE: usize = codec::MAX_FRAME_SIZE;
 pub const MCS_VERSION: u8 = codec::MCS_VERSION;
+pub use crypto::{WebPushKeyMaterial, decrypt_web_push};
 pub use dedupe::{
     MAX_DEDUPE_BYTES, MAX_DEDUPE_CAPACITY, MAX_PERSISTENT_ID_BYTES, PersistentIdWindow,
 };
