@@ -2,11 +2,11 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::BytesMut;
-use prost::Message;
 use p256::{
     SecretKey,
     elliptic_curve::{Generate, sec1::ToSec1Point},
 };
+use prost::Message;
 use rand::{RngExt, rng};
 use reqwest::{Client, Response};
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
@@ -16,6 +16,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio_util::codec::Decoder;
 use uuid::Uuid;
 
 use crate::{
@@ -65,11 +66,7 @@ async fn bounded_body(mut response: Response, maximum: usize) -> Result<Vec<u8>>
         });
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(http_error)?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(http_error)? {
         let actual = body.len().saturating_add(chunk.len());
         if actual > maximum {
             return Err(Error::FrameTooLarge {
@@ -584,14 +581,12 @@ mod tests {
 
     #[test]
     fn connector_debug_redacts_custom_endpoint_urls() {
-        let connector = FcmConnector::new("sender")
-            .ok()
-            .map(|connector| {
-                connector.with_endpoints(
-                    "https://secret.example/checkin?token=secret",
-                    "https://secret.example/register",
-                )
-            });
+        let connector = FcmConnector::new("sender").ok().map(|connector| {
+            connector.with_endpoints(
+                "https://secret.example/checkin?token=secret",
+                "https://secret.example/register",
+            )
+        });
         assert!(connector.is_some());
         if let Some(connector) = connector {
             let debug = format!("{connector:?}");

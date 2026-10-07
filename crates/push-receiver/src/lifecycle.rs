@@ -93,9 +93,7 @@ impl ReceiverSourceSender {
     /// after a channel permit is available, so canceled sends cannot leak
     /// source-budget accounting.
     pub async fn send(&self, item: Result<Notification>) -> Result<()> {
-        let bytes = item
-            .as_ref()
-            .map_or(0, |notification| notification_bytes(notification));
+        let bytes = item.as_ref().map_or(0, notification_bytes);
         if bytes > MAX_NOTIFICATION_BYTES {
             return Err(Error::NotificationTooLarge);
         }
@@ -173,6 +171,7 @@ pub fn start_with_policy(
             queued_bytes: source_queued_bytes,
         } = source;
         let mut source = source_input;
+        let mut dedupe = PersistentIdWindow::new(dedupe_capacity);
         let mut attempts: u32 = 0;
         task_readiness
             .send(Readiness::Ready)
@@ -359,11 +358,9 @@ pub fn start_connected(
                                 }
                             }
                             Ok(SessionEvent::Closed) => {
-                                attempts = attempts.saturating_add(1);
-                                if attempts > policy.max_attempts() {
-                                    let _ = task_readiness.send(Readiness::Stopped);
-                                    return Err(Error::TransportClosed);
-                                }
+                                // A clean session close follows a successful
+                                // session, so reconnect failures start fresh.
+                                attempts = 0;
                                 let _ = task_readiness.send(Readiness::Starting);
                                 break;
                             }
@@ -475,9 +472,20 @@ mod tests {
         };
         let handle = start(source, 1, 2);
         tokio::task::yield_now().await;
-        assert!(sender.send(Ok(Notification::new(vec![1], None))).await.is_ok());
-        assert!(sender.send(Ok(Notification::new(vec![2], None))).await.is_ok());
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle.shutdown()).await;
+        assert!(
+            sender
+                .send(Ok(Notification::new(vec![1], None)))
+                .await
+                .is_ok()
+        );
+        assert!(
+            sender
+                .send(Ok(Notification::new(vec![2], None)))
+                .await
+                .is_ok()
+        );
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle.shutdown()).await;
         assert!(matches!(result, Ok(Ok(()))));
     }
 
@@ -534,17 +542,18 @@ mod tests {
         let connector = Arc::new(ResetProbeConnector {
             calls: Arc::clone(&calls),
         });
-        let policy = RetryPolicy::new(
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-            0,
-        )
-        .with_max_attempts(1);
+        let policy = RetryPolicy::new(std::time::Duration::ZERO, std::time::Duration::ZERO, 0)
+            .with_max_attempts(1);
         let handle = start_connected(connector, 1, 1, policy);
-        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            if calls.load(Ordering::Acquire) >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 3);
         let result = handle.shutdown().await;
         assert!(matches!(result, Err(Error::TransportClosed)));
-        assert_eq!(calls.load(Ordering::Acquire), 3);
     }
     #[test]
     fn rejects_zero_source_capacity() {
