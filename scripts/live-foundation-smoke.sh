@@ -318,6 +318,12 @@ cleanup() {
   # mounts cannot remain attached to a stopped container. Preserve disposable
   # PostgreSQL containers and private diagnostics on failure for inspection.
   if [[ "${container_started:-false}" == true && -n "${container_name:-}" ]]; then
+  if [[ "$exit_code" -ne 0 && "${container_started:-false}" == true \
+    && -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
+    docker logs "$container_name" >"$tmp_dir/bot.log" 2>&1 || true
+    docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$container_name" \
+      >"$tmp_dir/bot-state" 2>/dev/null || true
+  fi
     docker stop --time 30 "$container_name" >/dev/null 2>&1 || true
     docker rm "$container_name" >/dev/null 2>&1 || true
   fi
