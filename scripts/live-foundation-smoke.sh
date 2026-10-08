@@ -44,7 +44,8 @@ EOF
 current_check=preflight
 fail() {
   local reason=$*
-  if [[ -n "${manifest:-}" && -f "$manifest" ]]; then
+  if declare -F record >/dev/null 2>&1 \
+    && [[ -n "${manifest:-}" && -f "$manifest" ]]; then
     record "${current_check:-preflight}" fail "$reason"
   fi
   printf 'live-foundation-smoke: %s\n' "$reason" >&2
@@ -249,6 +250,7 @@ if [[ -z "$discord_env_file" ]]; then
   [[ -z "${DISCORD_TOKEN:-}" ]] || fail 'DISCORD_TOKEN must not be set directly; use DISCORD_TOKEN_FILE'
 fi
 [[ -z "${DATABASE_URL_CONTAINER_FILE:-}" ]] || fail 'DATABASE_URL_CONTAINER_FILE is harness-generated only'
+command -v jq >/dev/null 2>&1 || fail 'jq is required for redacted JSON evidence'
 
 # Secret files validation for preflight
 secret_files=()
@@ -705,6 +707,7 @@ migration_count_before=${migration_count_before//[[:space:]]/}
 record schema-current pass "fresh schema has embedded migration metadata ($migration_count_before migrations)"
 
 # 5. Runtime DDL denials (actual attempted CREATE, ALTER, DROP, GRANT)
+current_check=runtime-ddl
 runtime_err="$tmp_dir/runtime_err.log"
 
 # Attempt CREATE TABLE
@@ -735,6 +738,7 @@ grep -Eiq 'permission denied|must be owner' "$runtime_err" || fail 'runtime GRAN
 record runtime-ddl-denied pass 'runtime CREATE, ALTER, DROP, and GRANT attempts were denied with authorization errors'
 
 # 6. Runtime DML positive test: insert and read back
+current_check=runtime-dml
 test_row_id="11111111-2222-3333-4444-555555555555"
 run_psql_query runtime "INSERT INTO public.rustplus_push_credentials (id, steam_id, device_id, state, format_version, algorithm, key_id, wrapped_dek, nonce, ciphertext) VALUES ('$test_row_id', 76561198000000001, 'dev1', 'pending', 1, 'aes-256-gcm-siv', 'key1', '\x0102', '\x010203040506070809101112', '\x0102030405060708091011121314151617');" >/dev/null
 readback_count=$(run_psql_query runtime "SELECT count(*) FROM public.rustplus_push_credentials WHERE id = '$test_row_id';")
@@ -743,6 +747,7 @@ readback_count=${readback_count//[[:space:]]/}
 record runtime-dml-positive pass 'runtime role performed authorized application DML insert and select'
 
 # 7. Runtime readiness & reconnect
+current_check=readiness-reconnect
 run_psql_query runtime 'SELECT 1;' >/dev/null || fail 'runtime readiness SELECT 1 failed'
 record readiness pass 'runtime PostgreSQL readiness SELECT 1 succeeded'
 

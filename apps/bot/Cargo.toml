@@ -27,6 +27,7 @@ rustplus-client = { version = "0.1.0", path = "../../crates/rustplus-client" }
 tracing.workspace = true
 bot-domain = { version = "0.1.0", path = "../../crates/domain" }
 zeroize = { workspace = true, optional = true }
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

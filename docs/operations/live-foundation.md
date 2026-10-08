@@ -11,6 +11,9 @@ without printing values. The host-side Discord inspection binary is built with
 the `live-acceptance` feature; the production bot image does not include that
 inspection mode. Never run this harness against production.
 
+Prerequisites include `bash`, `jq`, `python3`, `psql`, `openssl`, and Docker
+when disposable containers are used.
+
 ## Safety gate and evidence
 
 Before the first Discord connection, the coordinator MUST send and receive an

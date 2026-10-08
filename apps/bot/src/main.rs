@@ -333,13 +333,9 @@ async fn run_discord_acceptance(args: DiscordAcceptanceArgs) -> Result<(), BoxEr
     match args.action {
         DiscordAcceptanceAction::ListGuilds => {
             let guilds = client.list_guilds().await?;
-            let items: Vec<String> = guilds
-                .iter()
-                .map(|(id, name)| format!(r#"{{"id":{},"name":"{}"}}"#, id, name))
-                .collect();
             println!(
-                r#"{{"status":"pass","action":"list_guilds","guilds":[{}]}}"#,
-                items.join(",")
+                "{}",
+                serde_json::json!({"status":"pass","action":"list_guilds","guilds": guilds.iter().map(|(id,name)| serde_json::json!({"id":id,"name":name})).collect::<Vec<_>>()})
             );
         }
         _ => {
@@ -369,21 +365,24 @@ async fn run_discord_acceptance(args: DiscordAcceptanceArgs) -> Result<(), BoxEr
                     let global_ping = client.count_global_ping().await?;
                     let guild_ping = client.count_guild_ping(guild_id).await?;
                     println!(
-                        r#"{{"status":"pass","action":"inspect","application_id":{},"bot_username":"{}","bot_user_id":{},"guild_id":{},"guild_name":"{}","global_ping_count":{},"guild_ping_count":{}}}"#,
-                        identity.application_id,
-                        identity.bot_username,
-                        identity.bot_user_id,
-                        identity.guild_id,
-                        identity.guild_name,
-                        global_ping,
-                        guild_ping,
+                        "{}",
+                        serde_json::json!({
+                            "status":"pass","action":"inspect",
+                            "application_id":identity.application_id,
+                            "bot_username":identity.bot_username,
+                            "bot_user_id":identity.bot_user_id,
+                            "guild_id":identity.guild_id,
+                            "guild_name":identity.guild_name,
+                            "global_ping_count":global_ping,
+                            "guild_ping_count":guild_ping
+                        })
                     );
                 }
                 DiscordAcceptanceAction::EnsureGuildPing => {
                     let (command_id, created) = client.ensure_guild_ping(guild_id).await?;
                     println!(
-                        r#"{{"status":"pass","action":"ensure_guild_ping","guild_id":{},"command_id":{},"created":{}}}"#,
-                        guild_id, command_id, created
+                        "{}",
+                        serde_json::json!({"status":"pass","action":"ensure_guild_ping","guild_id":guild_id,"command_id":command_id,"created":created})
                     );
                 }
                 DiscordAcceptanceAction::CleanupGuildPing { command_id } => {
@@ -392,8 +391,8 @@ async fn run_discord_acceptance(args: DiscordAcceptanceArgs) -> Result<(), BoxEr
                         .await?;
                     client.delete_guild_command(guild_id, command_id).await?;
                     println!(
-                        r#"{{"status":"pass","action":"cleanup_guild_ping","guild_id":{},"command_id":{}}}"#,
-                        guild_id, command_id
+                        "{}",
+                        serde_json::json!({"status":"pass","action":"cleanup_guild_ping","guild_id":guild_id,"command_id":command_id})
                     );
                 }
                 DiscordAcceptanceAction::VerifyAll => {
@@ -405,16 +404,19 @@ async fn run_discord_acceptance(args: DiscordAcceptanceArgs) -> Result<(), BoxEr
                     let (command_id, created) = client.ensure_guild_ping(guild_id).await?;
                     let guild_ping = client.count_guild_ping(guild_id).await?;
                     println!(
-                        r#"{{"status":"pass","action":"verify_all","application_id":{},"bot_username":"{}","bot_user_id":{},"guild_id":{},"guild_name":"{}","global_ping_count":{},"guild_ping_count":{},"guild_ping_id":{},"guild_ping_created":{}}}"#,
-                        identity.application_id,
-                        identity.bot_username,
-                        identity.bot_user_id,
-                        identity.guild_id,
-                        identity.guild_name,
-                        global_ping,
-                        guild_ping,
-                        command_id,
-                        created,
+                        "{}",
+                        serde_json::json!({
+                            "status":"pass","action":"verify_all",
+                            "application_id":identity.application_id,
+                            "bot_username":identity.bot_username,
+                            "bot_user_id":identity.bot_user_id,
+                            "guild_id":identity.guild_id,
+                            "guild_name":identity.guild_name,
+                            "global_ping_count":global_ping,
+                            "guild_ping_count":guild_ping,
+                            "guild_ping_id":command_id,
+                            "guild_ping_created":created
+                        })
                     );
                 }
             }
@@ -729,5 +731,15 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn acceptance_json_serializes_control_characters() {
+        let value = serde_json::json!({"guild_name":"quote\" newline\n control\u{0001}"});
+        let encoded = value.to_string();
+        assert!(encoded.contains("\\\""));
+        assert!(encoded.contains("\\n"));
+        assert!(encoded.contains("\\u0001"));
+        assert!(!encoded.contains('\u{0001}'));
     }
 }
