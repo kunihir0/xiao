@@ -110,6 +110,13 @@ fn cli_rejects_pairing_app_data_mutations() {
 }
 
 #[test]
+fn cli_rejects_short_fcm_subscribe_endpoint() {
+    let mut bad: serde_json::Value = serde_json::from_str(EMBEDDED_FIXTURE).expect("fixture");
+    bad["routes"][0]["current"]["steps"][2]["endpoint"] = serde_json::Value::String("x".to_owned());
+    let output = run_stdin(&bad.to_string());
+    assert_eq!(output.status.code(), Some(1));
+}
+#[test]
 fn cli_oversized_stdin_rejected() {
     let output = run_stdin(&" ".repeat(65537));
     assert_eq!(output.status.code(), Some(1));

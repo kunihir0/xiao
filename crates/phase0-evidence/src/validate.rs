@@ -429,6 +429,11 @@ fn validate_enrollment_route(
     let cur_fcm = &route.current.steps[2];
     let cur_expo = &route.current.steps[3];
     let mod_expo = &route.modern.steps[3];
+    if cur_fcm.endpoint != "https://fcm.googleapis.com/fcm/connect/subscribe" {
+        return Err(EvidenceError::Malformed(
+            "FCM subscribe endpoint is not approved".to_owned(),
+        ));
+    }
     if cur_fcm.method != "POST" || cur_expo.method != "POST" || mod_expo.method != "POST" {
         return Err(EvidenceError::Malformed(
             "enrollment HTTP methods must be POST".to_owned(),
