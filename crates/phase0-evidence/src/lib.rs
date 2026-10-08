@@ -38,7 +38,7 @@ impl fmt::Display for EvidenceError {
 
 impl std::error::Error for EvidenceError {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
     schema_version: u32,
@@ -54,11 +54,12 @@ struct Source {
     name: String,
     repository: String,
     commit_or_version: String,
+    path: String,
     reviewed_on: String,
     classification: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Route {
     name: String,
@@ -117,10 +118,12 @@ struct Classification {
 
 #[derive(Debug, Serialize)]
 struct Retention {
-    max_days: u32,
+    generated_artifact_max_days: u32,
+    checked_in_fixture_retention: &'static str,
     raw_payloads_persisted: bool,
     manifest_retained: bool,
     redaction_before_hash: bool,
+    checksum_not_authenticity: bool,
 }
 
 /// Render the checked-in Phase 0 evidence manifest.
@@ -133,8 +136,17 @@ pub fn render_embedded() -> Result<String, EvidenceError> {
 /// The input is expected to already contain redacted fixtures. This function
 /// never writes a raw fixture or attempts to redact one after the fact.
 pub fn render(input: &str) -> Result<String, EvidenceError> {
+    if input.len() > 256 * 1024 {
+        return Err(EvidenceError::Malformed(
+            "fixture exceeds 256 KiB".to_owned(),
+        ));
+    }
     let parsed: Input =
         serde_json::from_str(input).map_err(|error| EvidenceError::Json(error.to_string()))?;
+    validate_limits(&parsed)?;
+    let parsed_value =
+        serde_json::to_value(&parsed).map_err(|error| EvidenceError::Json(error.to_string()))?;
+    scan_value(&parsed_value, "fixture")?;
     validate_input(&parsed)?;
 
     let mut routes = Vec::with_capacity(parsed.routes.len());
@@ -161,7 +173,7 @@ pub fn render(input: &str) -> Result<String, EvidenceError> {
             facts: vec![
                 "fixture source references and route contracts are pinned in this repository",
                 "current and modern payloads passed structural and redaction validation",
-                "artifact hashes are SHA-256 over canonical redacted JSON",
+                "artifact hashes are SHA-256 checksums over canonical redacted JSON, not authenticity proofs",
             ],
             inferences: vec![
                 "modern route shape may differ from the legacy current route",
@@ -170,16 +182,49 @@ pub fn render(input: &str) -> Result<String, EvidenceError> {
             live_proof: Vec::new(),
         },
         retention: Retention {
-            max_days: parsed.retention_days,
+            generated_artifact_max_days: parsed.retention_days,
+            checked_in_fixture_retention: "indefinite in Git history",
             raw_payloads_persisted: false,
             manifest_retained: true,
             redaction_before_hash: true,
+            checksum_not_authenticity: true,
         },
         manifest_sha256: String::new(),
     };
     let without_hash = canonical_json(&manifest)?;
     manifest.manifest_sha256 = sha256(without_hash.as_bytes());
     canonical_json(&manifest)
+}
+
+fn validate_limits(input: &Input) -> Result<(), EvidenceError> {
+    let value =
+        serde_json::to_value(input).map_err(|error| EvidenceError::Json(error.to_string()))?;
+    fn walk(value: &Value, depth: usize, count: &mut usize) -> Result<(), EvidenceError> {
+        if depth > 64 {
+            return Err(EvidenceError::Malformed(
+                "fixture nesting exceeds 64 levels".to_owned(),
+            ));
+        }
+        *count += 1;
+        if *count > 4096 {
+            return Err(EvidenceError::Malformed(
+                "fixture has too many values".to_owned(),
+            ));
+        }
+        match value {
+            Value::String(text) if text.len() > 4096 => Err(EvidenceError::Malformed(
+                "fixture string exceeds 4096 bytes".to_owned(),
+            )),
+            Value::Object(object) => object
+                .values()
+                .try_for_each(|child| walk(child, depth + 1, count)),
+            Value::Array(values) => values
+                .iter()
+                .try_for_each(|child| walk(child, depth + 1, count)),
+            _ => Ok(()),
+        }
+    }
+    walk(&value, 0, &mut 0)
 }
 
 fn validate_input(input: &Input) -> Result<(), EvidenceError> {
@@ -206,6 +251,7 @@ fn validate_input(input: &Input) -> Result<(), EvidenceError> {
     for source in &input.sources {
         if source.repository.is_empty()
             || source.commit_or_version.is_empty()
+            || source.path.is_empty()
             || source.reviewed_on != input.snapshot_date
             || source.classification != "fact"
         {
@@ -230,6 +276,11 @@ fn validate_input(input: &Input) -> Result<(), EvidenceError> {
             "route names must be unique".to_owned(),
         ));
     }
+    let source_names: BTreeSet<_> = input
+        .sources
+        .iter()
+        .map(|source| source.name.as_str())
+        .collect();
     for required in REQUIRED_ROUTES {
         if !names.contains(required) {
             return Err(EvidenceError::Malformed(format!(
@@ -246,6 +297,14 @@ fn validate_input(input: &Input) -> Result<(), EvidenceError> {
             return Err(EvidenceError::Malformed(
                 "route names, provenance, and assertions are required".to_owned(),
             ));
+        }
+        if !source_ref_known(&route.current_source, &source_names)
+            || !source_ref_known(&route.modern_source, &source_names)
+        {
+            return Err(EvidenceError::Malformed(format!(
+                "route {} references undeclared provenance",
+                route.name
+            )));
         }
         scan_value(
             &Value::String(route.current_source.clone()),
@@ -266,6 +325,19 @@ fn validate_input(input: &Input) -> Result<(), EvidenceError> {
         validate_route_semantics(route)?;
     }
     Ok(())
+}
+
+fn source_ref_known(reference: &str, names: &BTreeSet<&str>) -> bool {
+    reference.split(';').all(|part| {
+        let Some((name, commit)) = part.split_once('@') else {
+            return false;
+        };
+        names.contains(name)
+            && commit.len() >= 7
+            && commit
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+    })
 }
 
 fn validate_contract(contract: &Contract, route: &str) -> Result<(), EvidenceError> {
@@ -291,9 +363,13 @@ fn validate_contract(contract: &Contract, route: &str) -> Result<(), EvidenceErr
     scan_value(&Value::Object(contract.headers.clone()), route)?;
     scan_value(&contract.payload, route)?;
     scan_value(&contract.response, route)?;
+    scan_value(
+        &Value::String(contract.endpoint.clone()),
+        &format!("{route}.endpoint"),
+    )?;
+
     Ok(())
 }
-
 fn valid_endpoint(endpoint: &str) -> bool {
     !endpoint.is_empty()
         && endpoint.chars().all(|character| !character.is_control())
@@ -402,9 +478,19 @@ fn scan_value(value: &Value, path: &str) -> Result<(), EvidenceError> {
                     "privatekey",
                     "bearer",
                     "credential",
+                    "apikey",
+                    "secret",
+                    "auth",
+                    "refresh",
+                    "encryptionkey",
+                    "security",
+                    "androidid",
+                    "private",
+                    "key",
                 ]
                 .iter()
-                .any(|needle| normalized.contains(needle));
+                .any(|needle| normalized.contains(needle))
+                    && !(normalized == "key" && child == "pairing");
                 if sensitive_key && child != REDACTED {
                     return Err(EvidenceError::Secret(format!(
                         "{path}.{key} is not redacted"
@@ -476,6 +562,9 @@ mod tests {
         assert!(output.contains("\"offline\":true"));
         assert!(output.contains("\"live_proof\":[]"));
         assert_eq!(output, render_embedded().expect("second render must match"));
+        assert!(output.contains(
+            "\"sha256\":\"1d9059388310c6d9616c3bc7529e60baaca5e308c772f1d3cb4d5c6f23ce8c25\""
+        ));
     }
 
     #[test]
@@ -523,5 +612,29 @@ mod tests {
         let value = format!("{}\n", FIXTURE.trim_end()).replacen('{', "{\"unexpected\":true,", 1);
         let error = render(&value).expect_err("unknown field must fail");
         assert!(matches!(error, EvidenceError::Json(_)));
+    }
+    #[test]
+    fn semantic_mutations_and_size_limits_fail_closed() {
+        let mut value: Value = serde_json::from_str(FIXTURE).expect("fixture JSON");
+        value["routes"][5]["modern"]["response"]["broadcast"]["entityChanged"]["payload"]["value"] =
+            Value::Bool(false);
+        let error = render(&value.to_string()).expect_err("Alarm=true mutation must fail");
+        assert!(matches!(error, EvidenceError::Malformed(_)));
+
+        let oversized = format!(
+            "{{\"schema_version\":1,\"snapshot_date\":\"2026-10-07\",\"retention_days\":30,\"sources\":[],\"routes\":[],\"padding\":\"{}\"}}",
+            "x".repeat(300_000)
+        );
+        let error = render(&oversized).expect_err("oversized fixture must fail");
+        assert!(matches!(error, EvidenceError::Malformed(_)));
+    }
+
+    #[test]
+    fn canonicalization_ignores_object_key_order() {
+        let value: Value = serde_json::from_str(FIXTURE).expect("fixture JSON");
+        let reordered = serde_json::to_string(&sort_value(value)).expect("reordered JSON");
+        let first = render(FIXTURE).expect("fixture render");
+        let second = render(&reordered).expect("reordered render");
+        assert_eq!(first, second);
     }
 }

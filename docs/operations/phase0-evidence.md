@@ -12,16 +12,21 @@ cargo run -p phase0-evidence > /tmp/phase0-a.json
 cargo run -p phase0-evidence > /tmp/phase0-b.json
 diff -u /tmp/phase0-a.json /tmp/phase0-b.json
 ```
-The current contracts are grounded in Xiao baseline `469c984`, the pinned
-`kunihir0/rustplus` commit `5b9a0803ac404a00b7f58e298c91b1130504d5c7`, and
-`kunihir0/push-receiver` commit `3b5b741c7ef52c2da26414bad2cffbf778644fd`.
-The modern comparison uses `liamcottle/rustplus.js@75915f25`. MCS is modeled as
-raw TLS over TCP (`mtalk.google.com:5228`), pairing as an FCM app-data
-notification, and entity/alarm responses as the pinned Rust+ protobuf shapes.
+The current contracts are grounded in Xiao baseline
+`469c98435647fa2582b8d14339cd385a686a79e6`, the pinned
+`kunihir0/rustplus@5b9a0803ac404a00b7f58e298c91b1130504d5c7` protobuf, and
+`kunihir0/push-receiver@3b5b741c7ef52c2da26414bad2cffbf778644fd` transport.
+The modern comparison uses
+`liamcottle/rustplus.js@75915f25fc7c1718f7c23c419953f4655840fade`.
+MCS is modeled as raw TLS over TCP (`mtalk.google.com:5228`), pairing as an
+FCM app-data notification, and entity/alarm responses as the pinned Rust+
+protobuf shapes.
 Payloads are synthetic and visibly non-secret; credential-like fields are
 `[REDACTED]`. The harness scans keys and string values fail-closed before
-canonical JSON SHA-256 hashing. Raw payloads are never persisted; the manifest
-is retained for 30 days as a development-only artifact.
+canonical JSON SHA-256 checksumming. Checked-in fixtures remain in Git history
+indefinitely; the 30-day retention applies only to generated temporary
+manifests/artifacts. The checksum is a deterministic integrity aid, not
+authenticity or tamper-proof evidence.
 
 Manifest classifications distinguish repository fixture **facts**, route-shape
 **inferences**, and **live proof**. `live_proof` is intentionally empty: this
