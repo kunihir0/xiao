@@ -488,26 +488,82 @@ fn validate_step_keys(step: &EnrollmentStep) -> Result<(), EvidenceError> {
             )));
         }
     };
-
+    let required_payload: &[&str] = match step.step.as_str() {
+        "checkin" => &[
+            "user_serial_number",
+            "checkin",
+            "version",
+            "id",
+            "security_token",
+        ],
+        "register3" => &["app", "X-subtype", "device", "sender"],
+        "fcm_subscribe" => &[
+            "authorized_entity",
+            "endpoint",
+            "encryption_key",
+            "encryption_auth",
+        ],
+        "expo_push_token" => &[
+            "type",
+            "deviceId",
+            "development",
+            "appId",
+            "deviceToken",
+            "projectId",
+        ],
+        "facepunch_register" => &["AuthToken", "DeviceId", "PushKind", "PushToken"],
+        "firebase_installations" => &["appId", "authVersion", "fid", "sdkVersion"],
+        _ => &[],
+    };
+    let required_response: &[&str] = match step.step.as_str() {
+        "checkin" => &["android_id", "security_token"],
+        "register3" | "fcm_subscribe" => &["token"],
+        "expo_push_token" => &["data"],
+        "facepunch_register" => &["success"],
+        "firebase_installations" => &["authToken", "fid", "refreshToken"],
+        _ => &[],
+    };
     if let Value::Object(obj) = &step.payload {
         for k in obj.keys() {
             if !allowed_payload.contains(&k.as_str()) {
                 return Err(EvidenceError::Malformed(format!(
-                    "unexpected key '{k}' in payload of step '{}'",
+                    "unexpected payload key in enrollment step '{}'",
                     step.step
                 )));
             }
         }
+        if required_payload.iter().any(|key| !obj.contains_key(*key)) {
+            return Err(EvidenceError::Malformed(format!(
+                "required payload field missing for enrollment step '{}'",
+                step.step
+            )));
+        }
+    } else {
+        return Err(EvidenceError::Malformed(format!(
+            "enrollment step '{}' payload must be an object",
+            step.step
+        )));
     }
     if let Value::Object(obj) = &step.response {
         for k in obj.keys() {
             if !allowed_response.contains(&k.as_str()) {
                 return Err(EvidenceError::Malformed(format!(
-                    "unexpected key '{k}' in response of step '{}'",
+                    "unexpected response key in enrollment step '{}'",
                     step.step
                 )));
             }
         }
+        if required_response.iter().any(|key| !obj.contains_key(*key)) {
+            return Err(EvidenceError::Malformed(format!(
+                "required response field missing for enrollment step '{}'",
+                step.step
+            )));
+        }
+    } else {
+        return Err(EvidenceError::Malformed(format!(
+            "enrollment step '{}' response must be an object",
+            step.step
+        )));
     }
     Ok(())
 }
@@ -643,6 +699,13 @@ fn validate_pairing_route(
                 "{side_name} pairing payload missing numeric playerId"
             ))
         })?;
+        if raw["type"].as_str() != Some("server")
+            || raw["playerToken"].as_str() != Some("[REDACTED]")
+        {
+            return Err(EvidenceError::Malformed(format!(
+                "{side_name} pairing payload must identify server and redact playerToken"
+            )));
+        }
 
         if !ALLOWED_SYNTHETIC_PLAYER_IDS.contains(&player_id) {
             return Err(EvidenceError::Secret(
