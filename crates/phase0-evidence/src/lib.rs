@@ -97,7 +97,7 @@ mod tests {
         assert_eq!(manifest.routes.len(), 6);
         assert_eq!(
             manifest.manifest_sha256,
-            "c41d573305075265cdd8adc89a7b0139a586da3527b0bdf785fa0b613630e9eb"
+            "1100634186bd81ec9a9ade839a875d9d48f90c64a01edd19a8f105c7274a0081"
         );
 
         let expected_hashes = [
@@ -114,7 +114,7 @@ mod tests {
             (
                 "pairing",
                 "f3469e22582638a18d7911aee3b67c080db6d9e6d6cd3673a3a978ece7aaa93d",
-                "9d043b531a6dcf0bfe44dee56356a4fbed00a3dd52217ea873d09dfdc3a81c4a",
+                "f3469e22582638a18d7911aee3b67c080db6d9e6d6cd3673a3a978ece7aaa93d",
             ),
             (
                 "getEntityInfo",

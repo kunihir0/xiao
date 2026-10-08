@@ -79,16 +79,29 @@ fn validate_safe_input_path(path_str: &str) -> Result<PathBuf, EvidenceError> {
         .canonicalize()
         .map_err(|e| EvidenceError::Io(e.to_string()))?;
 
-    let is_in_fixtures = canonical.components().any(|c| c.as_os_str() == "fixtures");
-    let is_in_target = canonical.components().any(|c| c.as_os_str() == "target");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let allowed_fixtures_dir = manifest_dir.join("fixtures").canonicalize().ok();
     let temp_dir = std::env::temp_dir()
         .canonicalize()
         .unwrap_or_else(|_| std::env::temp_dir());
-    let is_in_temp = canonical.starts_with(&temp_dir);
+    let target_tmp = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("target").join("tmp"))
+        .and_then(|p| p.canonicalize().ok());
 
-    if !is_in_fixtures && !is_in_temp && !is_in_target {
+    let is_contained = allowed_fixtures_dir
+        .as_ref()
+        .is_some_and(|dir| canonical.starts_with(dir))
+        || canonical.starts_with(&temp_dir)
+        || target_tmp
+            .as_ref()
+            .is_some_and(|dir| canonical.starts_with(dir));
+
+    if !is_contained {
         return Err(EvidenceError::Blocked(
-            "input file must be within an allowed fixtures or temporary test directory".to_owned(),
+            "input file must be within the crate fixtures directory or temporary test directory"
+                .to_owned(),
         ));
     }
 

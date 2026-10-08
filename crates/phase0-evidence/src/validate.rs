@@ -32,6 +32,38 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+pub const ALLOWED_SOURCES: &[(&str, &str, &str, &str)] = &[
+    (
+        "xiao-current-rustplus",
+        "https://github.com/kunihir0/xiao",
+        "469c98435647fa2582b8d14339cd385a686a79e6",
+        "crates/push-receiver/src/transport.rs;crates/rustplus-adapter/src/registration.rs;crates/rustplus-adapter/src/parse.rs",
+    ),
+    (
+        "rustplus-current-protocol",
+        "https://github.com/kunihir0/rustplus",
+        "5b9a0803ac404a00b7f58e298c91b1130504d5c7",
+        "proto/rustplus.proto;src/client.rs",
+    ),
+    (
+        "push-receiver-current",
+        "https://github.com/kunihir0/push-receiver",
+        "3b5b741c7ef52c2da26414bad2cffbf778644fdc",
+        "src/checkin.rs;src/register.rs;src/mcs.rs;proto/mcs.proto",
+    ),
+    (
+        "rustplus-js-modern",
+        "https://github.com/liamcottle/rustplus.js",
+        "75915f25fc7c1718f7c23c419953f4655840fade",
+        "cli/index.js;docs/PairingFlow.md;rustplus.js;rustplus.proto",
+    ),
+    (
+        "liam-push-receiver",
+        "https://github.com/liamcottle/push-receiver",
+        "ecc93a37ca618859eaacae71ec0c0136ce1621f5",
+        "src/android/fcm.js;src/client.js;src/mcs.proto;src/gcm/index.js",
+    ),
+];
 pub fn validate_evidence(input: &EvidenceInput) -> Result<Vec<ManifestRoute>, EvidenceError> {
     if input.schema_version != SCHEMA_VERSION {
         return Err(EvidenceError::Malformed(format!(
@@ -56,7 +88,28 @@ pub fn validate_evidence(input: &EvidenceInput) -> Result<Vec<ManifestRoute>, Ev
 
     // Validate sources and check for duplicate names
     let mut source_map = BTreeMap::new();
+    if input.sources.len() != ALLOWED_SOURCES.len() {
+        return Err(EvidenceError::Malformed(format!(
+            "source count {} does not match approved sources count {}",
+            input.sources.len(),
+            ALLOWED_SOURCES.len()
+        )));
+    }
+
     for source in &input.sources {
+        let matching_allowed = ALLOWED_SOURCES.iter().find(|(name, repo, commit, path)| {
+            *name == source.name.as_str()
+                && *repo == source.repository.as_str()
+                && *commit == source.commit_or_version.as_str()
+                && *path == source.path.as_str()
+        });
+        if matching_allowed.is_none() {
+            return Err(EvidenceError::Malformed(format!(
+                "source '{}' is not an approved pinned source or has mismatched repository/commit/path",
+                source.name
+            )));
+        }
+
         if source_map.insert(source.name.as_str(), source).is_some() {
             return Err(EvidenceError::Malformed(format!(
                 "duplicate source name '{}'",
@@ -540,19 +593,15 @@ fn validate_pairing_route(
     let cur = &route.current;
     let md = &route.modern;
 
-    if cur.method == "FCM_NOTIFICATION_APP_DATA" && cur.endpoint == "fcm://notification/app-data" {
-        actual_assertions.insert(AssertionId::PairingCurrentIsFcmAppData);
+    if cur.method == "FCM_NOTIFICATION_APP_DATA"
+        && cur.endpoint == "fcm://notification/app-data"
+        && md.method == "FCM_NOTIFICATION_APP_DATA"
+        && md.endpoint == "fcm://notification/app-data"
+    {
+        actual_assertions.insert(AssertionId::PairingMethodIsFcmAppData);
     } else {
         return Err(EvidenceError::Malformed(
-            "current pairing transport method and endpoint must be FCM app data".to_owned(),
-        ));
-    }
-
-    if md.method == "EXPO_PUSH_NOTIFICATION" && md.endpoint == "expo://notification/delivery" {
-        actual_assertions.insert(AssertionId::PairingModernIsExpoNotification);
-    } else {
-        return Err(EvidenceError::Malformed(
-            "modern pairing transport method and endpoint must be Expo notification".to_owned(),
+            "pairing transport methods and endpoints must be FCM_NOTIFICATION_APP_DATA at fcm://notification/app-data".to_owned(),
         ));
     }
 
@@ -567,116 +616,64 @@ fn validate_pairing_route(
         "entityName",
     ];
 
-    // Verify current app_data json vs normalized
-    let pairing_item = cur
-        .app_data
-        .iter()
-        .find(|item| item.key == "pairing")
-        .ok_or_else(|| EvidenceError::Malformed("missing 'pairing' in app_data".to_owned()))?;
+    for (side_name, side) in [("current", cur), ("modern", md)] {
+        let pairing_item = side
+            .app_data
+            .iter()
+            .find(|item| item.key == "pairing")
+            .ok_or_else(|| {
+                EvidenceError::Malformed(format!("missing 'pairing' in {side_name} app_data"))
+            })?;
 
-    let cur_raw: serde_json::Value = serde_json::from_str(&pairing_item.value)
-        .map_err(|e| EvidenceError::Json(e.to_string()))?;
+        let raw: serde_json::Value = serde_json::from_str(&pairing_item.value)
+            .map_err(|e| EvidenceError::Json(e.to_string()))?;
 
-    if let Value::Object(obj) = &cur_raw {
-        for k in obj.keys() {
-            if !allowed_keys.contains(&k.as_str()) {
-                return Err(EvidenceError::Malformed(
-                    "unexpected key in pairing app_data JSON".to_owned(),
-                ));
+        if let Value::Object(obj) = &raw {
+            for k in obj.keys() {
+                if !allowed_keys.contains(&k.as_str()) {
+                    return Err(EvidenceError::Malformed(format!(
+                        "unexpected key in {side_name} pairing app_data JSON"
+                    )));
+                }
             }
         }
-    }
 
-    let cur_player_id = cur_raw["playerId"].as_u64().ok_or_else(|| {
-        EvidenceError::Malformed("pairing payload missing numeric playerId".to_owned())
-    })?;
-
-    if !ALLOWED_SYNTHETIC_PLAYER_IDS.contains(&cur_player_id) {
-        return Err(EvidenceError::Secret(
-            "playerId is not in synthetic allowlist".to_owned(),
-        ));
-    }
-
-    if cur_player_id != cur.normalized_pairing.player_id {
-        return Err(EvidenceError::Malformed(
-            "app_data playerId does not match normalized_pairing.player_id".to_owned(),
-        ));
-    }
-
-    if cur_raw["ip"].as_str() != Some(&cur.normalized_pairing.host) {
-        return Err(EvidenceError::Malformed(
-            "app_data ip does not match normalized_pairing.host".to_owned(),
-        ));
-    }
-
-    if cur_raw["port"].as_u64() != Some(cur.normalized_pairing.port as u64) {
-        return Err(EvidenceError::Malformed(
-            "app_data port does not match normalized_pairing.port".to_owned(),
-        ));
-    }
-
-    if cur_raw.get("paired").is_some() {
-        return Err(EvidenceError::Malformed(
-            "pairing payload must not contain invented 'paired' response".to_owned(),
-        ));
-    }
-
-    // Verify modern notification_data vs normalized
-    let body_str = md
-        .notification_data
-        .get("body")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            EvidenceError::Malformed("missing 'body' in modern notification_data".to_owned())
+        let player_id = raw["playerId"].as_u64().ok_or_else(|| {
+            EvidenceError::Malformed(format!(
+                "{side_name} pairing payload missing numeric playerId"
+            ))
         })?;
 
-    let mod_raw: serde_json::Value =
-        serde_json::from_str(body_str).map_err(|e| EvidenceError::Json(e.to_string()))?;
+        if !ALLOWED_SYNTHETIC_PLAYER_IDS.contains(&player_id) {
+            return Err(EvidenceError::Secret(
+                "playerId is not in synthetic allowlist".to_owned(),
+            ));
+        }
 
-    if let Value::Object(obj) = &mod_raw {
-        for k in obj.keys() {
-            if !allowed_keys.contains(&k.as_str()) {
-                return Err(EvidenceError::Malformed(
-                    "unexpected key in modern pairing notification body".to_owned(),
-                ));
-            }
+        if player_id != side.normalized_pairing.player_id {
+            return Err(EvidenceError::Malformed(format!(
+                "{side_name} app_data playerId does not match normalized_pairing.player_id"
+            )));
+        }
+
+        if raw["ip"].as_str() != Some(&side.normalized_pairing.host) {
+            return Err(EvidenceError::Malformed(format!(
+                "{side_name} app_data ip does not match normalized_pairing.host"
+            )));
+        }
+
+        if raw["port"].as_u64() != Some(side.normalized_pairing.port as u64) {
+            return Err(EvidenceError::Malformed(format!(
+                "{side_name} app_data port does not match normalized_pairing.port"
+            )));
+        }
+
+        if raw.get("paired").is_some() {
+            return Err(EvidenceError::Malformed(format!(
+                "{side_name} pairing payload must not contain invented 'paired' response"
+            )));
         }
     }
-
-    let mod_player_id = mod_raw["playerId"].as_u64().ok_or_else(|| {
-        EvidenceError::Malformed("modern pairing body missing numeric playerId".to_owned())
-    })?;
-
-    if !ALLOWED_SYNTHETIC_PLAYER_IDS.contains(&mod_player_id) {
-        return Err(EvidenceError::Secret(
-            "playerId is not in synthetic allowlist".to_owned(),
-        ));
-    }
-
-    if mod_player_id != md.normalized_pairing.player_id {
-        return Err(EvidenceError::Malformed(
-            "modern body playerId does not match normalized_pairing.player_id".to_owned(),
-        ));
-    }
-
-    if mod_raw["ip"].as_str() != Some(&md.normalized_pairing.host) {
-        return Err(EvidenceError::Malformed(
-            "modern body ip does not match normalized_pairing.host".to_owned(),
-        ));
-    }
-
-    if mod_raw["port"].as_u64() != Some(md.normalized_pairing.port as u64) {
-        return Err(EvidenceError::Malformed(
-            "modern body port does not match normalized_pairing.port".to_owned(),
-        ));
-    }
-
-    if mod_raw.get("paired").is_some() {
-        return Err(EvidenceError::Malformed(
-            "modern pairing payload must not contain invented 'paired' response".to_owned(),
-        ));
-    }
-
     actual_assertions.insert(AssertionId::PairingSyntheticPlayerIdMatchesNormalized);
     actual_assertions.insert(AssertionId::PairingPlayerTokenRedacted);
     actual_assertions.insert(AssertionId::PairingNormalizedAddressMatchesNested);

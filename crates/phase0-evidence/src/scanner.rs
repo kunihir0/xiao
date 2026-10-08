@@ -182,8 +182,7 @@ const ALLOWED_ASSERTIONS_AND_PROOFS: &[&str] = &[
     "MCS_LOGIN_PAYLOAD_FIELDSET_COMPLETE",
     "MCS_LOGIN_CREDENTIALS_REDACTED",
     "MCS_READINESS_TAG_IS_LOGIN_RESPONSE",
-    "PAIRING_CURRENT_IS_FCM_APP_DATA",
-    "PAIRING_MODERN_IS_EXPO_NOTIFICATION",
+    "PAIRING_METHOD_IS_FCM_APP_DATA",
     "PAIRING_SYNTHETIC_PLAYER_ID_MATCHES_NORMALIZED",
     "PAIRING_PLAYER_TOKEN_REDACTED",
     "PAIRING_NORMALIZED_ADDRESS_MATCHES_NESTED",
@@ -206,6 +205,10 @@ const ALLOWED_ASSERTIONS_AND_PROOFS: &[&str] = &[
     "STEAM_ACCOUNT_COMPANION_AUTHENTICATION",
     "LIVE_PROVIDER_PUSH_DELIVERY",
 ];
+
+const ALLOWED_SYNTHETIC_STRINGS: &[&str] =
+    &["synthetic-device-01", "synthetic-fid-01", "synthetic-alarm"];
+
 fn is_allowed_token_shaped_string(s: &str, known_hashes: &BTreeSet<&str>) -> bool {
     if s == REDACTED_MARKER {
         return true;
@@ -224,13 +227,11 @@ fn is_allowed_token_shaped_string(s: &str, known_hashes: &BTreeSet<&str>) -> boo
     if known_hashes.contains(s) {
         return true;
     }
-    if s.starts_with("synthetic-") {
+    if ALLOWED_SYNTHETIC_STRINGS.contains(&s) {
         return true;
     }
-    if s == "49451aca-a822-41e6-ad59-955718d0ff9c" {
-        return true;
-    }
-    if s == "com.facepunch.rust.companion"
+    if s == "49451aca-a822-41e6-ad59-955718d0ff9c"
+        || s == "com.facepunch.rust.companion"
         || s == "org.chromium.linux"
         || s == "org.mozilla.firefox"
         || s == "chrome-63.0.3234.0"
@@ -260,7 +261,6 @@ fn is_allowed_token_shaped_string(s: &str, known_hashes: &BTreeSet<&str>) -> boo
         || s.starts_with("ws://")
         || s.starts_with("tcp+tls://")
         || s.starts_with("fcm://")
-        || s.starts_with("expo://")
     {
         return true;
     }

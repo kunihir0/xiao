@@ -53,8 +53,7 @@ pub enum AssertionId {
     McsLoginCredentialsRedacted,
     McsReadinessTagIsLoginResponse,
     // Pairing assertions
-    PairingCurrentIsFcmAppData,
-    PairingModernIsExpoNotification,
+    PairingMethodIsFcmAppData,
     PairingSyntheticPlayerIdMatchesNormalized,
     PairingPlayerTokenRedacted,
     PairingNormalizedAddressMatchesNested,
@@ -274,30 +273,20 @@ pub struct McsReadinessResponse {
 pub struct PairingRoute {
     pub current_source: String,
     pub modern_source: String,
-    pub current: CurrentPairingSide,
-    pub modern: ModernPairingSide,
+    pub current: PairingSide,
+    pub modern: PairingSide,
     pub expected_assertions: Vec<AssertionId>,
     pub live_proof_needed: Vec<LiveProofNeed>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CurrentPairingSide {
+pub struct PairingSide {
     pub endpoint: String,
     pub method: String,
     pub app_data: Vec<AppDataItem>,
     pub normalized_pairing: NormalizedPairing,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModernPairingSide {
-    pub endpoint: String,
-    pub method: String,
-    pub notification_data: Map<String, Value>,
-    pub normalized_pairing: NormalizedPairing,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppDataItem {
