@@ -64,6 +64,8 @@ fn cli_secret_error_does_not_leak() {
         "secret123",
         "76561198000000001",
         "https://u:password@example.invalid/path",
+        "https://fcm.googleapis.com/fcm/connect/REAL_TOKEN",
+        "{\"token\":\"REAL_TOKEN\"}",
     ] {
         let mut bad: serde_json::Value = serde_json::from_str(EMBEDDED_FIXTURE).expect("fixture");
         bad["routes"][0]["expected_assertions"][0] = serde_json::Value::String(secret.to_owned());
@@ -73,6 +75,15 @@ fn cli_secret_error_does_not_leak() {
         assert!(stderr.contains("phase0-evidence error:"));
         assert!(!stderr.contains(secret));
     }
+}
+
+#[test]
+fn cli_rejects_unapproved_register_device() {
+    let mut bad: serde_json::Value = serde_json::from_str(EMBEDDED_FIXTURE).expect("fixture");
+    bad["routes"][0]["current"]["steps"][1]["payload"]["device"] =
+        serde_json::Value::String("1234".to_owned());
+    let output = run_stdin(&bad.to_string());
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]

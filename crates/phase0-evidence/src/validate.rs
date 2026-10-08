@@ -363,6 +363,12 @@ fn validate_enrollment_route(
             "current register3 X-subtype has invalid synthetic UUID".to_owned(),
         ));
     }
+    let device = register.payload.get("device").and_then(Value::as_str);
+    if !matches!(device, Some("[REDACTED]" | "synthetic-device-01")) {
+        return Err(EvidenceError::Malformed(
+            "current register3 device is not an approved synthetic value".to_owned(),
+        ));
+    }
 
     let cur_step_names: Vec<&str> = route
         .current

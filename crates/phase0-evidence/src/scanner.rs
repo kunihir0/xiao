@@ -212,83 +212,60 @@ const ALLOWED_ASSERTIONS_AND_PROOFS: &[&str] = &[
 const ALLOWED_SYNTHETIC_STRINGS: &[&str] =
     &["synthetic-device-01", "synthetic-fid-01", "synthetic-alarm"];
 
+const ALLOWED_ENDPOINTS: &[&str] = &[
+    "https://android.clients.google.com/checkin",
+    "https://android.clients.google.com/c2dm/register3",
+    "https://fcm.googleapis.com/fcm/send/[REDACTED]",
+    "https://fcm.googleapis.com/fcm/connect/subscribe",
+    "https://exp.host/--/api/v2/push/getExpoPushToken",
+    "https://companion-rust.facepunch.com/api/push/register",
+    "https://firebaseinstallations.googleapis.com/v1/projects/rust-companion-app/installations",
+    "tcp+tls://mtalk.google.com:5228",
+    "fcm://notification/app-data",
+    "wss://203.0.113.10:28082/",
+    "ws://203.0.113.10:28082/",
+];
+
 fn is_allowed_token_shaped_string(s: &str, known_hashes: &BTreeSet<&str>) -> bool {
-    if s == REDACTED_MARKER {
-        return true;
-    }
-    // Allow known assertion and live proof identifiers exactly
-    if ALLOWED_ASSERTIONS_AND_PROOFS.contains(&s) {
-        return true;
-    }
-    // Allow JSON-delimited strings (their parsed structure is scanned separately)
-    let trimmed = s.trim();
-    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    if s == REDACTED_MARKER
+        || ALLOWED_ASSERTIONS_AND_PROOFS.contains(&s)
+        || ALLOWED_ENDPOINTS.contains(&s)
+        || known_hashes.contains(s)
+        || ALLOWED_SYNTHETIC_STRINGS.contains(&s)
     {
         return true;
     }
-    if known_hashes.contains(s) {
-        return true;
-    }
-    if ALLOWED_SYNTHETIC_STRINGS.contains(&s) {
-        return true;
-    }
-    if s == "wp:receiver.push.com#123e4567-e89b-12d3-a456-426614174000"
-        || s == "49451aca-a822-41e6-ad59-955718d0ff9c"
-        || s == "com.facepunch.rust.companion"
-        || s == "android-min-sdk/23 fire-core/20.0.0"
-        || s == "org.chromium.linux"
-        || s == "org.mozilla.firefox"
-        || s == "chrome-63.0.3234.0"
-        || s == "mcs.android.com"
-        || s == "1:976529667804:android:d6f1ddeb4403b338fea619"
-        || s == "2026-10-07"
-        || s == "application/json"
-        || s == "application/x-protobuf"
-        || s == "application/x-www-form-urlencoded"
-        || s == "mcs_version_tag_delimited"
-        || s == "facepunch_register"
-        || s == "firebase_installations"
-        || s == "FCM_NOTIFICATION_APP_DATA"
-        || s == "EXPO_PUSH_NOTIFICATION"
-        || s == "MCS_FRAMED_PROTOBUF"
-        || s == "PROTOBUF_BROADCAST"
-        || s == "PROTOBUF_RPC"
-        || s == "xiao-current-rustplus"
-        || s == "rustplus-current-protocol"
-        || s == "push-receiver-current"
-        || s == "rustplus-js-modern"
-        || s == "liam-push-receiver"
-    {
-        return true;
-    }
-    // Allow URL forms without query/userinfo
-    if s.starts_with("https://")
-        || s.starts_with("wss://")
-        || s.starts_with("ws://")
-        || s.starts_with("tcp+tls://")
-        || s.starts_with("fcm://")
-    {
-        return true;
-    }
-    // Allow source reference strings, e.g. name@commit
-    if s.contains('@')
+    matches!(
+        s,
+        "wp:receiver.push.com#123e4567-e89b-12d3-a456-426614174000"
+            | "49451aca-a822-41e6-ad59-955718d0ff9c"
+            | "com.facepunch.rust.companion"
+            | "android-min-sdk/23 fire-core/20.0.0"
+            | "org.chromium.linux"
+            | "org.mozilla.firefox"
+            | "chrome-63.0.3234.0"
+            | "mcs.android.com"
+            | "1:976529667804:android:d6f1ddeb4403b338fea619"
+            | "2026-10-07"
+            | "application/json"
+            | "application/x-protobuf"
+            | "application/x-www-form-urlencoded"
+            | "mcs_version_tag_delimited"
+            | "facepunch_register"
+            | "firebase_installations"
+            | "FCM_NOTIFICATION_APP_DATA"
+            | "EXPO_PUSH_NOTIFICATION"
+            | "MCS_FRAMED_PROTOBUF"
+            | "PROTOBUF_BROADCAST"
+            | "PROTOBUF_RPC"
+            | "xiao-current-rustplus"
+            | "rustplus-current-protocol"
+            | "push-receiver-current"
+            | "rustplus-js-modern"
+            | "liam-push-receiver"
+    ) || (s.contains('@')
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '-' | '_' | ';' | '.'))
-    {
-        return true;
-    }
-    // Allow file paths
-    if s.split(';').all(|part| {
-        part.ends_with(".rs")
-            || part.ends_with(".proto")
-            || part.ends_with(".js")
-            || part.ends_with(".txt")
-            || part.ends_with(".md")
-    }) {
-        return true;
-    }
-    false
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '-' | '_' | ';' | '.')))
 }
 
 fn validate_string_content(
@@ -309,8 +286,20 @@ fn validate_string_content(
             "control characters detected at {path}"
         )));
     }
+    if path.contains("app_data[") && path.ends_with(".value") {
+        return Ok(());
+    }
 
     let lower = s.to_ascii_lowercase();
+    if path.starts_with("root.sources[") && path.ends_with(".repository") {
+        if s.contains("://") {
+            validate_url(s, path)?;
+        }
+        return Ok(());
+    }
+    if path.starts_with("root.sources[") && path.ends_with(".path") {
+        return Ok(());
+    }
 
     if lower.contains("-----begin") {
         return Err(EvidenceError::Secret(format!(
