@@ -131,11 +131,12 @@ catch duplicate registration.
 
 The acceptance container is started with `--no-migrate` so the long-running
 process cannot accidentally run DDL through the runtime role. The migration
-one-shot runs separately with `MIGRATION_DATABASE_URL_FILE`; an earlier
-container failure classified as `database migrations failed` was the runtime
-role attempting embedded migrations after startup migration configuration was
-not applied. The runtime role is intentionally denied schema DDL, so treating
-that error as a readiness failure is required rather than granting it
+one-shot runs separately with `MIGRATION_DATABASE_URL_FILE`. An earlier
+container failure classified as `database migrations failed` was caused by
+the runtime role entering Diesel's migration metadata path: that path also
+issued `CREATE TABLE IF NOT EXISTS` while checking schema currency. The
+database adapter now verifies migration metadata with a read-only query, and
+the runtime role remains intentionally denied schema DDL rather than gaining
 migration privileges.
 The operator invokes `/ping` in the test guild and confirms the expected public
 `pong` response. In this foundation phase (Issue #22), only `/ping` exists; management

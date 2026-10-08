@@ -4,6 +4,7 @@
 //! private to this crate. Callers interact with the typed [`Db`] lifecycle
 //! methods and [`DbError`] only.
 
+use diesel::migration::{Migration, MigrationSource};
 use diesel::sql_query;
 use diesel_async::pooled_connection::{
     AsyncDieselConnectionManager, ManagerConfig, RecyclingMethod, deadpool::Pool,
@@ -24,6 +25,12 @@ const MIGRATIONS: diesel_migrations::EmbeddedMigrations = embed_migrations!("../
 const DEFAULT_MAX_CONNECTIONS: usize = 8;
 type PoolManager = AsyncDieselConnectionManager<AsyncPgConnection>;
 type DatabasePool = Pool<AsyncPgConnection>;
+
+#[derive(diesel::QueryableByName)]
+struct MigrationVersionRow {
+    #[diesel(sql_type = diesel::sql_types::VarChar)]
+    version: String,
+}
 
 /// PostgreSQL TLS configuration for the persistence adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -350,22 +357,12 @@ impl Db {
     }
 
     async fn verify_schema_current_locked(&self) -> Result<(), DbError> {
-        let connection = self
+        let mut connection = self
             .pool
             .get()
             .await
             .map_err(|_| DbError::ConnectionAcquisition)?;
-        let mut harness = AsyncMigrationHarness::new(connection);
-        let has_pending = harness
-            .has_pending_migration(MIGRATIONS)
-            .map_err(|_| DbError::Migration)?;
-
-        if has_pending {
-            self.ready.store(false, Ordering::Release);
-            self.migrations_complete.store(false, Ordering::Release);
-            return Err(DbError::SchemaPending);
-        }
-
+        verify_schema_current_connection(&mut connection).await?;
         self.migrations_complete.store(true, Ordering::Release);
         Ok(())
     }
@@ -390,14 +387,9 @@ impl Db {
             })?;
 
         if !AtomicBool::load(&self.migrations_complete, Ordering::Acquire) {
-            let mut harness = AsyncMigrationHarness::new(connection);
-            let has_pending = harness.has_pending_migration(MIGRATIONS).map_err(|_| {
+            if let Err(error) = verify_schema_current_connection(&mut connection).await {
                 self.ready.store(false, Ordering::Release);
-                DbError::Migration
-            })?;
-            if has_pending {
-                self.ready.store(false, Ordering::Release);
-                return Err(DbError::SchemaPending);
+                return Err(error);
             }
             self.migrations_complete.store(true, Ordering::Release);
         }
@@ -437,6 +429,34 @@ impl Db {
 
     pub(crate) fn pool(&self) -> &DatabasePool {
         &self.pool
+    }
+}
+
+async fn verify_schema_current_connection(
+    connection: &mut AsyncPgConnection,
+) -> Result<(), DbError> {
+    // `MigrationHarness::has_pending_migration` calls
+    // `CREATE TABLE IF NOT EXISTS` before reading the metadata table.
+    // Runtime connections are deliberately DDL-denied, so verify currency
+    // with a read-only metadata query instead.
+    let applied = sql_query("SELECT version FROM __diesel_schema_migrations ORDER BY version")
+        .load::<MigrationVersionRow>(connection)
+        .await
+        .map_err(|_| DbError::Migration)?;
+    let expected = MigrationSource::<diesel::pg::Pg>::migrations(&MIGRATIONS)
+        .map_err(|_| DbError::Migration)?
+        .into_iter()
+        .map(|migration| migration.name().version().as_owned().to_string())
+        .collect::<Vec<_>>();
+    let applied = applied
+        .into_iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+
+    if applied == expected {
+        Ok(())
+    } else {
+        Err(DbError::SchemaPending)
     }
 }
 
