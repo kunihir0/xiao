@@ -54,3 +54,11 @@ All notable externally meaningful changes are documented here. Releases follow S
   `SECRET_ACTIVE_KEY_ID` are set; a partial set is a startup error. The
   in-memory pairing store was removed. See
   `docs/operations/rustplus-companion.md`.
+
+- Added the deterministic offline Phase 0 Rust+ evidence harness (`phase0-evidence`)
+  with source-grounded route contracts (Xiao, kunihir0/rustplus, kunihir0/push-receiver,
+  liamcottle/rustplus.js, and liamcottle/push-receiver), multi-step enrollment sequencing,
+  raw TLS MCS framing, normalized FCM pairing, exact protobuf `getEntityInfo` and
+  `AppBroadcast.entityChanged` Alarm=2 transitions, fail-closed redaction and secret
+  scanning, canonical SHA-256 manifest generation, and explicit fact/inference/live-proof
+  classification. No live provider calls or credentials are used.
