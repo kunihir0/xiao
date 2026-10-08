@@ -272,8 +272,8 @@ pub fn validate_evidence(input: &EvidenceInput) -> Result<Vec<ManifestRoute>, Ev
 fn validate_source_ref(
     reference: &str,
     sources: &BTreeMap<&str, &Source>,
-    route_name: &str,
-    side: &str,
+    _route_name: &str,
+    _side: &str,
 ) -> Result<(), EvidenceError> {
     if reference.is_empty() {
         return Err(EvidenceError::Malformed(
