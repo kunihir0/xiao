@@ -120,11 +120,16 @@ inputs:
 --discord-approved            coordinator approval after the notice
 ```
 
+Both local and remote image modes require a non-empty 40-hex `--source-sha`;
+the immutable image must carry `org.opencontainers.image.revision` exactly
+equal to that SHA. Remote images additionally require an `@sha256:` digest.
+
 The image receives the approved token through Docker's original `--env-file`
 mechanism (or a mounted `DISCORD_TOKEN_FILE`), plus read-only
-`DATABASE_URL_FILE` and `DATABASE_CA_FILE` mounts. The entrypoint removes
-conflicting direct database variables imported from the env file before exec;
-the host never exports or copies the token. The migration DDL secret is
+`DATABASE_URL_FILE` and `DATABASE_CA_FILE` mounts. The harness uses a
+value-free shell command to unset conflicting direct database variables before
+executing the entrypoint; production entrypoint behavior is unchanged. The
+host never exports or copies the token. The migration DDL secret is
 deliberately not mounted into the bot container. Startup waits for
 schema-current/readiness evidence, then checks the global command list and
 performs an idempotent guild command registration; both lists MUST contain

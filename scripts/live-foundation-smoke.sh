@@ -174,7 +174,7 @@ fi
 valid_label() { [[ "$1" =~ ^[A-Za-z0-9._:-]{1,100}$ ]]; }
 valid_alias() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; }
 valid_snowflake() { [[ "$1" =~ ^[0-9]{17,20}$ ]]; }
-valid_digest_image() { [[ "$1" =~ @sha256:[[:xdigit:]]{64}$ ]]; }
+valid_source_sha() { [[ "$1" =~ ^[[:xdigit:]]{40}$ ]]; }
 
 # Locate keg libpq and cargo bot binary if available
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -206,8 +206,8 @@ if [[ "$mode" == discord-live ]]; then
   valid_snowflake "$guild_id" || fail 'guild ID is required and must be a Discord snowflake'
   valid_snowflake "$application_id" || fail 'application ID is required and must be a Discord snowflake'
 
+  valid_source_sha "$source_sha" || fail '--source-sha is required and must be exactly 40 hexadecimal characters'
   if [[ "$local_image" == true ]]; then
-    [[ -n "$source_sha" ]] || fail '--source-sha is required with --local-image'
     current_head=$(git -C "$repo_root" rev-parse HEAD)
     [[ "$source_sha" == "$current_head" ]] || fail '--source-sha must exactly match checked-out HEAD'
   else
@@ -321,13 +321,16 @@ cleanup() {
   # Always remove local bot containers after stopping them so credential-bearing
   # mounts cannot remain attached to a stopped container. Preserve disposable
   # PostgreSQL containers and private diagnostics on failure for inspection.
-  if [[ "${container_started:-false}" == true && -n "${container_name:-}" ]]; then
   if [[ "$exit_code" -ne 0 && "${container_started:-false}" == true \
-    && -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
-    docker logs "$container_name" >"$tmp_dir/bot.log" 2>&1 || true
-    docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$container_name" \
-      >"$tmp_dir/bot-state" 2>/dev/null || true
+    && -n "${evidence_dir:-}" && -d "$evidence_dir" ]]; then
+    {
+      printf '{"check":"bot-container","status":"stopped","exit_code":"'
+      docker inspect --format '{{.State.ExitCode}}' "$container_name" 2>/dev/null || printf 'unknown'
+      printf '","readiness_logs_observed":false}\n'
+    } >"$evidence_dir/cleanup-diagnostic.json"
+    chmod 600 "$evidence_dir/cleanup-diagnostic.json"
   fi
+  if [[ "${container_started:-false}" == true && -n "${container_name:-}" ]]; then
     if ! docker stop --time 30 "$container_name" >/dev/null 2>&1; then cleanup_failed=true; fi
     if ! docker rm "$container_name" >/dev/null 2>&1; then cleanup_failed=true; fi
   fi
@@ -805,11 +808,17 @@ bot_env_args=(
   --env RUST_LOG=info
 )
 
-docker_args=(docker run -d --name "$container_name" --user "$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --add-host=host.docker.internal:host-gateway "${bot_env_args[@]}")
-if ! docker run --rm --user "$(id -u):$(id -g)" \
+runtime_uid=10001
+runtime_gid=10001
+[[ "$runtime_uid" != 0 && "$runtime_gid" != 0 ]] || fail 'bot runtime identity must be non-root'
+docker_args=(docker run -d --name "$container_name" --user "$runtime_uid:$runtime_gid" --cap-drop=ALL --security-opt=no-new-privileges --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --add-host=host.docker.internal:host-gateway "${bot_env_args[@]}")
+if [[ "$(docker image inspect --format '{{.Config.User}}' "$image")" != "10001:10001" ]]; then
+  fail 'reviewed image must declare fixed non-root user 10001:10001'
+fi
+if ! docker run --rm --user "$runtime_uid:$runtime_gid" \
   --mount "type=bind,src=$DATABASE_CA_FILE,dst=/run/secrets/database_ca,readonly" \
   --entrypoint /bin/sh "$image" -c 'test -s /run/secrets/database_ca -a -r /run/secrets/database_ca'; then
-  record bot-ca-mount fail 'runtime image could not read the approved CA mount as the configured UID'
+  record bot-ca-mount fail 'runtime image could not read the approved CA mount as fixed UID 10001'
   fail 'bot runtime CA mount is not readable'
 fi
 record bot-ca-mount pass 'runtime image can read the approved CA mount as the configured UID'
