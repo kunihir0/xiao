@@ -21,6 +21,8 @@ pub struct Config {
     rustplus: Option<RustPlusConfig>,
 }
 
+/// Rust+ companion configuration. Opt-in: every variable in
+/// [`RUSTPLUS_VARIABLES`] must be set together, or none of them.
 /// Standalone migration settings required by `xiao-bot migrate`.
 #[derive(Clone)]
 pub struct MigrationConfig {
@@ -99,12 +101,125 @@ impl Debug for MigrationConfig {
 #[derive(Clone)]
 pub struct RustPlusConfig {
     fcm_sender_id: String,
+    steam_id: u64,
+    steam_auth_token_file: PathBuf,
+    keyring_file: PathBuf,
+    active_key_id: String,
 }
+
+/// Environment variables that together enable Rust+ pairing.
+pub const RUSTPLUS_VARIABLES: [&str; 5] = [
+    "RUSTPLUS_FCM_SENDER_ID",
+    "RUSTPLUS_STEAM_ID",
+    "RUSTPLUS_STEAM_AUTH_TOKEN_FILE",
+    "SECRET_KEYRING_FILE",
+    "SECRET_ACTIVE_KEY_ID",
+];
 
 impl RustPlusConfig {
     pub fn fcm_sender_id(&self) -> &str {
         &self.fcm_sender_id
     }
+
+    /// Steam account (SteamID64) that owns the companion registration.
+    pub const fn steam_id(&self) -> u64 {
+        self.steam_id
+    }
+
+    /// Owner-only file holding the operator-supplied Rust+ companion auth
+    /// token. Read only when a registration is required.
+    pub fn steam_auth_token_file(&self) -> &Path {
+        &self.steam_auth_token_file
+    }
+
+    /// Owner-only key-encryption keyring file (`key_id:hex32` lines).
+    pub fn keyring_file(&self) -> &Path {
+        &self.keyring_file
+    }
+
+    /// Key id used to wrap newly written data keys.
+    pub fn active_key_id(&self) -> &str {
+        &self.active_key_id
+    }
+
+    fn from_lookup<F>(lookup: &mut F) -> Result<Option<Self>, ConfigError>
+    where
+        F: FnMut(&'static str) -> Result<Option<String>, ConfigError>,
+    {
+        let fcm_sender_id = load_secret(
+            lookup,
+            "RUSTPLUS_FCM_SENDER_ID",
+            "RUSTPLUS_FCM_SENDER_ID_FILE",
+        )?;
+        let steam_id = optional(lookup, "RUSTPLUS_STEAM_ID")?;
+        let steam_auth_token_file = optional(lookup, "RUSTPLUS_STEAM_AUTH_TOKEN_FILE")?;
+        let keyring_file = optional(lookup, "SECRET_KEYRING_FILE")?;
+        let active_key_id = optional(lookup, "SECRET_ACTIVE_KEY_ID")?;
+        let values = [
+            fcm_sender_id,
+            steam_id,
+            steam_auth_token_file,
+            keyring_file,
+            active_key_id,
+        ];
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if let Some(index) = values.iter().position(Option::is_none) {
+            return Err(ConfigError::PartialRustPlus {
+                missing: RUSTPLUS_VARIABLES[index],
+            });
+        }
+        let mut values = values.into_iter().flatten();
+        let mut next = || values.next().unwrap_or_default();
+        let fcm_sender_id = next();
+        let steam_id = next();
+        let steam_auth_token_file = next();
+        let keyring_file = next();
+        let active_key_id = next();
+
+        let steam_id = steam_id
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(ConfigError::InvalidRustPlus {
+                variable: "RUSTPLUS_STEAM_ID",
+                reason: "expected a non-zero SteamID64",
+            })?;
+        let active_key_id = active_key_id.trim().to_owned();
+        if active_key_id.len() > 64
+            || !active_key_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ConfigError::InvalidRustPlus {
+                variable: "SECRET_ACTIVE_KEY_ID",
+                reason: "expected 1-64 characters from [A-Za-z0-9._-]",
+            });
+        }
+        let steam_auth_token_file =
+            absolute_path("RUSTPLUS_STEAM_AUTH_TOKEN_FILE", steam_auth_token_file)?;
+        let keyring_file = absolute_path("SECRET_KEYRING_FILE", keyring_file)?;
+        Ok(Some(Self {
+            fcm_sender_id,
+            steam_id,
+            steam_auth_token_file,
+            keyring_file,
+            active_key_id,
+        }))
+    }
+}
+
+fn absolute_path(variable: &'static str, value: String) -> Result<PathBuf, ConfigError> {
+    let path = PathBuf::from(value.trim());
+    if !path.is_absolute() {
+        return Err(ConfigError::InvalidRustPlus {
+            variable,
+            reason: "expected an absolute file path",
+        });
+    }
+    Ok(path)
 }
 
 impl Config {
@@ -160,8 +275,7 @@ impl Config {
                 value: "TELEMETRY_FORMAT",
             })?;
 
-        let rustplus = optional(&mut lookup, "RUSTPLUS_FCM_SENDER_ID")?
-            .map(|fcm_sender_id| RustPlusConfig { fcm_sender_id });
+        let rustplus = RustPlusConfig::from_lookup(&mut lookup)?;
 
         Ok(Self {
             discord_token,
@@ -236,6 +350,10 @@ impl Debug for RustPlusConfig {
         formatter
             .debug_struct("RustPlusConfig")
             .field("fcm_sender_id", &REDACTED)
+            .field("steam_id", &self.steam_id)
+            .field("steam_auth_token_file", &self.steam_auth_token_file)
+            .field("keyring_file", &self.keyring_file)
+            .field("active_key_id", &self.active_key_id)
             .finish()
     }
 }
@@ -299,6 +417,13 @@ pub enum ConfigError {
     InvalidBoolean { variable: &'static str },
     /// The telemetry output format is not supported.
     InvalidTelemetryFormat { value: &'static str },
+    /// Only some of the Rust+ variables were set; the group is all-or-nothing.
+    PartialRustPlus { missing: &'static str },
+    /// A Rust+ variable was set to an unusable value.
+    InvalidRustPlus {
+        variable: &'static str,
+        reason: &'static str,
+    },
     /// Both direct environment variable and _FILE variable were provided.
     SecretCollision {
         variable: &'static str,
@@ -348,6 +473,13 @@ impl Display for ConfigError {
             }
             Self::InvalidTelemetryFormat { value } => {
                 write!(formatter, "unsupported telemetry format in {value}")
+            }
+            Self::PartialRustPlus { missing } => write!(
+                formatter,
+                "incomplete Rust+ configuration: {missing} is required when any Rust+ variable is set"
+            ),
+            Self::InvalidRustPlus { variable, reason } => {
+                write!(formatter, "invalid {variable}: {reason}")
             }
             Self::SecretCollision {
                 variable,
@@ -406,59 +538,84 @@ where
 
 /// Reads and validates a secret file from disk.
 ///
-/// Ensures the file exists, is not a symlink, is a regular file, is owned by
-/// the process UID (on Unix), is not readable or writable by group/others (`mode & 0o077 == 0`),
-/// and is non-empty. Returns the trimmed secret content wrapped in [`Zeroizing`].
+/// On Unix, the file is opened once with no-follow semantics and all owner,
+/// mode, type, and size checks use that descriptor, closing path-stat/open
+/// races. The trimmed secret is zeroized on drop.
 pub fn read_secret_file(
     path: impl AsRef<Path>,
     file_variable: &'static str,
 ) -> Result<Zeroizing<String>, ConfigError> {
+    use std::io::Read;
+
+    const MAX_SECRET_BYTES: u64 = 64 * 1024;
     let path = path.as_ref();
-    let metadata = fs::symlink_metadata(path).map_err(|_| ConfigError::InvalidSecretFile {
-        file_variable,
-        reason: "cannot read file metadata or file does not exist",
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(ConfigError::InvalidSecretFile {
-            file_variable,
-            reason: "secret file must not be a symbolic link",
-        });
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
     }
+    #[cfg(not(unix))]
+    {
+        if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(ConfigError::InvalidSecretFile {
+                file_variable,
+                reason: "secret file must not be a symbolic link",
+            });
+        }
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| ConfigError::InvalidSecretFile {
+            file_variable,
+            reason: "cannot open secret file without following links",
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ConfigError::InvalidSecretFile {
+            file_variable,
+            reason: "cannot read opened secret file metadata",
+        })?;
     if !metadata.is_file() {
         return Err(ConfigError::InvalidSecretFile {
             file_variable,
             reason: "path is not a regular file",
         });
     }
-
+    if metadata.len() > MAX_SECRET_BYTES {
+        return Err(ConfigError::InvalidSecretFile {
+            file_variable,
+            reason: "secret file exceeds 64 KiB",
+        });
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let euid = rustix::process::geteuid().as_raw();
-        if metadata.uid() != euid {
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
             return Err(ConfigError::InvalidSecretFile {
                 file_variable,
                 reason: "secret file must be owned by the current process user",
             });
         }
-        let mode = metadata.mode();
-        if mode & 0o077 != 0 {
+        if metadata.mode() & 0o077 != 0 {
             return Err(ConfigError::InvalidSecretFile {
                 file_variable,
-                reason: "secret file permissions must not permit group or other access (must be 0400 or 0600)",
+                reason: "secret file permissions must be 0400 or 0600",
             });
         }
     }
-
-    let content = fs::read_to_string(path).map_err(|_| ConfigError::InvalidSecretFile {
-        file_variable,
-        reason: "cannot read secret file as valid UTF-8",
-    })?;
-    let trimmed = content.trim().to_owned();
+    let mut content = Zeroizing::new(String::with_capacity(metadata.len() as usize));
+    file.read_to_string(&mut content)
+        .map_err(|_| ConfigError::InvalidSecretFile {
+            file_variable,
+            reason: "cannot read secret file as valid UTF-8",
+        })?;
+    let trimmed = content.trim();
     if trimmed.is_empty() {
         return Err(ConfigError::EmptySecretFile { file_variable });
     }
-    Ok(Zeroizing::new(trimmed))
+    Ok(Zeroizing::new(trimmed.to_owned()))
 }
 
 fn load_secret<F>(
@@ -574,7 +731,7 @@ fn parse_bool(value: &str, variable: &'static str) -> Result<bool, ConfigError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, MigrationConfig};
+    use super::{Config, ConfigError, MigrationConfig, read_secret_file};
     use std::collections::HashMap;
     use std::fs;
 
@@ -853,5 +1010,155 @@ mod tests {
         if let Ok(config) = result {
             assert!(config.rustplus().is_none());
         }
+    }
+
+    const RUSTPLUS: [(&str, &str); 5] = [
+        ("RUSTPLUS_FCM_SENDER_ID", "sender-secret"),
+        ("RUSTPLUS_STEAM_ID", "76561198000000001"),
+        (
+            "RUSTPLUS_STEAM_AUTH_TOKEN_FILE",
+            "/run/secrets/rustplus_token",
+        ),
+        ("SECRET_KEYRING_FILE", "/run/secrets/keyring"),
+        ("SECRET_ACTIVE_KEY_ID", "key-2026-10"),
+    ];
+
+    fn with_rustplus(
+        overrides: &[(&'static str, &'static str)],
+        omit: Option<&str>,
+    ) -> Result<Config, ConfigError> {
+        let mut values = vec![
+            ("DISCORD_TOKEN", "token"),
+            ("DATABASE_URL", "postgres://localhost/bot"),
+            ("DATABASE_TLS_MODE", "insecure"),
+        ];
+        for (name, value) in RUSTPLUS {
+            if Some(name) == omit {
+                continue;
+            }
+            let value = overrides
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map_or(value, |(_, value)| *value);
+            values.push((name, value));
+        }
+        config(&values)
+    }
+
+    #[test]
+    fn complete_rustplus_configuration_is_typed_and_redacted() {
+        let result = with_rustplus(&[], None);
+        assert!(result.is_ok());
+        if let Ok(config) = result {
+            let rustplus = config.rustplus();
+            assert!(rustplus.is_some());
+            if let Some(rustplus) = rustplus {
+                assert_eq!(rustplus.steam_id(), 76_561_198_000_000_001);
+                assert_eq!(rustplus.active_key_id(), "key-2026-10");
+                assert_eq!(
+                    rustplus.keyring_file(),
+                    std::path::Path::new("/run/secrets/keyring")
+                );
+            }
+            let debug = format!("{config:?}");
+            assert!(!debug.contains("sender-secret"));
+            assert_eq!(debug.matches("[REDACTED]").count(), 3);
+        }
+    }
+
+    #[test]
+    fn partial_rustplus_configuration_is_a_typed_error() {
+        for (missing, _) in RUSTPLUS {
+            assert_eq!(
+                with_rustplus(&[], Some(missing)).err(),
+                Some(ConfigError::PartialRustPlus { missing }),
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_rustplus_values_are_rejected() {
+        let cases: [(&'static str, &'static str); 6] = [
+            ("RUSTPLUS_STEAM_ID", "0"),
+            ("RUSTPLUS_STEAM_ID", "steam"),
+            ("SECRET_ACTIVE_KEY_ID", "bad key"),
+            ("SECRET_ACTIVE_KEY_ID", "k\u{e9}y"),
+            ("SECRET_KEYRING_FILE", "relative/keyring"),
+            ("RUSTPLUS_STEAM_AUTH_TOKEN_FILE", "token.txt"),
+        ];
+        for (variable, value) in cases {
+            assert!(matches!(
+                with_rustplus(&[(variable, value)], None),
+                Err(ConfigError::InvalidRustPlus { variable: v, .. }) if v == variable
+            ));
+        }
+        assert_eq!(
+            with_rustplus(&[("RUSTPLUS_FCM_SENDER_ID", " ")], None).err(),
+            Some(ConfigError::Empty {
+                variable: "RUSTPLUS_FCM_SENDER_ID"
+            })
+        );
+    }
+
+    #[test]
+    fn rustplus_sender_id_can_be_loaded_from_owner_only_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let sender_path = dir.path().join("sender-id");
+        fs::write(&sender_path, "  sender-from-file \n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&sender_path, fs::Permissions::from_mode(0o400))?;
+        }
+        let mut values = HashMap::from([
+            ("DISCORD_TOKEN".to_owned(), "token".to_owned()),
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://localhost/bot".to_owned(),
+            ),
+            ("DATABASE_TLS_MODE".to_owned(), "insecure".to_owned()),
+            (
+                "RUSTPLUS_FCM_SENDER_ID_FILE".to_owned(),
+                sender_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "RUSTPLUS_STEAM_ID".to_owned(),
+                "76561198000000001".to_owned(),
+            ),
+            (
+                "RUSTPLUS_STEAM_AUTH_TOKEN_FILE".to_owned(),
+                "/run/secrets/rustplus_token".to_owned(),
+            ),
+            (
+                "SECRET_KEYRING_FILE".to_owned(),
+                "/run/secrets/keyring".to_owned(),
+            ),
+            ("SECRET_ACTIVE_KEY_ID".to_owned(), "key-2026-10".to_owned()),
+        ]);
+        let config = Config::from_lookup(|name| Ok(values.remove(name)))?;
+        assert_eq!(
+            config.rustplus().map(super::RustPlusConfig::fcm_sender_id),
+            Some("sender-from-file"),
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_reader_rejects_symlink() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::{fs::PermissionsExt, fs::symlink};
+
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::write(&target, "secret")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o400))?;
+        symlink(&target, &link)?;
+        assert!(matches!(
+            read_secret_file(&link, "TEST_SECRET_FILE"),
+            Err(ConfigError::InvalidSecretFile { .. })
+        ));
+        Ok(())
     }
 }

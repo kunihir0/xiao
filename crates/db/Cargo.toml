@@ -10,12 +10,18 @@ publish = false
 workspace = true
 
 [dependencies]
+bot-application = { version = "0.1.0", path = "../application" }
+bot-domain = { version = "0.1.0", path = "../domain" }
 tokio = { version = "1.53.2", features = ["sync"] }
 deadpool = { version = "0.13.1", features = ["rt_tokio_1"] }
-diesel = { version = "2.3.13", features = ["postgres"] }
+diesel = { version = "2.3.13", features = ["postgres", "uuid"] }
 diesel-async = { version = "0.9.2", features = ["postgres", "migrations", "deadpool"] }
 diesel_migrations = "2.3.2"
-thiserror = "2.0.21"
+aes-gcm-siv.workspace = true
+rand.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
 tokio-postgres = "0.7.18"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }

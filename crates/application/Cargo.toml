@@ -11,8 +11,11 @@ workspace = true
 
 [dependencies]
 bot-domain = { version = "0.1.0", path = "../domain" }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
 tokio-util = { workspace = true, features = ["rt"] }
+uuid.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 bot-test-support = { path = "../test-support", version = "0.1.0" }

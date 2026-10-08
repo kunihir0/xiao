@@ -2,17 +2,26 @@
 
 use std::sync::Arc;
 
-use bot::{BoxError, Composition, CompositionError, CtrlCSignal, ShutdownSignal};
+use bot::{BoxError, Composition, CtrlCSignal};
 use bot_application::{
-    MemoryPairingStore, PairingService, PairingSource, SessionConfig, SessionConnector,
+    CompanionRegistrar, PairingService, PushCredentialStore, SessionConfig, SteamAuthTokenSource,
+    ensure_companion_registration,
 };
-use bot_config::Config;
-use bot_db::{Db, DbConfig};
+use bot_config::{Config, RustPlusConfig};
+use bot_db::{
+    Db, DbConfig, FileKeyring, KeyProvider, PostgresPairingStore, PostgresPushCredentialStore,
+    rewrap_secrets,
+};
 use bot_discord::{DiscordConfig, DiscordHandle};
+use bot_domain::SteamId;
 use bot_telemetry::init_from_config;
 use push_receiver::{FcmConnector, ProductionConfig};
-use rustplus_adapter::{ParseConfig, PushPairingSource, RustPlusSessionConnector};
+use rustplus_adapter::{
+    CompanionEndpoints, FacepunchRegistrar, FileSteamAuthToken, ParseConfig, PushPairingSource,
+    RustPlusSessionConnector, snapshot_from_fcm_secrets,
+};
 use rustplus_client::ReconnectPolicy;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 #[tokio::main]
@@ -23,26 +32,79 @@ async fn main() {
     }
 }
 
-fn register_pairing_service<Signal, Source, Connector>(
-    composition: &mut Composition<Signal>,
-    enabled: bool,
-    service: PairingService<Source, Connector>,
-) -> Result<(), CompositionError>
-where
-    Signal: ShutdownSignal,
-    Source: PairingSource + Sync + 'static,
-    Connector: SessionConnector + 'static,
-{
-    if !enabled {
-        return Ok(());
-    }
-    let cancellation = composition.cancellation_token();
-    composition.register("rustplus-pairing", async move {
-        service
-            .run(cancellation)
-            .await
-            .map_err(|error| Box::new(error) as BoxError)
-    })
+/// Restores the active companion registration (no network) or completes
+/// enrollment, then builds an FCM connector from the persisted snapshot so
+/// Google check-in/register is never repeated for a restored credential.
+async fn restore_fcm_connector(
+    credentials: &dyn PushCredentialStore,
+    registrar: &dyn CompanionRegistrar,
+    tokens: &dyn SteamAuthTokenSource,
+    steam_id: SteamId,
+    fcm_sender_id: &str,
+) -> Result<FcmConnector, BoxError> {
+    let outcome = ensure_companion_registration(credentials, registrar, tokens, steam_id).await?;
+    info!(
+        kind = ?outcome.kind,
+        credential = %outcome.credential.id,
+        "Rust+ companion credentials ready"
+    );
+    let snapshot = snapshot_from_fcm_secrets(&outcome.credential.fcm)?;
+    Ok(FcmConnector::from_snapshot(fcm_sender_id, snapshot)?)
+}
+
+/// Owns the whole Rust+ lifecycle: secret rewrap, credential restore or
+/// enrollment, then the pairing service. Cancellation is honoured during
+/// startup as well as while running.
+async fn run_rustplus(
+    database: Arc<Db>,
+    keys: Arc<dyn KeyProvider>,
+    config: RustPlusConfig,
+    cancellation: CancellationToken,
+) -> Result<(), BoxError> {
+    let startup = async {
+        let rewrapped = rewrap_secrets(&database, keys.as_ref()).await?;
+        info!(
+            credentials = rewrapped.credentials,
+            pairings = rewrapped.pairings,
+            "secret data keys wrapped with the active key"
+        );
+        let steam_id = SteamId::new(config.steam_id())?;
+        let credentials =
+            PostgresPushCredentialStore::new(Arc::clone(&database), Arc::clone(&keys));
+        let registrar = FacepunchRegistrar::new(
+            config.fcm_sender_id().to_owned(),
+            CompanionEndpoints::production(),
+        )?;
+        let tokens = FileSteamAuthToken::new(config.steam_auth_token_file().to_path_buf());
+        restore_fcm_connector(
+            &credentials,
+            &registrar,
+            &tokens,
+            steam_id,
+            config.fcm_sender_id(),
+        )
+        .await
+    };
+    let fcm = tokio::select! {
+        () = cancellation.cancelled() => return Ok(()),
+        result = startup => Arc::new(result?),
+    };
+    let receiver_config = ProductionConfig::default();
+    let receiver = push_receiver::start_connected(
+        fcm,
+        receiver_config.queue_capacity,
+        receiver_config.dedupe_capacity,
+        receiver_config.retry,
+    );
+    let source = PushPairingSource::new(receiver, ParseConfig::default());
+    let connector = RustPlusSessionConnector::new(ReconnectPolicy::default())?;
+    let store = PostgresPairingStore::new(database, keys);
+    let (service, _service_handle) =
+        PairingService::new(source, connector, store, SessionConfig::default());
+    service
+        .run(cancellation)
+        .await
+        .map_err(|error| Box::new(error) as BoxError)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,7 +196,7 @@ async fn run() -> Result<(), BoxError> {
                 false
             };
             let database_config = create_db_config(config.database_url(), config.database_tls())?;
-            let database = Db::connect(&database_config).await?;
+            let database = Arc::new(Db::connect(&database_config).await?);
             if migrate_on_startup {
                 info!("startup migrations enabled: initializing database");
                 let report = database.initialize().await?;
@@ -151,25 +213,24 @@ async fn run() -> Result<(), BoxError> {
             // Database startup is complete before Discord is constructed.
             let mut composition = Composition::new(CtrlCSignal);
             if let Some(rustplus_config) = config.rustplus() {
-                let fcm = Arc::new(FcmConnector::new(rustplus_config.fcm_sender_id())?);
-                let receiver_config = ProductionConfig::default();
-                let receiver = push_receiver::start_connected(
-                    fcm,
-                    receiver_config.queue_capacity,
-                    receiver_config.dedupe_capacity,
-                    receiver_config.retry,
-                );
-                let source = PushPairingSource::new(receiver, ParseConfig::default());
-                let connector = RustPlusSessionConnector::new(ReconnectPolicy::default())?;
-                let (service, _service_handle) = PairingService::new(
-                    source,
-                    connector,
-                    MemoryPairingStore::default(),
-                    SessionConfig::default(),
-                );
-                register_pairing_service(&mut composition, true, service)?;
+                // Fail closed before starting components when the keyring is
+                // absent, malformed, or not owner-only.
+                let keys: Arc<dyn KeyProvider> = Arc::new(FileKeyring::load(
+                    rustplus_config.keyring_file(),
+                    rustplus_config.active_key_id(),
+                )?);
+                let cancellation = composition.cancellation_token();
+                composition.register(
+                    "rustplus-pairing",
+                    run_rustplus(
+                        Arc::clone(&database),
+                        keys,
+                        rustplus_config.clone(),
+                        cancellation,
+                    ),
+                )?;
             } else {
-                info!("Rust+ pairing disabled: no RUSTPLUS_FCM_SENDER_ID configured");
+                info!("Rust+ pairing disabled: no Rust+ companion configuration");
             }
             let discord =
                 DiscordHandle::new(DiscordConfig::new(config.discord_token().to_owned())?);
@@ -191,52 +252,102 @@ async fn run() -> Result<(), BoxError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bot_application::{
+        BoxFuture, CredentialId, CredentialState, DeviceId, FcmSecrets, PushCredential,
+        RegistrationError, SteamAuthToken, StoreError,
+    };
+
     use super::*;
-    use bot::{Readiness, channel_signal};
-    use bot_test_support::{FakePairingSource, FakeSessionConnector};
 
-    fn service() -> (
-        PairingService<FakePairingSource, FakeSessionConnector>,
-        bot_test_support::FakePairingSender,
-    ) {
-        let (source, sender) = FakePairingSource::new(1);
-        let (service, _) = PairingService::new(
-            source,
-            FakeSessionConnector::new(),
-            MemoryPairingStore::default(),
-            SessionConfig::default(),
-        );
-        (service, sender)
+    struct ActiveOnlyStore(PushCredential);
+
+    impl PushCredentialStore for ActiveOnlyStore {
+        fn load_active<'a>(
+            &'a self,
+            _steam_id: SteamId,
+        ) -> BoxFuture<'a, Result<Option<PushCredential>, StoreError>> {
+            Box::pin(async move { Ok(Some(self.0.clone())) })
+        }
+        fn load_pending<'a>(
+            &'a self,
+            _steam_id: SteamId,
+        ) -> BoxFuture<'a, Result<Option<PushCredential>, StoreError>> {
+            Box::pin(async { Err(StoreError::Unavailable) })
+        }
+        fn save_pending<'a>(
+            &'a self,
+            _credential: &'a PushCredential,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async { Err(StoreError::Unavailable) })
+        }
+        fn promote_active<'a>(
+            &'a self,
+            _id: CredentialId,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async { Err(StoreError::Unavailable) })
+        }
+        fn retire<'a>(&'a self, _id: CredentialId) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async { Err(StoreError::Unavailable) })
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingNetwork(AtomicUsize);
+
+    impl CompanionRegistrar for CountingNetwork {
+        fn create_fcm_credentials<'a>(
+            &'a self,
+        ) -> BoxFuture<'a, Result<FcmSecrets, RegistrationError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(RegistrationError::Transport("test")) })
+        }
+        fn register<'a>(
+            &'a self,
+            _auth_token: &'a SteamAuthToken,
+            _device_id: &'a DeviceId,
+            _fcm: &'a FcmSecrets,
+        ) -> BoxFuture<'a, Result<(), RegistrationError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(RegistrationError::Transport("test")) })
+        }
+    }
+
+    impl SteamAuthTokenSource for CountingNetwork {
+        fn load<'a>(&'a self) -> BoxFuture<'a, Result<SteamAuthToken, RegistrationError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(RegistrationError::AuthTokenUnavailable("test")) })
+        }
     }
 
     #[tokio::test]
-    async fn enabled_pairing_service_is_joined_on_channel_shutdown() -> Result<(), BoxError> {
-        let (mut trigger, signal) = channel_signal();
-        let mut composition = Composition::new(signal);
-        let (service, _sender) = service();
-        register_pairing_service(&mut composition, true, service)?;
-        let task = tokio::spawn(composition.run());
-        trigger.trigger()?;
-        let report = task.await??;
-        assert_eq!(report.readiness, Readiness::Stopped);
-        assert!(report.shutdown_requested);
-        assert_eq!(report.joined_tasks, 1);
-        Ok(())
-    }
+    async fn active_credential_restores_connector_without_any_registration() {
+        let steam_id = SteamId::new(76_561_198_000_000_001).unwrap();
+        let fcm = FcmSecrets::new(41, 42, "restored-token".to_owned(), [5; 32], [6; 16]).unwrap();
+        let store = ActiveOnlyStore(PushCredential {
+            id: CredentialId::generate(),
+            steam_id,
+            device_id: DeviceId::generate(),
+            state: CredentialState::Active,
+            fcm,
+        });
+        let network = CountingNetwork::default();
 
-    #[tokio::test]
-    async fn disabled_pairing_service_is_not_registered() -> Result<(), BoxError> {
-        let (mut trigger, signal) = channel_signal();
-        let mut composition = Composition::new(signal);
-        let (service, _sender) = service();
-        register_pairing_service(&mut composition, false, service)?;
-        trigger.trigger()?;
-        let report = composition.run().await?;
-        assert_eq!(report.readiness, Readiness::Stopped);
-        assert!(report.shutdown_requested);
-        assert_eq!(report.joined_tasks, 0);
-        Ok(())
+        let connector = restore_fcm_connector(&store, &network, &network, steam_id, "976529667804")
+            .await
+            .unwrap();
+
+        assert_eq!(network.0.load(Ordering::SeqCst), 0);
+        let snapshot = connector.snapshot().await.unwrap();
+        assert_eq!(snapshot.checkin.android_id(), 41);
+        assert_eq!(snapshot.checkin.security_token(), 42);
+        assert_eq!(snapshot.registration_token.as_str(), "restored-token");
+        assert_eq!(snapshot.keys.private_key_bytes(), Some([5; 32]));
+        assert_eq!(snapshot.keys.auth_secret_bytes(), Some([6; 16]));
+        assert!(!format!("{connector:?}").contains("restored-token"));
     }
 
     #[test]

@@ -53,12 +53,30 @@ done
 check_secret_file DISCORD_TOKEN_FILE
 check_secret_file DATABASE_URL_FILE
 check_secret_file MIGRATION_DATABASE_URL_FILE
-check_secret_file RUSTPLUS_FCM_SENDER_ID_FILE optional
 
 # The CA bundle is also a secret-manager file source. Inside the container it is
 # always mounted as /run/secrets/database_ca.
 if [[ "${DATABASE_TLS_MODE:-verify-full}" == "verify-full" ]]; then
   check_secret_file DATABASE_CA_SOURCE
+fi
+
+# Rust+ is opt-in but all values are required together when enabled. Sender ID
+# and bearer/keyring values are file-backed; Steam ID and active key ID are
+# non-secret metadata.
+rustplus_enabled=false
+for name in RUSTPLUS_FCM_SENDER_ID_SOURCE RUSTPLUS_STEAM_ID \
+  RUSTPLUS_STEAM_AUTH_TOKEN_SOURCE SECRET_KEYRING_SOURCE SECRET_ACTIVE_KEY_ID; do
+  value=$(printenv "$name" 2>/dev/null || true)
+  [[ -z "$value" ]] || rustplus_enabled=true
+done
+if [[ "$rustplus_enabled" == true ]]; then
+  check_secret_file RUSTPLUS_FCM_SENDER_ID_SOURCE
+  check_secret_file RUSTPLUS_STEAM_AUTH_TOKEN_SOURCE
+  check_secret_file SECRET_KEYRING_SOURCE
+  [[ "${RUSTPLUS_STEAM_ID:-}" =~ ^[1-9][0-9]+$ ]] \
+    || fail "RUSTPLUS_STEAM_ID must be a non-zero SteamID64"
+  [[ "${SECRET_ACTIVE_KEY_ID:-}" =~ ^[A-Za-z0-9._-]{1,64}$ ]] \
+    || fail "SECRET_ACTIVE_KEY_ID must contain 1-64 characters from [A-Za-z0-9._-]"
 fi
 
 printf '%s\n' 'production environment shape is valid (secret values not printed)'

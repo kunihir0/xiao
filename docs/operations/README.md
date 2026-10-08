@@ -54,3 +54,5 @@ path. Every release record MUST include the immutable artifact digest, source
 commit, migration compatibility decision, six CI gates, and deployment smoke
 evidence.
 
+- [Rust+ companion credentials](rustplus-companion.md): configuration, keyring,
+  out-of-band auth token, re-enrollment, key rotation, and platform limits.

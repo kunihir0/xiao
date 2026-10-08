@@ -44,6 +44,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-gcm-siv"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c32325128cb24de2a2d14d92da7569dae7073f9e47334521d494747fa94d902"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ctutils",
+ "polyval",
+ "zeroize",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -161,8 +176,8 @@ dependencies = [
  "bot-config",
  "bot-db",
  "bot-discord",
+ "bot-domain",
  "bot-telemetry",
- "bot-test-support",
  "push-receiver",
  "rustplus-adapter",
  "rustplus-client",
@@ -177,8 +192,11 @@ version = "0.1.0"
 dependencies = [
  "bot-domain",
  "bot-test-support",
+ "rustix",
  "tokio",
  "tokio-util",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -195,17 +213,22 @@ dependencies = [
 name = "bot-db"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm-siv",
+ "bot-application",
+ "bot-domain",
  "deadpool",
  "diesel",
  "diesel-async",
  "diesel_migrations",
  "futures-util",
+ "rand 0.10.3",
  "rustls",
  "thiserror 2.0.21",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -591,6 +614,7 @@ dependencies = [
  "downcast-rs",
  "itoa",
  "pq-sys",
+ "uuid",
 ]
 
 [[package]]
@@ -2015,6 +2039,7 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots 1.0.9",
+ "zeroize",
 ]
 
 [[package]]
@@ -2335,9 +2360,12 @@ version = "0.1.0"
 dependencies = [
  "bot-application",
  "bot-domain",
+ "bytes",
  "futures-util",
  "proptest",
  "push-receiver",
+ "reqwest",
+ "rustls",
  "rustplus-client",
  "serde",
  "serde_json",
@@ -2345,6 +2373,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "url",
+ "zeroize",
 ]
 
 [[package]]

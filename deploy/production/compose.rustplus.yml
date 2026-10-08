@@ -1,0 +1,34 @@
+# Optional overlay enabling Rust+ companion enrollment and encrypted restore.
+# Use with: docker compose -f compose.yml -f compose.rustplus.yml ...
+secrets:
+  rustplus_fcm_sender_id:
+    file: "${RUSTPLUS_FCM_SENDER_ID_SOURCE:?set RUSTPLUS_FCM_SENDER_ID_SOURCE}"
+  rustplus_steam_auth_token:
+    file: "${RUSTPLUS_STEAM_AUTH_TOKEN_SOURCE:?set RUSTPLUS_STEAM_AUTH_TOKEN_SOURCE}"
+  rustplus_secret_keyring:
+    file: "${SECRET_KEYRING_SOURCE:?set SECRET_KEYRING_SOURCE}"
+
+services:
+  bot:
+    environment:
+      RUSTPLUS_FCM_SENDER_ID_FILE: /run/secrets/rustplus_fcm_sender_id
+      RUSTPLUS_STEAM_ID: "${RUSTPLUS_STEAM_ID:?set RUSTPLUS_STEAM_ID}"
+      RUSTPLUS_STEAM_AUTH_TOKEN_FILE: /run/secrets/rustplus_steam_auth_token
+      SECRET_KEYRING_FILE: /run/secrets/rustplus_secret_keyring
+      SECRET_ACTIVE_KEY_ID: "${SECRET_ACTIVE_KEY_ID:?set SECRET_ACTIVE_KEY_ID}"
+    secrets:
+      - source: rustplus_fcm_sender_id
+        target: rustplus_fcm_sender_id
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: rustplus_steam_auth_token
+        target: rustplus_steam_auth_token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: rustplus_secret_keyring
+        target: rustplus_secret_keyring
+        uid: "10001"
+        gid: "10001"
+        mode: 0400

@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::{
     Error, Notification, Result,
     checkin::{
-        CheckinCredentials, build_checkin_request, parse_checkin_response,
+        CheckinCredentials, RegistrationToken, build_checkin_request, parse_checkin_response,
         parse_registration_response,
     },
     codec::{FrameTag, McsCodec, McsFrame},
@@ -107,6 +107,24 @@ pub enum SessionEvent {
     Closed,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct FcmRegistrationSnapshot {
+    pub checkin: CheckinCredentials,
+    pub registration_token: RegistrationToken,
+    pub keys: WebPushKeyMaterial,
+}
+
+impl std::fmt::Debug for FcmRegistrationSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FcmRegistrationSnapshot")
+            .field("checkin", &self.checkin)
+            .field("registration_token", &"<redacted>")
+            .field("keys", &self.keys)
+            .finish()
+    }
+}
+
 /// Creates authenticated sessions, retaining no raw wire types at the API boundary.
 pub trait ReceiverConnector: Send + Sync {
     fn connect<'a>(
@@ -126,6 +144,7 @@ pub struct FcmConnector {
     credentials: Arc<tokio::sync::Mutex<Option<CheckinCredentials>>>,
     web_push_keys: Arc<tokio::sync::Mutex<Option<WebPushKeyMaterial>>>,
     sender_id: String,
+    registration_token: Arc<tokio::sync::Mutex<Option<RegistrationToken>>>,
 }
 
 impl std::fmt::Debug for FcmConnector {
@@ -172,7 +191,68 @@ impl FcmConnector {
             credentials: Arc::new(tokio::sync::Mutex::new(None)),
             web_push_keys: Arc::new(tokio::sync::Mutex::new(None)),
             sender_id,
+            registration_token: Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+
+    pub fn from_snapshot(
+        sender_id: impl Into<String>,
+        snapshot: FcmRegistrationSnapshot,
+    ) -> Result<Self> {
+        let sender_id = sender_id.into();
+        if sender_id.is_empty() || sender_id.len() > 256 {
+            return Err(Error::MissingCredential("sender_id"));
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::builder()
+            .https_only(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(IO_TIMEOUT)
+            .build()
+            .map_err(http_error)?;
+        Ok(Self {
+            client,
+            checkin_url: "https://android.clients.google.com/checkin".into(),
+            registration_url: "https://android.clients.google.com/c2dm/register3".into(),
+            subscribe_url: "https://fcm.googleapis.com/fcm/connect/subscribe".into(),
+            mcs_host: "mtalk.google.com".into(),
+            mcs_port: 5228,
+            credentials: Arc::new(tokio::sync::Mutex::new(Some(snapshot.checkin))),
+            web_push_keys: Arc::new(tokio::sync::Mutex::new(Some(snapshot.keys))),
+            registration_token: Arc::new(tokio::sync::Mutex::new(Some(
+                snapshot.registration_token,
+            ))),
+            sender_id,
+        })
+    }
+
+    pub async fn snapshot(&self) -> Option<FcmRegistrationSnapshot> {
+        let checkin = *self.credentials.lock().await;
+        let registration_token = self.registration_token.lock().await.clone();
+        let keys = self.web_push_keys.lock().await.clone();
+        match (checkin, registration_token, keys) {
+            (Some(checkin), Some(registration_token), Some(keys)) => {
+                Some(FcmRegistrationSnapshot {
+                    checkin,
+                    registration_token,
+                    keys,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Ensures the legacy FCM registration is complete and returns all
+    /// credentials needed to restore a companion receiver.
+    pub async fn register(&self) -> Result<FcmRegistrationSnapshot> {
+        self.ensure_registered().await?;
+        self.snapshot()
+            .await
+            .ok_or(Error::InvalidState("FCM registration snapshot incomplete"))
+    }
+
+    pub async fn registration_token(&self) -> Option<RegistrationToken> {
+        self.registration_token.lock().await.clone()
     }
 
     #[must_use]
@@ -247,6 +327,7 @@ impl FcmConnector {
         let registration_body = String::from_utf8(bounded_body(registration, 4096).await?)
             .map_err(|_| Error::InvalidRegistration("registration response is not UTF-8".into()))?;
         let token = parse_registration_response(&registration_body)?;
+        *self.registration_token.lock().await = Some(token.clone());
         let key_material = generate_web_push_keys();
         let subscribe_form = [
             ("authorized_entity", self.sender_id.clone()),
@@ -558,6 +639,7 @@ impl Default for ProductionConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -611,5 +693,30 @@ mod tests {
             assert!(!debug.contains("secret.example"));
             assert!(!debug.contains("token=secret"));
         }
+    }
+
+    #[tokio::test]
+    async fn connector_from_snapshot_populates_credentials_and_redacts() {
+        let checkin = CheckinCredentials::new(12345, 67890).unwrap();
+        let token = RegistrationToken::new("secret-fcm-token-value").unwrap();
+        let keys = WebPushKeyMaterial::from_bytes([7u8; 32], [8u8; 16]);
+        let snapshot = FcmRegistrationSnapshot {
+            checkin,
+            registration_token: token,
+            keys,
+        };
+        let debug = format!("{snapshot:?}");
+        assert!(!debug.contains("secret-fcm-token-value"));
+        assert!(debug.contains("<redacted>"));
+
+        let connector = FcmConnector::from_snapshot("12345678", snapshot.clone()).unwrap();
+        let restored_snapshot = connector.snapshot().await.unwrap();
+        assert_eq!(restored_snapshot.checkin, checkin);
+        assert_eq!(
+            restored_snapshot.registration_token.as_str(),
+            "secret-fcm-token-value"
+        );
+        assert_eq!(restored_snapshot.keys.private_key(), &[7u8; 32]);
+        assert_eq!(restored_snapshot.keys.auth_secret(), &[8u8; 16]);
     }
 }

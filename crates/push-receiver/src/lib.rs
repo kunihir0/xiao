@@ -44,7 +44,10 @@ pub use mcs::{
     encode_heartbeat_ack, encode_login,
 };
 pub use retry::{MAX_RETRY_ATTEMPTS, MAX_RETRY_DELAY, RetryPolicy};
-pub use transport::{FcmConnector, McsSession, ProductionConfig, ReceiverConnector, SessionEvent};
+pub use transport::{
+    FcmConnector, FcmRegistrationSnapshot, McsSession, ProductionConfig, ReceiverConnector,
+    SessionEvent,
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppData {

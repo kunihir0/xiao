@@ -181,9 +181,26 @@ where
             self.readiness.send_replace(ServiceReadiness::Failed);
             return Err(ServiceError::Store(StoreError::Invalid(reason.to_owned())));
         }
-        if let Err(error) = self.store.load().await {
+        let restored = match self.store.load().await {
+            Ok(pairings) => pairings,
+            Err(error) => {
+                self.readiness.send_replace(ServiceReadiness::Failed);
+                return Err(ServiceError::Restore(error));
+            }
+        };
+        if restored.len() > self.config.max_servers {
             self.readiness.send_replace(ServiceReadiness::Failed);
-            return Err(ServiceError::Store(error));
+            return Err(ServiceError::Restore(StoreError::Invalid(format!(
+                "{} persisted pairings exceed max_servers {}",
+                restored.len(),
+                self.config.max_servers
+            ))));
+        }
+        // Restored sessions start in `Connecting`; their individual outcome is
+        // visible through snapshots and never blocks service readiness.
+        for pairing in restored {
+            self.record_dedupe(&pairing);
+            self.spawn_worker(pairing);
         }
         let mut source_readiness = self.source.readiness_watch();
         let initial_readiness = *source_readiness.borrow();
@@ -274,6 +291,12 @@ where
             .upsert(&pairing)
             .await
             .map_err(ServiceError::Store)?;
+        self.spawn_worker(pairing);
+        Ok(())
+    }
+
+    fn spawn_worker(&mut self, pairing: Pairing) {
+        let server = pairing.server_id().clone();
         let session_id = self.allocate_session_id();
         let cancellation = CancellationToken::new();
         let (finished_tx, finished_rx) = oneshot::channel();
@@ -309,7 +332,6 @@ where
             },
         );
         self.publish_snapshots();
-        Ok(())
     }
 
     async fn handle_worker_message(&mut self, message: WorkerMessage) {

@@ -94,10 +94,11 @@ smoke environments; production MUST use `DISCORD_TOKEN_FILE` and
 `xiao-bot` itself validates and reads owner-only `*_FILE` mounts without
 copying secret values into its environment. The entrypoint is an `exec`-only
 shim so `migrate` can load only DDL configuration while the bot loads only
-runtime configuration. Optional Rust+ credential mounts are added by #16;
-until then pairing remains disabled. Never put tokens in image layers, Git,
-command arguments, or logs.
-Rotation is documented in `docs/operations/credential-rotation.md`.
+runtime configuration. Rust+ remains disabled unless the optional
+`compose.rustplus.yml` overlay and its owner-only secret files are supplied;
+see [`rustplus-companion.md`](../../docs/operations/rustplus-companion.md).
+Never put tokens in image layers, Git, command arguments, or logs. Rotation is
+documented in `docs/operations/credential-rotation.md`.
 
 ## Runtime semantics
 

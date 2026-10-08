@@ -43,3 +43,14 @@ All notable externally meaningful changes are documented here. Releases follow S
 - Hardened Rust+ pairing endpoints to public IP literals with special-use
   range rejection, gated insecure local transport behind a test-only feature,
   and preserved typed shutdown/session failure propagation.
+- Added encrypted PostgreSQL persistence for Rust+ companion FCM credentials,
+  Web Push keys, and pairings (per-row AES-256-GCM-SIV data keys wrapped by an
+  owner-only file keyring, startup rewrap rotation), Expo/Facepunch companion
+  push registration from an operator-supplied auth-token file with typed
+  re-enrollment on 401/403, and startup restore without re-registration.
+  **Config change:** Rust+ is enabled only when all of
+  `RUSTPLUS_FCM_SENDER_ID`, `RUSTPLUS_STEAM_ID`,
+  `RUSTPLUS_STEAM_AUTH_TOKEN_FILE`, `SECRET_KEYRING_FILE`, and
+  `SECRET_ACTIVE_KEY_ID` are set; a partial set is a startup error. The
+  in-memory pairing store was removed. See
+  `docs/operations/rustplus-companion.md`.

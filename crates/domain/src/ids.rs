@@ -88,6 +88,22 @@ impl PlayerId {
     }
 }
 
+/// A Steam account identity bound to a Rust+ companion registration.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SteamId(u64);
+
+impl SteamId {
+    pub fn new(value: u64) -> Result<Self, DomainError> {
+        (value != 0)
+            .then_some(Self(value))
+            .ok_or(DomainError::Invalid { field: "steam_id" })
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct EntityId(u32);
 

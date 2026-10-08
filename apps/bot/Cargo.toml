@@ -21,7 +21,7 @@ rustplus-adapter = { version = "0.1.0", path = "../../crates/rustplus-adapter" }
 push-receiver = { version = "0.1.0", path = "../../crates/push-receiver" }
 rustplus-client = { version = "0.1.0", path = "../../crates/rustplus-client" }
 tracing.workspace = true
+bot-domain = { version = "0.1.0", path = "../../crates/domain" }
 
 [dev-dependencies]
-bot-test-support = { path = "../../crates/test-support", version = "0.1.0" }
 tokio = { workspace = true, features = ["test-util"] }

@@ -94,16 +94,28 @@ impl std::error::Error for PairingSourceError {}
 pub enum StoreError {
     Unavailable,
     Invalid(String),
+    /// The key provider is missing a required key or cannot wrap/unwrap.
     SecretStorageUnavailable,
+    /// Stored ciphertext failed authentication or could not be decoded.
+    /// Never treated as an empty store.
+    Decryption,
+    /// A uniqueness constraint (for example one pending credential per Steam
+    /// account) rejected the write.
+    Conflict,
+    /// The referenced record does not exist in the expected state.
+    NotFound,
 }
 impl std::fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable => formatter.write_str("pairing store unavailable"),
+            Self::Unavailable => formatter.write_str("store unavailable"),
             Self::Invalid(message) => {
-                write!(formatter, "invalid pairing store operation: {message}")
+                write!(formatter, "invalid store operation: {message}")
             }
             Self::SecretStorageUnavailable => formatter.write_str("secret storage unavailable"),
+            Self::Decryption => formatter.write_str("stored secret failed authentication"),
+            Self::Conflict => formatter.write_str("store uniqueness conflict"),
+            Self::NotFound => formatter.write_str("store record not found"),
         }
     }
 }
@@ -154,6 +166,8 @@ pub enum ServiceError {
     Store(StoreError),
     SourceClosed,
     ShutdownTimeout(Duration),
+    /// Persisted pairings could not be restored at startup.
+    Restore(StoreError),
 }
 impl std::fmt::Display for ServiceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -167,6 +181,7 @@ impl std::fmt::Display for ServiceError {
             Self::ShutdownTimeout(duration) => {
                 write!(formatter, "service shutdown timed out after {duration:?}")
             }
+            Self::Restore(error) => write!(formatter, "pairing restore failed: {error}"),
         }
     }
 }
