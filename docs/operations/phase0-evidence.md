@@ -14,9 +14,9 @@ Run default embedded fixture:
 cargo run -q -p phase0-evidence
 ```
 
-Run custom fixture file (strictly sandboxed to `.json` files within `fixtures/` or test directories):
+Run a bounded custom fixture from stdin (the CLI never reads arbitrary filesystem paths):
 ```console
-cargo run -q -p phase0-evidence -- --input crates/phase0-evidence/fixtures/evidence.json
+cargo run -q -p phase0-evidence -- -
 ```
 
 Or pipe from stdin (bounded to 64 KiB):
@@ -80,7 +80,7 @@ The harness validates contracts across six routes:
 ## Security & Fail-Closed Redaction Policy
 
 - **Input limits**: Inputs exceeding 64 KiB, nesting deeper than 32 levels, collections exceeding 64 items, or strings exceeding 2048 bytes are rejected before full processing.
-- **CLI Sandboxing**: The CLI `--input` path rejects symlinks, requires a `.json` extension, verifies the target is within a designated `fixtures` or test directory, and blocks access to sensitive keywords (`keyring`, `secret`, `.env`, `token`, `id_rsa`, `passwd`, `credential`, etc.).
+- **CLI input**: The CLI accepts only the embedded fixture or bounded stdin (`-`); it never reads env, database, keyring, network, provider state, or arbitrary filesystem paths.
 - **Zero Error Leakage**: Scanner and validation error messages include only structural JSON paths and invariant descriptions; they never echo rejected secret values, URLs with credentials, or identifiers.
 - **Sensitive Key Redaction**: Keys containing `token`, `password`, `cookie`, `auth`, `secret`, `private`, `credential`, `apikey`, `refresh`, `encryptionkey`, `security`, `androidid`, or ending with `key` must have value `[REDACTED]`.
 - **String content scanning**: Rejects strings containing PEM headers (`-----BEGIN`), Bearer tokens, credential assignments (`token=`, `secret=`, `api_key=`, etc.), unknown high-entropy hex sequences (≥ 32 chars), and URL userinfo/query/fragment. Any string $\ge 16$ characters without whitespace must belong to an explicit allowlist.
