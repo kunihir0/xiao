@@ -301,6 +301,11 @@ json_escape() {
   value=${value//$'\n'/\\n}
   value=${value//$'\r'/\\r}
   value=${value//$'\t'/\\t}
+  value=${value//$'\b'/\\b}
+  value=${value//$'\f'/\\f}
+  value=${value//$'\v'/\\u000b}
+  value=${value//$'\a'/\\u0007}
+  value=${value//$'\e'/\\u001b}
   printf '%s' "$value"
 }
 
@@ -312,6 +317,9 @@ record() {
 
 cleanup() {
   local exit_code=$?
+  if [[ "$exit_code" -ne 0 && -n "${manifest:-}" && -f "$manifest" ]]; then
+    record acceptance fail "exit_status=$exit_code evidence_dir=$evidence_dir evidence_owner=$(id -u):$(id -g) cleanup_status=started"
+  fi
   local cleanup_failed=false
   # Always remove local bot containers after stopping them so credential-bearing
   # mounts cannot remain attached to a stopped container. Preserve disposable
@@ -347,6 +355,9 @@ cleanup() {
   fi
   if [[ "$cleanup_failed" == true ]]; then
     printf 'live-foundation-smoke: cleanup failed\n' >&2
+    if [[ -n "${manifest:-}" && -f "$manifest" ]]; then
+      record cleanup fail "cleanup_status=failed evidence_dir=$evidence_dir evidence_owner=$(id -u):$(id -g)"
+    fi
     return 70
   fi
   unset DISCORD_TOKEN 2>/dev/null || true
