@@ -171,12 +171,18 @@ impl DiscordAcceptanceClient {
             Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(
                 response,
             ))) if response.status_code == serenity::http::StatusCode::NOT_FOUND
-                && response.error.code == 10003 =>
+                && response.error.code == 10063 =>
             {
                 Ok(())
             }
+            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(
+                response,
+            ))) => Err(DiscordError::Api(format!(
+                "nonexistent command returned HTTP {} code {}",
+                response.status_code, response.error.code
+            ))),
             Err(_) => Err(DiscordError::Api(
-                "nonexistent command did not return Discord 404/10003".to_owned(),
+                "nonexistent command returned a non-HTTP error".to_owned(),
             )),
             Ok(_) => Err(DiscordError::Api(
                 "querying nonexistent command unexpectedly succeeded".to_owned(),

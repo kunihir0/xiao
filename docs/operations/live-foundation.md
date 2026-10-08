@@ -148,9 +148,10 @@ introduced in later issues (#25, #31).
 Management authorization and ephemeral error behavior are **N/A** for this
 foundation run: the approved application exposes only the public `/ping`
 command. The authenticated nonexistent-command probe is the safe error
-replacement and requires Discord HTTP 404 with error code 10003. Future
-management authorization work is tracked by #25 and #31; the harness MUST NOT
-claim an unauthorized management result for `/ping`.
+replacement and requires Discord HTTP 404 with error code 10063 (unknown
+application command). Future management authorization work is tracked by #25
+and #31; the harness MUST NOT claim an unauthorized management result for
+`/ping`.
 
 Backup/restore is **N/A** for this disposable, harness-created database:
 there is no pre-existing external dataset or provider snapshot to restore.
