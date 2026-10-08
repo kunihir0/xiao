@@ -74,6 +74,18 @@ pub fn validate_evidence(input: &EvidenceInput) -> Result<Vec<ManifestRoute>, Ev
             &source.repository,
             &format!("source {}.repository", source.name),
         )?;
+        if !source
+            .repository
+            .starts_with("https://github.com/kunihir0/")
+            && !source
+                .repository
+                .starts_with("https://github.com/liamcottle/")
+        {
+            return Err(EvidenceError::Malformed(format!(
+                "source '{}' repository must belong to a trusted GitHub organization (kunihir0 or liamcottle)",
+                source.name
+            )));
+        }
 
         if source.commit_or_version.len() != 40
             || !source
@@ -92,6 +104,26 @@ pub fn validate_evidence(input: &EvidenceInput) -> Result<Vec<ManifestRoute>, Ev
                 "source '{}' has empty path",
                 source.name
             )));
+        }
+
+        for p in source.path.split(';') {
+            if p.contains("..") || p.starts_with('/') {
+                return Err(EvidenceError::Malformed(format!(
+                    "source '{}' path must be relative without traversal",
+                    source.name
+                )));
+            }
+            let valid_ext = p.ends_with(".rs")
+                || p.ends_with(".proto")
+                || p.ends_with(".js")
+                || p.ends_with(".txt")
+                || p.ends_with(".md");
+            if !valid_ext {
+                return Err(EvidenceError::Malformed(format!(
+                    "source '{}' path '{p}' has invalid file extension",
+                    source.name
+                )));
+            }
         }
 
         if source.reviewed_on != SNAPSHOT_DATE {
@@ -236,6 +268,12 @@ fn validate_enrollment_route(
     route: &EnrollmentRoute,
 ) -> Result<(Artifact, Artifact, Vec<AssertionStatus>), EvidenceError> {
     let mut actual_assertions = BTreeSet::new();
+    for s in &route.current.steps {
+        validate_step_keys(s)?;
+    }
+    for s in &route.modern.steps {
+        validate_step_keys(s)?;
+    }
 
     let cur_step_names: Vec<&str> = route
         .current
@@ -327,6 +365,98 @@ fn validate_enrollment_route(
     let modern_artifact = create_artifact(&route.modern)?;
 
     Ok((current_artifact, modern_artifact, assertions))
+}
+fn validate_step_keys(step: &EnrollmentStep) -> Result<(), EvidenceError> {
+    let (allowed_payload, allowed_response): (&[&str], &[&str]) = match step.step.as_str() {
+        "checkin" => (
+            &[
+                "user_serial_number",
+                "checkin",
+                "version",
+                "id",
+                "security_token",
+            ],
+            &["android_id", "security_token"],
+        ),
+        "register3" => (
+            &[
+                "app",
+                "X-subtype",
+                "device",
+                "sender",
+                "cert",
+                "app_ver",
+                "X-app_ver",
+                "X-osv",
+                "X-cliv",
+                "X-gmsv",
+                "X-scope",
+                "X-Goog-Firebase-Installations-Auth",
+                "X-gms_app_id",
+                "X-Firebase-Client",
+                "X-Firebase-Client-Log-Type",
+                "X-app_ver_name",
+                "target_ver",
+            ],
+            &["token"],
+        ),
+        "fcm_subscribe" => (
+            &[
+                "authorized_entity",
+                "endpoint",
+                "encryption_key",
+                "encryption_auth",
+            ],
+            &["token"],
+        ),
+        "expo_push_token" => (
+            &[
+                "type",
+                "deviceId",
+                "development",
+                "appId",
+                "deviceToken",
+                "projectId",
+            ],
+            &["data"],
+        ),
+        "facepunch_register" => (
+            &["AuthToken", "DeviceId", "PushKind", "PushToken"],
+            &["success"],
+        ),
+        "firebase_installations" => (
+            &["appId", "authVersion", "fid", "sdkVersion"],
+            &["authToken", "fid", "refreshToken"],
+        ),
+        _ => {
+            return Err(EvidenceError::Malformed(format!(
+                "unrecognized enrollment step name '{}'",
+                step.step
+            )));
+        }
+    };
+
+    if let Value::Object(obj) = &step.payload {
+        for k in obj.keys() {
+            if !allowed_payload.contains(&k.as_str()) {
+                return Err(EvidenceError::Malformed(format!(
+                    "unexpected key '{k}' in payload of step '{}'",
+                    step.step
+                )));
+            }
+        }
+    }
+    if let Value::Object(obj) = &step.response {
+        for k in obj.keys() {
+            if !allowed_response.contains(&k.as_str()) {
+                return Err(EvidenceError::Malformed(format!(
+                    "unexpected key '{k}' in response of step '{}'",
+                    step.step
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_mcs_route(
@@ -434,9 +564,29 @@ fn validate_pairing_route(
         })?;
 
         if !ALLOWED_SYNTHETIC_PLAYER_IDS.contains(&player_id) {
-            return Err(EvidenceError::Secret(format!(
-                "playerId {player_id} is not in synthetic allowlist"
-            )));
+            return Err(EvidenceError::Secret(
+                "playerId is not in synthetic allowlist".to_owned(),
+            ));
+        }
+
+        let allowed_keys = [
+            "ip",
+            "port",
+            "playerId",
+            "playerToken",
+            "type",
+            "entityId",
+            "entityType",
+            "entityName",
+        ];
+        if let Value::Object(obj) = &raw {
+            for k in obj.keys() {
+                if !allowed_keys.contains(&k.as_str()) {
+                    return Err(EvidenceError::Malformed(
+                        "unexpected key in pairing app_data JSON".to_owned(),
+                    ));
+                }
+            }
         }
 
         if player_id != side.normalized_pairing.player_id {

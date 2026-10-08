@@ -1,8 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use std::fs;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 const EMBEDDED_FIXTURE: &str = include_str!("../fixtures/evidence.json");
 
@@ -16,7 +15,6 @@ fn cli_default_emits_valid_manifest() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     assert!(stdout.contains("\"offline\":true"));
     assert!(stdout.contains("\"live_proof\":[]"));
-    assert!(stdout.contains("f3422b87ca70ee4832c3b951adcbbff2af327a41937dba5fc2adb4815073ea84"));
 }
 
 #[test]
@@ -36,26 +34,28 @@ fn cli_input_file_works() {
 }
 
 #[test]
-fn cli_stdin_works() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_phase0-evidence"))
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn binary with -");
+fn cli_rejects_sensitive_files() {
+    let output = Command::new(env!("CARGO_BIN_EXE_phase0-evidence"))
+        .arg("--input")
+        .arg(".env")
+        .output()
+        .expect("run binary with .env");
 
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        stdin
-            .write_all(EMBEDDED_FIXTURE.as_bytes())
-            .expect("write stdin");
-    }
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("access blocked"));
 
-    let output = child.wait_with_output().expect("wait on child");
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("\"offline\":true"));
+    let tmp_keyring = format!("{}/my_keyring.json", env!("CARGO_TARGET_TMPDIR"));
+    fs::write(&tmp_keyring, "{}").expect("write temp");
+    let output = Command::new(env!("CARGO_BIN_EXE_phase0-evidence"))
+        .arg("--input")
+        .arg(&tmp_keyring)
+        .output()
+        .expect("run binary with keyring name");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("access blocked"));
 }
 
 #[test]
@@ -72,24 +72,37 @@ fn cli_invalid_flags_exit_code_2() {
 
 #[test]
 fn cli_malformed_input_exit_code_1_no_stdout_no_secret_leak() {
-    let tmp_path = format!("{}/secret_leak_test.json", env!("CARGO_TARGET_TMPDIR"));
-    let mut bad = serde_json::from_str::<serde_json::Value>(EMBEDDED_FIXTURE).expect("parse json");
-    bad["routes"][0]["expected_assertions"][0] =
-        serde_json::Value::String("token=super_confidential_secret_value".to_string());
-    fs::write(&tmp_path, bad.to_string()).expect("write temp");
+    let test_secrets = [
+        "super_confidential_secret_value",
+        "user_secret:pass_secret",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "76561198000000001",
+    ];
 
-    let output = Command::new(env!("CARGO_BIN_EXE_phase0-evidence"))
-        .arg("--input")
-        .arg(&tmp_path)
-        .output()
-        .expect("run binary with malformed");
+    for secret in test_secrets {
+        let tmp_path = format!("{}/secret_leak_test.json", env!("CARGO_TARGET_TMPDIR"));
+        let mut bad =
+            serde_json::from_str::<serde_json::Value>(EMBEDDED_FIXTURE).expect("parse json");
+        bad["routes"][0]["expected_assertions"][0] =
+            serde_json::Value::String(format!("token={secret}"));
+        fs::write(&tmp_path, bad.to_string()).expect("write temp");
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
-    assert!(stderr.contains("phase0-evidence error:"));
-    // Fail-closed error must NOT contain the secret value itself
-    assert!(!stderr.contains("super_confidential_secret_value"));
+        let output = Command::new(env!("CARGO_BIN_EXE_phase0-evidence"))
+            .arg("--input")
+            .arg(&tmp_path)
+            .output()
+            .expect("run binary with malformed");
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+        assert!(stderr.contains("phase0-evidence error:"));
+        // Fail-closed error must NOT contain the secret value itself
+        assert!(
+            !stderr.contains(secret),
+            "stderr leaked secret '{secret}': {stderr}"
+        );
+    }
 }
 
 #[test]

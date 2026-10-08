@@ -48,13 +48,15 @@ pub fn render(input: &str) -> Result<String, EvidenceError> {
         routes,
         classification: model::Classification {
             facts: vec![
-                "all source references are pinned to exact repository commit hashes".to_owned(),
-                "current and modern contracts are extracted from source files in the pinned commits".to_owned(),
+                "all source references are pinned to exact repository commit hashes and file paths".to_owned(),
+                "current and modern request/response contracts and protobuf schemas are derived from pinned source files".to_owned(),
                 "all secrets in request/response payloads are redacted to [REDACTED]".to_owned(),
                 "artifact hashes are SHA-256 checksums over canonical redacted JSON".to_owned(),
             ],
             inferences: vec![
                 "normalized application event shapes represent internal adapter projections".to_owned(),
+                "modern pairing notification delivery via FCM app-data is an inference based on @liamcottle/push-receiver client event handling for notifications registered via Expo".to_owned(),
+                "WebSocket endpoints (wss://203.0.113.10:28082/) in getEntityInfo and Alarm fixtures are synthetic test endpoints using RFC 5737 documentation addresses; production endpoints use ws:// or Facepunch proxy wss://companion-rust.facepunch.com/game/{server}/{port}".to_owned(),
                 "modern route implementations may change in subsequent upstream releases".to_owned(),
             ],
             live_proof: Vec::new(),
@@ -95,7 +97,7 @@ mod tests {
         assert_eq!(manifest.routes.len(), 6);
         assert_eq!(
             manifest.manifest_sha256,
-            "f3422b87ca70ee4832c3b951adcbbff2af327a41937dba5fc2adb4815073ea84"
+            "84e4b64ca0ab8dc86c11dee5266600f6edcf1a7251e9352db91dcfeac0d3cea6"
         );
 
         let expected_hashes = [
@@ -329,5 +331,31 @@ mod tests {
         let deep = format!("{}{}", "{\"a\":".repeat(40), "1}".repeat(40));
         let err = render(&deep).expect_err("deeply nested must fail");
         assert!(matches!(err, EvidenceError::LimitExceeded(_)));
+    }
+
+    #[test]
+    fn untyped_unknown_payload_key_fails() {
+        let mut v: Value = serde_json::from_str(EMBEDDED_FIXTURE).expect("fixture");
+        v["routes"][0]["current"]["steps"][0]["payload"]["unexpected_blob"] =
+            Value::String("some_value".to_string());
+        let err = render(&v.to_string()).expect_err("unknown payload key must fail");
+        assert!(matches!(err, EvidenceError::Malformed(_)));
+    }
+
+    #[test]
+    fn random_credential_shaped_value_fails() {
+        let mut v: Value = serde_json::from_str(EMBEDDED_FIXTURE).expect("fixture");
+        v["routes"][0]["current"]["steps"][3]["payload"]["deviceId"] =
+            Value::String("dGVzdF9zZWNyZXRfdmFsdWUxMjM0NQ==".to_string());
+        let err = render(&v.to_string()).expect_err("credential shaped string must fail");
+        assert!(matches!(err, EvidenceError::Secret(_)));
+    }
+
+    #[test]
+    fn untrusted_source_repository_fails() {
+        let mut v: Value = serde_json::from_str(EMBEDDED_FIXTURE).expect("fixture");
+        v["sources"][0]["repository"] = Value::String("https://github.com/evil/repo".to_string());
+        let err = render(&v.to_string()).expect_err("untrusted repo must fail");
+        assert!(matches!(err, EvidenceError::Malformed(_)));
     }
 }

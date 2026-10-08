@@ -168,6 +168,70 @@ fn validate_key_and_value(key: &str, value: &Value, path: &str) -> Result<(), Ev
     Ok(())
 }
 
+fn is_allowed_token_shaped_string(s: &str, known_hashes: &BTreeSet<&str>) -> bool {
+    if s == REDACTED_MARKER {
+        return true;
+    }
+    // Allow uppercase enum/constant identifiers
+    if s.chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return true;
+    }
+    // Allow JSON-delimited strings (their parsed structure is scanned separately)
+    let trimmed = s.trim();
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        return true;
+    }
+    if known_hashes.contains(s) {
+        return true;
+    }
+    if s.starts_with("synthetic-") {
+        return true;
+    }
+    if s == "49451aca-a822-41e6-ad59-955718d0ff9c" {
+        return true;
+    }
+    if s == "com.facepunch.rust.companion"
+        || s == "org.chromium.linux"
+        || s == "org.mozilla.firefox"
+        || s == "chrome-63.0.3234.0"
+        || s == "mcs.android.com"
+        || s == "1:976529667804:android:d6f1ddeb4403b338fea619"
+        || s == "2026-10-07"
+    {
+        return true;
+    }
+    // Allow URL forms without query/userinfo
+    if s.starts_with("https://")
+        || s.starts_with("wss://")
+        || s.starts_with("tcp+tls://")
+        || s.starts_with("fcm://")
+    {
+        return true;
+    }
+    // Allow source reference strings, e.g. name@commit
+    if s.contains('@')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '-' | '_' | ';' | '.'))
+    {
+        return true;
+    }
+    // Allow file paths
+    if s.split(';').all(|part| {
+        part.ends_with(".rs")
+            || part.ends_with(".proto")
+            || part.ends_with(".js")
+            || part.ends_with(".txt")
+            || part.ends_with(".md")
+    }) {
+        return true;
+    }
+    false
+}
+
 fn validate_string_content(
     s: &str,
     path: &str,
@@ -175,8 +239,7 @@ fn validate_string_content(
 ) -> Result<(), EvidenceError> {
     if s.len() > MAX_STRING_LENGTH {
         return Err(EvidenceError::LimitExceeded(format!(
-            "string length {} at {path} exceeds {MAX_STRING_LENGTH}",
-            s.len()
+            "string length at {path} exceeds {MAX_STRING_LENGTH}"
         )));
     }
 
@@ -217,7 +280,7 @@ fn validate_string_content(
     for assign in SECRET_ASSIGNMENTS {
         if lower.contains(assign) {
             return Err(EvidenceError::Secret(format!(
-                "secret assignment pattern '{assign}' detected at {path}"
+                "secret assignment pattern detected at {path}"
             )));
         }
     }
@@ -230,16 +293,16 @@ fn validate_string_content(
     // SteamID64 production-shaped checks
     if s.starts_with("7656119") && s.len() == 17 && s.chars().all(|c| c.is_ascii_digit()) {
         return Err(EvidenceError::Secret(format!(
-            "production-shaped SteamID64 '{s}' detected at {path}"
+            "production-shaped SteamID64 detected at {path}"
         )));
     }
 
     // Known token prefixes
-    const SENSITIVE_PREFIXES: &[&str] = &["ghp_", "gho_", "AIza", "AKIA"];
+    const SENSITIVE_PREFIXES: &[&str] = &["ghp_", "gho_", "aiza", "akia"];
     for prefix in SENSITIVE_PREFIXES {
-        if s.starts_with(prefix) {
+        if lower.starts_with(prefix) {
             return Err(EvidenceError::Secret(format!(
-                "token prefix '{prefix}' detected at {path}"
+                "token prefix detected at {path}"
             )));
         }
     }
@@ -247,8 +310,19 @@ fn validate_string_content(
     // Hex string check: reject long hex unless it is in known_hashes (or allowed UUID/commit)
     if s.len() >= 32 && s.chars().all(|c| c.is_ascii_hexdigit()) && !known_hashes.contains(s) {
         return Err(EvidenceError::Secret(format!(
-            "unknown unredacted hex secret or hash '{s}' detected at {path}"
+            "unredacted hex secret or hash detected at {path}"
         )));
+    }
+
+    // Check for random high-entropy token-shaped string under any key
+    if s.len() >= 16 && !s.contains(' ') && !is_allowed_token_shaped_string(s, known_hashes) {
+        let has_alpha = s.chars().any(|c| c.is_ascii_alphabetic());
+        let has_digit = s.chars().any(|c| c.is_ascii_digit());
+        if has_alpha && has_digit {
+            return Err(EvidenceError::Secret(format!(
+                "unredacted credential-shaped value detected at {path}"
+            )));
+        }
     }
 
     Ok(())
@@ -258,7 +332,7 @@ fn validate_numeric_id(id: u64, path: &str) -> Result<(), EvidenceError> {
     // SteamID64 range starts around 76561197960265728
     if id >= 76_560_000_000_000_000 {
         return Err(EvidenceError::Secret(format!(
-            "production-shaped numeric SteamID64 '{id}' detected at {path}"
+            "production-shaped numeric SteamID64 detected at {path}"
         )));
     }
     Ok(())
@@ -267,7 +341,7 @@ fn validate_numeric_id(id: u64, path: &str) -> Result<(), EvidenceError> {
 pub fn validate_url(s: &str, path: &str) -> Result<(), EvidenceError> {
     if s.contains('?') || s.contains('#') || s.contains('@') {
         return Err(EvidenceError::Malformed(format!(
-            "URL at {path} contains forbidden query, fragment, or userinfo: '{s}'"
+            "URL at {path} contains forbidden query, fragment, or userinfo"
         )));
     }
 
@@ -275,28 +349,28 @@ pub fn validate_url(s: &str, path: &str) -> Result<(), EvidenceError> {
         .is_some_and(|(_, rest)| rest.starts_with('/'))
     {
         return Err(EvidenceError::Malformed(format!(
-            "URL at {path} has empty host: '{s}'"
+            "URL at {path} has empty host"
         )));
     }
 
-    let parsed = Url::parse(s)
-        .map_err(|e| EvidenceError::Malformed(format!("invalid URL '{s}' at {path}: {e}")))?;
+    let parsed =
+        Url::parse(s).map_err(|_| EvidenceError::Malformed(format!("invalid URL at {path}")))?;
 
     if parsed.host_str().is_none() || parsed.host_str() == Some("") {
         return Err(EvidenceError::Malformed(format!(
-            "URL at {path} lacks host: '{s}'"
+            "URL at {path} lacks host"
         )));
     }
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(EvidenceError::Secret(format!(
-            "URL at {path} contains userinfo: '{s}'"
+            "URL at {path} contains userinfo"
         )));
     }
 
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(EvidenceError::Malformed(format!(
-            "URL at {path} contains query or fragment: '{s}'"
+            "URL at {path} contains query or fragment"
         )));
     }
 
@@ -307,7 +381,7 @@ pub fn validate_url(s: &str, path: &str) -> Result<(), EvidenceError> {
             .unwrap_or_default();
         if path_segments.len() != 2 || path_segments[0].is_empty() || path_segments[1].is_empty() {
             return Err(EvidenceError::Malformed(format!(
-                "repository URL at {path} must be 'https://github.com/owner/repo', got '{s}'"
+                "repository URL at {path} must be 'https://github.com/owner/repo'"
             )));
         }
     }

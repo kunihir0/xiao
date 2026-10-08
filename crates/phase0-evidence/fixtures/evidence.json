@@ -370,7 +370,7 @@
     {
       "name": "pairing",
       "current_source": "xiao-current-rustplus@469c98435647fa2582b8d14339cd385a686a79e6",
-      "modern_source": "rustplus-js-modern@75915f25fc7c1718f7c23c419953f4655840fade",
+      "modern_source": "rustplus-js-modern@75915f25fc7c1718f7c23c419953f4655840fade;liam-push-receiver@ecc93a37ca618859eaacae71ec0c0136ce1621f5",
       "current": {
         "endpoint": "fcm://notification/app-data",
         "method": "FCM_NOTIFICATION_APP_DATA",

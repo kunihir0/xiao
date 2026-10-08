@@ -15,6 +15,7 @@ pub enum EvidenceError {
     Secret(String),
     LimitExceeded(String),
     Io(String),
+    Blocked(String),
 }
 
 impl std::fmt::Display for EvidenceError {
@@ -25,6 +26,7 @@ impl std::fmt::Display for EvidenceError {
             Self::Secret(message) => write!(f, "unredacted evidence: {message}"),
             Self::LimitExceeded(message) => write!(f, "resource limit exceeded: {message}"),
             Self::Io(message) => write!(f, "I/O error: {message}"),
+            Self::Blocked(message) => write!(f, "access blocked: {message}"),
         }
     }
 }
