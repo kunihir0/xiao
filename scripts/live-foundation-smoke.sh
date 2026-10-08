@@ -249,11 +249,11 @@ fi
 
 # Secret files validation for preflight
 secret_files=()
-if [[ -n "${DATABASE_URL_FILE:-}" ]]; then
-  secret_files+=(DATABASE_URL_FILE MIGRATION_DATABASE_URL_FILE DATABASE_CA_FILE DATABASE_WRONG_CA_FILE DATABASE_HOSTNAME_MISMATCH_URL_FILE DATABASE_PLAINTEXT_URL_FILE)
-fi
-if [[ "$mode" == discord-live && -z "$discord_env_file" && -n "${DISCORD_TOKEN_FILE:-}" ]]; then
-  secret_files+=(DISCORD_TOKEN_FILE)
+if [[ "$mode" == preflight || "$mode" == postgres || "$mode" == discord-live ]]; then
+  secret_files=(DATABASE_URL_FILE MIGRATION_DATABASE_URL_FILE DATABASE_CA_FILE DATABASE_WRONG_CA_FILE DATABASE_HOSTNAME_MISMATCH_URL_FILE DATABASE_PLAINTEXT_URL_FILE)
+  if [[ "$mode" == discord-live && -z "$discord_env_file" ]]; then
+    secret_files+=(DISCORD_TOKEN_FILE)
+  fi
 fi
 
 check_secret_file() {
@@ -274,7 +274,8 @@ check_secret_file() {
   (( (8#$mode_bits & 8#077) == 0 )) || fail "$variable must not be group/other accessible"
 }
 
-if [[ "$mode" == preflight && ${#secret_files[@]} -gt 0 ]]; then
+if [[ "$mode" == preflight || (("$mode" == postgres || "$mode" == discord-live) \
+  && -n "${DATABASE_URL_FILE:-}") ]]; then
   for variable in "${secret_files[@]}"; do check_secret_file "$variable"; done
 fi
 
@@ -335,10 +336,8 @@ cleanup() {
     docker stop "$pg_plain_container" >/dev/null 2>&1 || true
     docker rm "$pg_plain_container" >/dev/null 2>&1 || true
   fi
-  if [[ "$exit_code" -eq 0 && -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
+  if [[ -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
     rm -rf "$tmp_dir"
-  elif [[ -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
-    printf 'private diagnostics preserved at %s\n' "$tmp_dir" >&2
   fi
   if [[ "$exit_code" -eq 0 && "${evidence_ephemeral:-false}" == true \
     && -n "${evidence_dir:-}" && -d "$evidence_dir" ]]; then
@@ -359,7 +358,15 @@ if [[ -n "$db_id" ]]; then
   record resource pass "disposable_db_id=$db_id"
 fi
 if [[ "$mode" == discord-live ]]; then
-  record discord-target pass "app_alias=$app_alias application_id=$application_id guild_alias=$guild_alias guild_id=$guild_id image=$image"
+  image_id=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null) \
+    || fail 'reviewed image is not available in the local Docker engine'
+  image_repo_digests=$(docker image inspect --format '{{join .RepoDigests ","}}' "$image" 2>/dev/null || true)
+  [[ -n "$image_repo_digests" ]] || image_repo_digests='local-image-no-repository-digest'
+  image_revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image" 2>/dev/null || true)
+  if [[ "$local_image" == true ]]; then
+    [[ "$image_revision" == "$source_sha" ]] || fail 'local image revision label does not match --source-sha'
+  fi
+  record discord-target pass "app_alias=$app_alias application_id=$application_id guild_alias=$guild_alias guild_id=$guild_id image=$image image_id=$image_id image_digest=$image_repo_digests source_sha=$source_sha image_revision=$image_revision"
 fi
 
 if [[ "$mode" == preflight ]]; then
@@ -423,12 +430,15 @@ if [[ -z "${DATABASE_URL_FILE:-}" ]]; then
     -keyout "$tls_dir/wrong_ca.key" -out "$tls_dir/wrong_ca.crt" >/dev/null 2>&1
 
   chmod 0600 "$tls_dir/server.key" "$tls_dir/ca.key" "$tls_dir/wrong_ca.key"
-  chmod 0644 "$tls_dir/server.crt" "$tls_dir/ca.crt" "$tls_dir/wrong_ca.crt"
+  chmod 0600 "$tls_dir/server.crt" "$tls_dir/ca.crt" "$tls_dir/wrong_ca.crt"
 
   # Distinct generated passwords for disposable roles
   migrator_pw="migrator_$(head -c 16 /dev/urandom | xxd -p)"
   runtime_pw="runtime_$(head -c 16 /dev/urandom | xxd -p)"
   admin_pw="admin_$(head -c 16 /dev/urandom | xxd -p)"
+  admin_pw_file="$tmp_dir/postgres-admin-password"
+  printf '%s' "$admin_pw" >"$admin_pw_file"
+  chmod 0600 "$admin_pw_file"
 
   get_free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()'
@@ -448,7 +458,8 @@ if [[ -z "${DATABASE_URL_FILE:-}" ]]; then
   docker run -d --name "$pg_container" \
     -e POSTGRES_DB=xiao_test \
     -e POSTGRES_USER=xiao_admin \
-    -e POSTGRES_PASSWORD="$admin_pw" \
+    -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_admin_password \
+    --mount "type=bind,src=$admin_pw_file,dst=/run/secrets/postgres_admin_password,readonly" \
     -p "127.0.0.1:$pg_port:5432" \
     -v "$tls_dir/server.crt:/var/lib/postgresql/server.crt:ro" \
     -v "$tls_dir/server.key:/var/lib/postgresql/server.key:ro" \
@@ -461,7 +472,8 @@ if [[ -z "${DATABASE_URL_FILE:-}" ]]; then
   docker run -d --name "$pg_plain_container" \
     -e POSTGRES_DB=xiao_plain \
     -e POSTGRES_USER=xiao_admin \
-    -e POSTGRES_PASSWORD="$admin_pw" \
+    -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_admin_password \
+    --mount "type=bind,src=$admin_pw_file,dst=/run/secrets/postgres_admin_password,readonly" \
     -p "127.0.0.1:$pg_plain_port:5432" \
     "$pg_image" >/dev/null
 
@@ -512,6 +524,14 @@ SQL
   export DATABASE_URL_CONTAINER_FILE="$sec_dir/runtime_container_url"
   printf 'postgres://xiao_runtime:%s@host.docker.internal:%s/xiao_test' "$runtime_pw" "$pg_port" > "$DATABASE_URL_CONTAINER_FILE"
   chmod 0600 "$DATABASE_URL_FILE" "$MIGRATION_DATABASE_URL_FILE" "$DATABASE_HOSTNAME_MISMATCH_URL_FILE" "$DATABASE_PLAINTEXT_URL_FILE" "$DATABASE_URL_CONTAINER_FILE"
+fi
+if [[ "$mode" == postgres || "$mode" == discord-live ]]; then
+  for variable in "${secret_files[@]}"; do check_secret_file "$variable"; done
+  if [[ "$mode" == discord-live && -n "$discord_env_file" ]]; then
+    discord_env_check_path="$discord_env_file"
+    check_secret_file discord_env_check_path
+    unset discord_env_check_path
+  fi
 fi
 
 # Parse a PostgreSQL URL without placing the credential-bearing URL in argv.
@@ -792,32 +812,19 @@ if ! docker run --rm --user "$(id -u):$(id -g)" \
 fi
 record bot-ca-mount pass 'runtime image can read the approved CA mount as the configured UID'
 
-# Read only the DISCORD_TOKEN assignment from the approved source file. The
-# value is never placed in argv, a second file, or evidence.
+# Pass the approved credential source directly to Docker. Never export or copy
+# the token in the host shell; the entrypoint removes conflicting direct DB
+# variables imported from the same env file before starting the bot.
+container_command=(--no-migrate)
 if [[ -n "$discord_env_file" ]]; then
-  discord_token_value=
-  while IFS= read -r env_line; do
-    case "$env_line" in
-      DISCORD_TOKEN=*)
-        discord_token_value=${env_line#DISCORD_TOKEN=}
-        discord_token_value=${discord_token_value#\"}
-        discord_token_value=${discord_token_value%\"}
-        discord_token_value=${discord_token_value#\'}
-        discord_token_value=${discord_token_value%\'}
-        break
-        ;;
-    esac
-  done < "$discord_env_file"
-  [[ -n "$discord_token_value" ]] || fail 'approved env file does not contain DISCORD_TOKEN'
-  export DISCORD_TOKEN="$discord_token_value"
-  unset discord_token_value env_line
-  docker_args+=(--env DISCORD_TOKEN)
+  docker_args+=(--env-file "$discord_env_file" --entrypoint /bin/sh)
+  container_command=(-c 'unset DATABASE_URL MIGRATION_DATABASE_URL DATABASE_CA; exec /usr/local/bin/xiao-entrypoint --no-migrate')
 else
   docker_args+=(--mount "type=bind,src=$DISCORD_TOKEN_FILE,dst=/run/secrets/discord_token,readonly"
                 --env DISCORD_TOKEN_FILE=/run/secrets/discord_token)
 fi
 
-"${docker_args[@]}" "$image" --no-migrate >/dev/null
+"${docker_args[@]}" "$image" "${container_command[@]}" >/dev/null
 container_started=true
 
 # Wait for bot container to reach running state
@@ -935,18 +942,27 @@ printf '%s\n' "$restart_inspect" | grep -Fq '"global_ping_count":1' || fail 'res
 printf '%s\n' "$restart_inspect" | grep -Fq '"guild_ping_count":1' || fail 'restart changed guild /ping command count'
 record duplicate-registration pass 'restart preserved exactly one global and guild /ping command'
 
-# Clean up created guild ping command if it was created during test
+# Clean up only the guild command created by this run, then verify absence.
 if [[ "$guild_ping_created" == "true" && -n "$created_guild_ping_id" && "$created_guild_ping_id" != "0" ]]; then
   clean_opts=(discord-acceptance --guild-id "$guild_id" --action cleanup-guild-ping --command-id "$created_guild_ping_id")
   if [[ -n "$discord_env_file" ]]; then
     clean_opts+=(--env-file "$discord_env_file")
   fi
-  "$bot_bin" "${clean_opts[@]}" >/dev/null 2>&1 || true
+  if ! "$bot_bin" "${clean_opts[@]}" >/dev/null 2>&1; then
+    record cleanup fail 'created guild command deletion failed'
+    fail 'created guild command deletion failed'
+  fi
+  if ! cleanup_inspect=$("$bot_bin" "${inspect_opts[@]}"); then
+    record cleanup fail 'guild command absence inspection failed'
+    fail 'guild command absence inspection failed'
+  fi
+  printf '%s\n' "$cleanup_inspect" | grep -Fq '"guild_ping_count":0' \
+    || { record cleanup fail 'created guild command remained after deletion'; fail 'created guild command remained after deletion'; }
 fi
 # Stop restarted container and remove its credential-bearing mounts.
 docker stop --time 30 "$container_name" >/dev/null
 container_started=false
-docker rm "$container_name" >/dev/null 2>&1 || true
+docker rm "$container_name" >/dev/null
 record cleanup pass 'bot container stopped and removed; created guild command cleanup completed'
 
 record discord-complete pass 'live Discord gateway and PostgreSQL foundation acceptance completed successfully'

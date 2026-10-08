@@ -224,7 +224,7 @@ impl DiscordHandle {
     }
 }
 
-async fn register_global_ping(ctx: &serenity::Context) -> Result<(), serenity::Error> {
+async fn register_global_ping(ctx: &serenity::Context) -> Result<(), Box<serenity::Error>> {
     let commands = ctx.http.get_global_commands().await?;
     if commands
         .iter()

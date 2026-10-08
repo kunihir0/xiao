@@ -163,15 +163,24 @@ impl DiscordAcceptanceClient {
         Ok(())
     }
 
-    /// Verifies safe error path: requesting a nonexistent command returns an error.
+    /// Verifies the Discord API's exact missing-command response.
     pub async fn verify_nonexistent_command_error(&self) -> Result<(), DiscordError> {
+        self.ensure_application_id().await?;
         let result = self.http.get_global_command(CommandId::new(1)).await;
-        if result.is_err() {
-            Ok(())
-        } else {
-            Err(DiscordError::Api(
+        match result {
+            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(
+                response,
+            ))) if response.status_code == serenity::http::StatusCode::NOT_FOUND
+                && response.error.code == 10003 =>
+            {
+                Ok(())
+            }
+            Err(_) => Err(DiscordError::Api(
+                "nonexistent command did not return Discord 404/10003".to_owned(),
+            )),
+            Ok(_) => Err(DiscordError::Api(
                 "querying nonexistent command unexpectedly succeeded".to_owned(),
-            ))
+            )),
         }
     }
 }

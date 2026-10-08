@@ -442,7 +442,14 @@ async fn verify_schema_current_connection(
     let applied = sql_query("SELECT version FROM __diesel_schema_migrations ORDER BY version")
         .load::<MigrationVersionRow>(connection)
         .await
-        .map_err(|_| DbError::Migration)?;
+        .map_err(|error| match error {
+            diesel::result::Error::DatabaseError(_, information)
+                if information.message().contains("does not exist") =>
+            {
+                DbError::SchemaPending
+            }
+            _ => DbError::Migration,
+        })?;
     let expected = MigrationSource::<diesel::pg::Pg>::migrations(&MIGRATIONS)
         .map_err(|_| DbError::Migration)?
         .into_iter()

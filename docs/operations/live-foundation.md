@@ -5,12 +5,11 @@ non-production Discord test guild. It validates the existing gateway/Poise and
 Diesel/PostgreSQL boundaries before Smart Alarm work. It does not enroll Rust+,
 create production resources, or make an HTTP health endpoint.
 
-The harness is `scripts/live-foundation-smoke.sh`. It defaults to no live
-operation only when invoked with `--dry-run`; `--preflight` validates secret-file
-
-The host-side Discord inspection binary is built with the `live-acceptance`
-feature; the production bot image does not include that inspection mode.
-shape without printing values. Never run it against production.
+The harness is `scripts/live-foundation-smoke.sh`. `--dry-run` performs no live
+operation; `--preflight` validates owner-only, regular, non-empty secret files
+without printing values. The host-side Discord inspection binary is built with
+the `live-acceptance` feature; the production bot image does not include that
+inspection mode. Never run this harness against production.
 
 ## Safety gate and evidence
 
@@ -121,13 +120,16 @@ inputs:
 --discord-approved            coordinator approval after the notice
 ```
 
-The image receives only file references (`DISCORD_TOKEN_FILE`,
-`DATABASE_URL_FILE`, and `DATABASE_CA_FILE`) mounted read-only. The migration
-DDL secret is deliberately not mounted into the bot container. Startup waits
-for database schema-current/readiness evidence, then checks the global command
-list and performs an idempotent guild command registration. Both lists MUST
-contain exactly one `/ping`. The harness checks this again after restart to
-catch duplicate registration.
+The image receives the approved token through Docker's original `--env-file`
+mechanism (or a mounted `DISCORD_TOKEN_FILE`), plus read-only
+`DATABASE_URL_FILE` and `DATABASE_CA_FILE` mounts. The entrypoint removes
+conflicting direct database variables imported from the env file before exec;
+the host never exports or copies the token. The migration DDL secret is
+deliberately not mounted into the bot container. Startup waits for
+schema-current/readiness evidence, then checks the global command list and
+performs an idempotent guild command registration; both lists MUST contain
+exactly one `/ping`. The harness checks this again after restart to catch
+duplicate registration.
 
 The acceptance container is started with `--no-migrate` so the long-running
 process cannot accidentally run DDL through the runtime role. The migration
@@ -143,9 +145,22 @@ The operator invokes `/ping` in the test guild and confirms the expected public
 commands, authorization policies, and ephemeral error responses are non-goals
 introduced in later issues (#25, #31).
 
+Management authorization and ephemeral error behavior are **N/A** for this
+foundation run: the approved application exposes only the public `/ping`
+command. The authenticated nonexistent-command probe is the safe error
+replacement and requires Discord HTTP 404 with error code 10003. Future
+management authorization work is tracked by #25 and #31; the harness MUST NOT
+claim an unauthorized management result for `/ping`.
+
+Backup/restore is **N/A** for this disposable, harness-created database:
+there is no pre-existing external dataset or provider snapshot to restore.
+The compatibility evidence is the from-zero migration plus repeat migration
+with a known DML fixture and readback; external database owners remain
+responsible for provider backup/restore drills.
+
 Safe error paths verified by the foundation harness are:
 1. pre-connect fail-closed gate without human approval (blocked status 78);
-2. unknown command registration / query validation error handling;
+2. authenticated nonexistent-command query returning Discord HTTP 404/code 10003;
 3. PostgreSQL runtime DDL authorization denials;
 4. PostgreSQL verify-full TLS negative error classes.
 
