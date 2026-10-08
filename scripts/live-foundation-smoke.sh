@@ -744,13 +744,16 @@ if [[ -n "$discord_env_file" ]]; then
   disc_opts+=(--env-file "$discord_env_file")
 fi
 
-if ! printf '%s\n' "$acceptance_out" | grep -Fq '"status":"pass"'; then
+if ! acceptance_out=$("$bot_bin" "${disc_opts[@]}"); then
+  record discord-identity fail 'authenticated Discord identity or command inspection failed'
   fail 'Discord acceptance identity/command verification failed'
 fi
-printf '%s\n' "$acceptance_out" | grep -Fq '"global_ping_count":1' \
-  || fail 'authenticated global command list did not contain exactly one /ping'
+if ! printf '%s\n' "$acceptance_out" | grep -Fq '"status":"pass"'; then
+  record discord-identity fail 'authenticated Discord identity or command inspection returned a non-pass status'
+  fail 'Discord acceptance identity/command verification failed'
+fi
 printf '%s\n' "$acceptance_out" | grep -Fq '"guild_ping_count":1' \
-  || fail 'authenticated guild command list did not contain exactly one /ping'
+  || fail 'approved guild command list did not contain exactly one /ping'
 
 # Extract non-secret discovery details from JSON output
 discovered_app_id=$(printf '%s\n' "$acceptance_out" | sed -n 's/.*"application_id":\([0-9]*\).*/\1/p')
