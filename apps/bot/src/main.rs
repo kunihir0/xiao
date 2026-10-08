@@ -294,6 +294,9 @@ fn resolve_discord_token(env_file_path: Option<&Path>) -> Result<Zeroizing<Strin
     if let Ok(token) = std::env::var("DISCORD_TOKEN")
         && !token.trim().is_empty()
     {
+        if env_file_path.is_some() {
+            return Err("DISCORD_TOKEN must not be set when --env-file is used".into());
+        }
         return Ok(Zeroizing::new(token.trim().to_owned()));
     }
     if let Ok(file_path) = std::env::var("DISCORD_TOKEN_FILE")
@@ -304,7 +307,8 @@ fn resolve_discord_token(env_file_path: Option<&Path>) -> Result<Zeroizing<Strin
         return Ok(secret);
     }
     if let Some(path) = env_file_path {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = bot_config::read_secret_file(path, "DISCORD_ACCEPTANCE_ENV_FILE")
+            .map_err(|e| Box::new(e) as BoxError)?;
         for line in contents.lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("DISCORD_TOKEN=") {

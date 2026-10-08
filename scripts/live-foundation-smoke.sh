@@ -34,7 +34,6 @@ Required for --discord-live:
   --discord-env-file PATH   Approved local env file path (0600, never printed).
   --discord-approved        Explicit approval received after the OMP notice.
   --command-observed       Confirm manual global/guild /ping and error-path probes.
-  --cleanup-approved        Approve removal of disposable test containers.
   --help                    Show this help.
 
 Secret values are accepted through *_FILE variables or owner-only --discord-env-file.
@@ -65,7 +64,6 @@ source_sha=
 discord_env_file=
 local_image=false
 discord_approved=false
-cleanup_approved=false
 command_observed=false
 evidence_ephemeral=false
 container_started=false
@@ -137,10 +135,6 @@ while (($# > 0)); do
       ;;
     --discord-approved)
       discord_approved=true
-      shift
-      ;;
-    --cleanup-approved)
-      cleanup_approved=true
       shift
       ;;
     --command-observed)
@@ -329,6 +323,11 @@ cleanup() {
       printf '","readiness_logs_observed":false}\n'
     } >"$evidence_dir/cleanup-diagnostic.json"
     chmod 600 "$evidence_dir/cleanup-diagnostic.json"
+    {
+      printf 'failure evidence: bot container did not complete acceptance\n'
+      printf 'raw diagnostics intentionally removed; inspect manifest statuses only\n'
+    } >"$evidence_dir/cleanup-diagnostic.log"
+    chmod 600 "$evidence_dir/cleanup-diagnostic.log"
   fi
   if [[ "${container_started:-false}" == true && -n "${container_name:-}" ]]; then
     if ! docker stop --time 30 "$container_name" >/dev/null 2>&1; then cleanup_failed=true; fi
@@ -808,17 +807,25 @@ bot_env_args=(
   --env RUST_LOG=info
 )
 
-runtime_uid=10001
-runtime_gid=10001
-[[ "$runtime_uid" != 0 && "$runtime_gid" != 0 ]] || fail 'bot runtime identity must be non-root'
-docker_args=(docker run -d --name "$container_name" --user "$runtime_uid:$runtime_gid" --cap-drop=ALL --security-opt=no-new-privileges --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --add-host=host.docker.internal:host-gateway "${bot_env_args[@]}")
+secret_owner_uid=$(stat -f '%u' "$DATABASE_CA_FILE" 2>/dev/null || stat -c '%u' "$DATABASE_CA_FILE")
+secret_owner_gid=$(stat -f '%g' "$DATABASE_CA_FILE" 2>/dev/null || stat -c '%g' "$DATABASE_CA_FILE")
+[[ "$secret_owner_uid" == "$(id -u)" && "$secret_owner_uid" != 0 ]] \
+  || fail 'mounted secret owner must be the invoking non-root UID'
+for mounted_secret in "$DATABASE_URL_FILE" "$DATABASE_CA_FILE"; do
+  mounted_uid=$(stat -f '%u' "$mounted_secret" 2>/dev/null || stat -c '%u' "$mounted_secret")
+  mounted_gid=$(stat -f '%g' "$mounted_secret" 2>/dev/null || stat -c '%g' "$mounted_secret")
+  [[ "$mounted_uid" == "$secret_owner_uid" && "$mounted_gid" == "$secret_owner_gid" ]] \
+    || fail 'mounted secret files must share one owner'
+done
+runtime_uid=$secret_owner_uid
+runtime_gid=$secret_owner_gid
 if [[ "$(docker image inspect --format '{{.Config.User}}' "$image")" != "10001:10001" ]]; then
   fail 'reviewed image must declare fixed non-root user 10001:10001'
 fi
 if ! docker run --rm --user "$runtime_uid:$runtime_gid" \
   --mount "type=bind,src=$DATABASE_CA_FILE,dst=/run/secrets/database_ca,readonly" \
   --entrypoint /bin/sh "$image" -c 'test -s /run/secrets/database_ca -a -r /run/secrets/database_ca'; then
-  record bot-ca-mount fail 'runtime image could not read the approved CA mount as fixed UID 10001'
+  record bot-ca-mount fail 'runtime image could not read the approved CA mount as the validated owner UID'
   fail 'bot runtime CA mount is not readable'
 fi
 record bot-ca-mount pass 'runtime image can read the approved CA mount as the configured UID'
