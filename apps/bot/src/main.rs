@@ -383,6 +383,9 @@ async fn run_discord_acceptance(args: DiscordAcceptanceArgs) -> Result<(), BoxEr
                     );
                 }
                 DiscordAcceptanceAction::CleanupGuildPing { command_id } => {
+                    client
+                        .verify_guild_ping_command(guild_id, command_id)
+                        .await?;
                     client.delete_guild_command(guild_id, command_id).await?;
                     println!(
                         r#"{{"status":"pass","action":"cleanup_guild_ping","guild_id":{},"command_id":{}}}"#,

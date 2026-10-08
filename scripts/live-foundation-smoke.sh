@@ -218,10 +218,13 @@ if [[ "$mode" == discord-live ]]; then
     [[ "$discord_env_file" == /* && -f "$discord_env_file" && ! -L "$discord_env_file" ]] || fail '--discord-env-file must be an absolute regular file'
     if stat -f '%Lp' "$discord_env_file" >/dev/null 2>&1; then
       local_env_mode=$(stat -f '%Lp' "$discord_env_file")
+      local_env_size=$(stat -f '%z' "$discord_env_file")
     else
       local_env_mode=$(stat -c '%a' "$discord_env_file")
+      local_env_size=$(stat -c '%s' "$discord_env_file")
     fi
     (( (8#$local_env_mode & 8#077) == 0 )) || fail '--discord-env-file must not be group/other accessible'
+    (( local_env_size <= 65536 )) || fail '--discord-env-file exceeds 64 KiB'
   fi
 
   # Explicit human approval is required for live Discord connection
@@ -284,9 +287,8 @@ if [[ -z "$evidence_dir" ]]; then
   evidence_dir=$(mktemp -d "${TMPDIR:-/tmp}/xiao-live-foundation.XXXXXX")
   evidence_ephemeral=true
 else
-  evidence_ephemeral=false
-  [[ ! -e "$evidence_dir" || -d "$evidence_dir" ]] || fail 'evidence path is not a directory'
-  mkdir -p "$evidence_dir"
+  [[ ! -e "$evidence_dir" ]] || fail 'evidence directory already exists; use a new owner-only directory'
+  mkdir "$evidence_dir"
 fi
 chmod 700 "$evidence_dir"
 manifest=$evidence_dir/manifest.jsonl
@@ -315,6 +317,7 @@ record() {
 
 cleanup() {
   local exit_code=$?
+  local cleanup_failed=false
   # Always remove local bot containers after stopping them so credential-bearing
   # mounts cannot remain attached to a stopped container. Preserve disposable
   # PostgreSQL containers and private diagnostics on failure for inspection.
@@ -325,23 +328,23 @@ cleanup() {
     docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "$container_name" \
       >"$tmp_dir/bot-state" 2>/dev/null || true
   fi
-    docker stop --time 30 "$container_name" >/dev/null 2>&1 || true
-    docker rm "$container_name" >/dev/null 2>&1 || true
+    if ! docker stop --time 30 "$container_name" >/dev/null 2>&1; then cleanup_failed=true; fi
+    if ! docker rm "$container_name" >/dev/null 2>&1; then cleanup_failed=true; fi
   fi
-  if [[ "$exit_code" -eq 0 && -n "${pg_container:-}" ]]; then
-    docker stop "$pg_container" >/dev/null 2>&1 || true
-    docker rm "$pg_container" >/dev/null 2>&1 || true
+  if [[ -n "${pg_container:-}" ]]; then
+    if ! docker stop "$pg_container" >/dev/null 2>&1; then cleanup_failed=true; fi
+    if ! docker rm "$pg_container" >/dev/null 2>&1; then cleanup_failed=true; fi
   fi
-  if [[ "$exit_code" -eq 0 && -n "${pg_plain_container:-}" ]]; then
-    docker stop "$pg_plain_container" >/dev/null 2>&1 || true
-    docker rm "$pg_plain_container" >/dev/null 2>&1 || true
+  if [[ -n "${pg_plain_container:-}" ]]; then
+    if ! docker stop "$pg_plain_container" >/dev/null 2>&1; then cleanup_failed=true; fi
+    if ! docker rm "$pg_plain_container" >/dev/null 2>&1; then cleanup_failed=true; fi
   fi
   if [[ -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
-    rm -rf "$tmp_dir"
+    if ! rm -rf "$tmp_dir"; then cleanup_failed=true; fi
   fi
-  if [[ "$exit_code" -eq 0 && "${evidence_ephemeral:-false}" == true \
-    && -n "${evidence_dir:-}" && -d "$evidence_dir" ]]; then
-    rm -rf "$evidence_dir"
+  if [[ "$cleanup_failed" == true ]]; then
+    printf 'live-foundation-smoke: cleanup failed\n' >&2
+    return 70
   fi
   unset DISCORD_TOKEN 2>/dev/null || true
 }
@@ -363,9 +366,8 @@ if [[ "$mode" == discord-live ]]; then
   image_repo_digests=$(docker image inspect --format '{{join .RepoDigests ","}}' "$image" 2>/dev/null || true)
   [[ -n "$image_repo_digests" ]] || image_repo_digests='local-image-no-repository-digest'
   image_revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image" 2>/dev/null || true)
-  if [[ "$local_image" == true ]]; then
-    [[ "$image_revision" == "$source_sha" ]] || fail 'local image revision label does not match --source-sha'
-  fi
+  [[ "$image_revision" == "$source_sha" ]] || fail 'image OCI revision label does not match --source-sha'
+  [[ "$image" == *@sha256:* || "$local_image" == true ]] || fail 'image must be immutable'
   record discord-target pass "app_alias=$app_alias application_id=$application_id guild_alias=$guild_alias guild_id=$guild_id image=$image image_id=$image_id image_digest=$image_repo_digests source_sha=$source_sha image_revision=$image_revision"
 fi
 

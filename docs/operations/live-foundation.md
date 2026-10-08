@@ -161,7 +161,7 @@ responsible for provider backup/restore drills.
 
 Safe error paths verified by the foundation harness are:
 1. pre-connect fail-closed gate without human approval (blocked status 78);
-2. authenticated nonexistent-command query returning Discord HTTP 404/code 10003;
+2. authenticated nonexistent-command query returning Discord HTTP 404/code 10063;
 3. PostgreSQL runtime DDL authorization denials;
 4. PostgreSQL verify-full TLS negative error classes.
 

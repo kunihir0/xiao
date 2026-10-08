@@ -145,6 +145,29 @@ impl DiscordAcceptanceClient {
         Ok((created.id.get(), true))
     }
 
+    /// Verifies a command belongs to this application/guild and is the expected
+    /// slash command before a destructive cleanup action.
+    pub async fn verify_guild_ping_command(
+        &self,
+        guild_id: u64,
+        command_id: u64,
+    ) -> Result<(), DiscordError> {
+        self.ensure_application_id().await?;
+        let command = self
+            .http
+            .get_guild_command(GuildId::new(guild_id), CommandId::new(command_id))
+            .await
+            .map_err(|err| DiscordError::Api(format!("failed to fetch guild command: {err}")))?;
+        if command.name != "ping"
+            || command.kind != serenity::model::application::CommandType::ChatInput
+        {
+            return Err(DiscordError::Api(
+                "refusing cleanup for a non-ping or non-chat-input command".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Deletes a guild command by ID without touching other commands.
     pub async fn delete_guild_command(
         &self,
