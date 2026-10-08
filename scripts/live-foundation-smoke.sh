@@ -783,6 +783,13 @@ bot_env_args=(
 )
 
 docker_args=(docker run -d --name "$container_name" --user "$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --add-host=host.docker.internal:host-gateway "${bot_env_args[@]}")
+if ! docker run --rm --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=$DATABASE_CA_FILE,dst=/run/secrets/database_ca,readonly" \
+  --entrypoint /bin/sh "$image" -c 'test -s /run/secrets/database_ca -a -r /run/secrets/database_ca'; then
+  record bot-ca-mount fail 'runtime image could not read the approved CA mount as the configured UID'
+  fail 'bot runtime CA mount is not readable'
+fi
+record bot-ca-mount pass 'runtime image can read the approved CA mount as the configured UID'
 
 # Read only the DISCORD_TOKEN assignment from the approved source file. The
 # value is never placed in argv, a second file, or evidence.
