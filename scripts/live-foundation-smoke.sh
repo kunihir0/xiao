@@ -950,8 +950,11 @@ docker stop --time 30 "$container_name" >/dev/null
 exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container_name")
 [[ "$exit_code" == 0 ]] || fail "bot did not exit cleanly on SIGTERM (exit status $exit_code)"
 record sigterm pass 'bot exited with status 0 within the 30-second grace period'
-container_started=false
-docker rm "$container_name" >/dev/null
+if docker rm "$container_name" >/dev/null; then
+  container_started=false
+else
+  fail 'bot container removal failed'
+fi
 
 # Restart bot container
 current_check=restart-readiness
@@ -1015,8 +1018,11 @@ fi
 # Stop restarted container and remove its credential-bearing mounts.
 current_check=resource-cleanup
 docker stop --time 30 "$container_name" >/dev/null
-container_started=false
-docker rm "$container_name" >/dev/null
+if docker rm "$container_name" >/dev/null; then
+  container_started=false
+else
+  fail 'bot container removal failed'
+fi
 record cleanup pass 'bot container stopped and removed; created guild command cleanup completed'
 
 record discord-complete pass 'live Discord gateway and PostgreSQL foundation acceptance completed successfully'
