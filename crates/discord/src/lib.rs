@@ -8,6 +8,7 @@ use std::{fmt, future::Future, pin::Pin, time::Duration};
 use poise::serenity_prelude as serenity;
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "live-acceptance")]
 pub mod acceptance;
 
 const REDACTED_TOKEN: &str = "[REDACTED]";
@@ -154,7 +155,7 @@ impl DiscordHandle {
                 on_error: on_framework_error,
                 ..Default::default()
             })
-            .setup(move |ctx, ready_event, framework| {
+            .setup(move |ctx, ready_event, _framework| {
                 Box::pin(async move {
                     tracing::info!(
                         bot_user = %ready_event.user.name,
@@ -162,9 +163,7 @@ impl DiscordHandle {
                         guild_count = ready_event.guilds.len(),
                         "Discord gateway READY received"
                     );
-                    match poise::builtins::register_globally(ctx, &framework.options().commands)
-                        .await
-                    {
+                    match register_global_ping(ctx).await {
                         Ok(()) => {
                             tracing::info!("Discord global slash command registration succeeded");
                             let _ = setup_sender.send(SetupStatus::Ready);
@@ -223,6 +222,20 @@ impl DiscordHandle {
         )
         .await
     }
+}
+
+async fn register_global_ping(ctx: &serenity::Context) -> Result<(), serenity::Error> {
+    let commands = ctx.http.get_global_commands().await?;
+    if commands
+        .iter()
+        .any(|command| command.name == PING_COMMAND_NAME)
+    {
+        return Ok(());
+    }
+    let command =
+        serenity::builder::CreateCommand::new(PING_COMMAND_NAME).description("Responds with pong.");
+    ctx.http.create_global_command(&command).await?;
+    Ok(())
 }
 
 async fn run_lifecycle(

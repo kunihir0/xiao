@@ -7,6 +7,9 @@ create production resources, or make an HTTP health endpoint.
 
 The harness is `scripts/live-foundation-smoke.sh`. It defaults to no live
 operation only when invoked with `--dry-run`; `--preflight` validates secret-file
+
+The host-side Discord inspection binary is built with the `live-acceptance`
+feature; the production bot image does not include that inspection mode.
 shape without printing values. Never run it against production.
 
 ## Safety gate and evidence
@@ -125,6 +128,15 @@ for database schema-current/readiness evidence, then checks the global command
 list and performs an idempotent guild command registration. Both lists MUST
 contain exactly one `/ping`. The harness checks this again after restart to
 catch duplicate registration.
+
+The acceptance container is started with `--no-migrate` so the long-running
+process cannot accidentally run DDL through the runtime role. The migration
+one-shot runs separately with `MIGRATION_DATABASE_URL_FILE`; an earlier
+container failure classified as `database migrations failed` was the runtime
+role attempting embedded migrations after startup migration configuration was
+not applied. The runtime role is intentionally denied schema DDL, so treating
+that error as a readiness failure is required rather than granting it
+migration privileges.
 The operator invokes `/ping` in the test guild and confirms the expected public
 `pong` response. In this foundation phase (Issue #22), only `/ping` exists; management
 commands, authorization policies, and ephemeral error responses are non-goals

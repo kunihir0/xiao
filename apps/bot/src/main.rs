@@ -1,6 +1,9 @@
 //! Process composition root for the Discord bot.
 
-use std::path::{Path, PathBuf};
+#[cfg(feature = "live-acceptance")]
+use std::path::Path;
+#[cfg(feature = "live-acceptance")]
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bot::{BoxError, Composition, CtrlCSignal};
@@ -13,6 +16,7 @@ use bot_db::{
     Db, DbConfig, FileKeyring, KeyProvider, PostgresPairingStore, PostgresPushCredentialStore,
     rewrap_secrets,
 };
+#[cfg(feature = "live-acceptance")]
 use bot_discord::acceptance::DiscordAcceptanceClient;
 use bot_discord::{DiscordConfig, DiscordHandle};
 use bot_domain::SteamId;
@@ -25,6 +29,7 @@ use rustplus_adapter::{
 use rustplus_client::ReconnectPolicy;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+#[cfg(feature = "live-acceptance")]
 use zeroize::Zeroizing;
 
 #[tokio::main]
@@ -110,6 +115,7 @@ async fn run_rustplus(
         .map_err(|error| Box::new(error) as BoxError)
 }
 
+#[cfg(feature = "live-acceptance")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiscordAcceptanceAction {
     ListGuilds,
@@ -119,6 +125,7 @@ pub enum DiscordAcceptanceAction {
     VerifyAll,
 }
 
+#[cfg(feature = "live-acceptance")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscordAcceptanceArgs {
     pub guild_id: Option<u64>,
@@ -129,11 +136,15 @@ pub struct DiscordAcceptanceArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BotMode {
-    Run { migrate_on_startup: bool },
+    Run {
+        migrate_on_startup: bool,
+    },
     MigrateOnly,
+    #[cfg(feature = "live-acceptance")]
     DiscordAcceptance(DiscordAcceptanceArgs),
 }
 
+#[cfg(feature = "live-acceptance")]
 fn parse_discord_acceptance_args(args: &[String]) -> Result<DiscordAcceptanceArgs, String> {
     let mut guild_id = None;
     let mut application_id = None;
@@ -211,6 +222,7 @@ pub fn parse_bot_mode(
     args: &[String],
     default_migrate_on_startup: bool,
 ) -> Result<BotMode, String> {
+    #[cfg(feature = "live-acceptance")]
     if let Some(first) = args.first()
         && first == "discord-acceptance"
     {
@@ -277,6 +289,7 @@ async fn run_migrations_command() -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg(feature = "live-acceptance")]
 fn resolve_discord_token(env_file_path: Option<&Path>) -> Result<Zeroizing<String>, BoxError> {
     if let Ok(token) = std::env::var("DISCORD_TOKEN")
         && !token.trim().is_empty()
@@ -308,6 +321,7 @@ fn resolve_discord_token(env_file_path: Option<&Path>) -> Result<Zeroizing<Strin
     )
 }
 
+#[cfg(feature = "live-acceptance")]
 async fn run_discord_acceptance(args: DiscordAcceptanceArgs) -> Result<(), BoxError> {
     let token = resolve_discord_token(args.env_file.as_deref())?;
     let client = DiscordAcceptanceClient::new(&token);
@@ -409,6 +423,7 @@ async fn run() -> Result<(), BoxError> {
 
     match mode {
         BotMode::MigrateOnly => run_migrations_command().await,
+        #[cfg(feature = "live-acceptance")]
         BotMode::DiscordAcceptance(args) => run_discord_acceptance(args).await,
         BotMode::Run {
             migrate_on_startup: requested_migrate_on_startup,
@@ -639,6 +654,7 @@ mod tests {
         assert!(matches!(&result, Err(msg) if msg.contains("unknown command line argument")));
     }
 
+    #[cfg(feature = "live-acceptance")]
     #[test]
     fn parse_bot_mode_discord_acceptance_valid() -> Result<(), String> {
         let args = vec![
@@ -663,6 +679,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "live-acceptance")]
     #[test]
     fn parse_bot_mode_discord_acceptance_optional_guild_id() -> Result<(), String> {
         let args = vec![
@@ -682,6 +699,7 @@ mod tests {
         );
         Ok(())
     }
+    #[cfg(feature = "live-acceptance")]
     #[test]
     fn parse_bot_mode_discord_acceptance_cleanup_action() -> Result<(), String> {
         let args = vec![

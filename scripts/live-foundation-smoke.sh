@@ -314,24 +314,28 @@ record() {
 
 cleanup() {
   local exit_code=$?
+  # Always remove local bot containers after stopping them so credential-bearing
+  # mounts cannot remain attached to a stopped container. Preserve disposable
+  # PostgreSQL containers and private diagnostics on failure for inspection.
   if [[ "${container_started:-false}" == true && -n "${container_name:-}" ]]; then
     docker stop --time 30 "$container_name" >/dev/null 2>&1 || true
-    if [[ "${cleanup_approved:-false}" == true ]]; then
-      docker rm "$container_name" >/dev/null 2>&1 || true
-    fi
+    docker rm "$container_name" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${pg_container:-}" && "${cleanup_approved:-false}" == true ]]; then
+  if [[ "$exit_code" -eq 0 && -n "${pg_container:-}" ]]; then
     docker stop "$pg_container" >/dev/null 2>&1 || true
     docker rm "$pg_container" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${pg_plain_container:-}" && "${cleanup_approved:-false}" == true ]]; then
+  if [[ "$exit_code" -eq 0 && -n "${pg_plain_container:-}" ]]; then
     docker stop "$pg_plain_container" >/dev/null 2>&1 || true
     docker rm "$pg_plain_container" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
+  if [[ "$exit_code" -eq 0 && -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
     rm -rf "$tmp_dir"
+  elif [[ -n "${tmp_dir:-}" && -d "$tmp_dir" ]]; then
+    printf 'private diagnostics preserved at %s\n' "$tmp_dir" >&2
   fi
-  if [[ "${evidence_ephemeral:-false}" == true && -n "${evidence_dir:-}" && -d "$evidence_dir" ]]; then
+  if [[ "$exit_code" -eq 0 && "${evidence_ephemeral:-false}" == true \
+    && -n "${evidence_dir:-}" && -d "$evidence_dir" ]]; then
     rm -rf "$evidence_dir"
   fi
   unset DISCORD_TOKEN 2>/dev/null || true
@@ -367,9 +371,15 @@ else
   fail 'psql is required for live PostgreSQL verification (install libpq)'
 fi
 
-# Ensure bot binary is available
-if [[ -z "$bot_bin" || ! -x "$bot_bin" ]]; then
-  cargo build --manifest-path "$repo_root/Cargo.toml" --package bot >/dev/null 2>&1
+# Ensure the migration/runtime binary is available. Discord acceptance commands
+# are compiled only behind the explicit live-acceptance feature.
+if [[ "$mode" == discord-live ]]; then
+  cargo build --locked --manifest-path "$repo_root/Cargo.toml" \
+    --package bot --features live-acceptance >/dev/null 2>&1 \
+    || fail 'failed to build bot with live-acceptance feature'
+  bot_bin="$repo_root/target/debug/bot"
+elif [[ -z "$bot_bin" || ! -x "$bot_bin" ]]; then
+  cargo build --locked --manifest-path "$repo_root/Cargo.toml" --package bot >/dev/null 2>&1
   bot_bin="$repo_root/target/debug/bot"
 fi
 
@@ -426,7 +436,7 @@ if [[ -z "${DATABASE_URL_FILE:-}" ]]; then
   pg_plain_container="xiao-pg-plain-$$"
 
   # Digest-pinned postgres image matching CI
-  pg_image="postgres:18.6-alpine"
+  pg_image="postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
 
   # Start disposable TLS postgres container
   docker run -d --name "$pg_container" \
@@ -457,6 +467,10 @@ if [[ -z "${DATABASE_URL_FILE:-}" ]]; then
     fi
     sleep 1
   done
+  docker exec "$pg_container" pg_isready -U xiao_admin -d xiao_test >/dev/null 2>&1 \
+    || fail 'TLS PostgreSQL container did not become ready'
+  docker exec "$pg_plain_container" pg_isready -U xiao_admin -d xiao_plain >/dev/null 2>&1 \
+    || fail 'plaintext PostgreSQL container did not become ready'
 
   # Provision distinct least-privilege roles in disposable TLS database
   docker exec -i "$pg_container" psql -U xiao_admin -d xiao_test >/dev/null <<SQL
@@ -494,6 +508,37 @@ SQL
   chmod 0600 "$DATABASE_URL_FILE" "$MIGRATION_DATABASE_URL_FILE" "$DATABASE_HOSTNAME_MISMATCH_URL_FILE" "$DATABASE_PLAINTEXT_URL_FILE" "$DATABASE_URL_CONTAINER_FILE"
 fi
 
+# Parse a PostgreSQL URL without placing the credential-bearing URL in argv.
+# Values are passed to Python over stdin and returned as NUL-delimited fields so
+# encoded credentials, IPv6 hosts, and query-bearing URLs are not hand-split.
+load_pg_env() {
+  local conn_url=$1
+  local -a fields=()
+  while IFS= read -r -d '' field; do
+    fields+=("$field")
+  done < <(python3 -c '
+import sys
+import urllib.parse
+
+url = urllib.parse.urlsplit(sys.stdin.read().strip())
+values = (
+    url.hostname or "",
+    str(url.port or 5432),
+    urllib.parse.unquote(url.username or ""),
+    urllib.parse.unquote(url.password or ""),
+    urllib.parse.unquote(url.path.lstrip("/")),
+)
+for value in values:
+    sys.stdout.buffer.write(value.encode("utf-8") + b"\0")
+' <<<"$conn_url")
+  (( ${#fields[@]} == 5 )) || fail 'database URL parser did not return all connection fields'
+  PGHOST=${fields[0]}
+  PGPORT=${fields[1]}
+  PGUSER=${fields[2]}
+  PGPASSWORD=${fields[3]}
+  PGDATABASE=${fields[4]}
+}
+
 # Function to run psql queries using environment variables without placing credentials in argv
 run_psql_query() {
   local role=$1 query=$2
@@ -507,17 +552,7 @@ run_psql_query() {
 
   local conn_url
   conn_url=$(cat "$url_file")
-
-  # Parse URL components using Python to preserve percent-encoding and avoid hand-parsing bugs
-  eval "$(python3 -c "
-import urllib.parse, sys
-url = urllib.parse.urlsplit('''$conn_url''')
-print(f'PGHOST=\"{url.hostname}\"')
-print(f'PGPORT=\"{url.port or 5432}\"')
-print(f'PGUSER=\"{url.username}\"')
-print(f'PGPASSWORD=\"{url.password}\"')
-print(f'PGDATABASE=\"{url.path.lstrip(\"/\")}\"')
-")"
+  load_pg_env "$conn_url"
 
   PGSSLMODE=verify-full PGSSLROOTCERT="$ca_file" \
   PGHOST="$PGHOST" PGPORT="$PGPORT" PGUSER="$PGUSER" PGPASSWORD="$PGPASSWORD" PGDATABASE="$PGDATABASE" \
@@ -548,16 +583,7 @@ expect_psql_failure() {
 
   local conn_url
   conn_url=$(cat "$url_file")
-
-  eval "$(python3 -c "
-import urllib.parse, sys
-url = urllib.parse.urlsplit('''$conn_url''')
-print(f'PGHOST=\"{url.hostname}\"')
-print(f'PGPORT=\"{url.port or 5432}\"')
-print(f'PGUSER=\"{url.username}\"')
-print(f'PGPASSWORD=\"{url.password}\"')
-print(f'PGDATABASE=\"{url.path.lstrip(\"/\")}\"')
-")"
+  load_pg_env "$conn_url"
 
   if PGSSLMODE=verify-full PGSSLROOTCERT="$ca_file" \
      PGHOST="$PGHOST" PGPORT="$PGPORT" PGUSER="$PGUSER" PGPASSWORD="$PGPASSWORD" PGDATABASE="$PGDATABASE" \
@@ -673,6 +699,7 @@ record readiness pass 'runtime PostgreSQL readiness SELECT 1 succeeded'
 
 run_psql_query runtime 'SELECT 1;' >/dev/null || fail 'runtime reconnect probe failed'
 record reconnect pass 'new runtime PostgreSQL session succeeded after readiness'
+record tls-verify-full pass 'trusted CA and hostname verification accepted a runtime connection'
 
 # 8. Upgrade idempotency & data preservation check
 DATABASE_URL_FILE="$DATABASE_URL_FILE" \
@@ -717,8 +744,13 @@ if [[ -n "$discord_env_file" ]]; then
   disc_opts+=(--env-file "$discord_env_file")
 fi
 
-acceptance_out=$("$bot_bin" "${disc_opts[@]}")
-printf '%s\n' "$acceptance_out" | grep -Fq '"status":"pass"' || fail "Discord acceptance verification failed: $acceptance_out"
+if ! printf '%s\n' "$acceptance_out" | grep -Fq '"status":"pass"'; then
+  fail 'Discord acceptance identity/command verification failed'
+fi
+printf '%s\n' "$acceptance_out" | grep -Fq '"global_ping_count":1' \
+  || fail 'authenticated global command list did not contain exactly one /ping'
+printf '%s\n' "$acceptance_out" | grep -Fq '"guild_ping_count":1' \
+  || fail 'authenticated guild command list did not contain exactly one /ping'
 
 # Extract non-secret discovery details from JSON output
 discovered_app_id=$(printf '%s\n' "$acceptance_out" | sed -n 's/.*"application_id":\([0-9]*\).*/\1/p')
@@ -746,17 +778,32 @@ bot_env_args=(
 
 docker_args=(docker run -d --name "$container_name" --user "$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --add-host=host.docker.internal:host-gateway "${bot_env_args[@]}")
 
-# Pass DISCORD_TOKEN into docker via environment variable without putting the value in argv or writing files
+# Read only the DISCORD_TOKEN assignment from the approved source file. The
+# value is never placed in argv, a second file, or evidence.
 if [[ -n "$discord_env_file" ]]; then
-  eval "$(grep -E '^DISCORD_TOKEN=' "$discord_env_file")"
-  export DISCORD_TOKEN
+  discord_token_value=
+  while IFS= read -r env_line; do
+    case "$env_line" in
+      DISCORD_TOKEN=*)
+        discord_token_value=${env_line#DISCORD_TOKEN=}
+        discord_token_value=${discord_token_value#\"}
+        discord_token_value=${discord_token_value%\"}
+        discord_token_value=${discord_token_value#\'}
+        discord_token_value=${discord_token_value%\'}
+        break
+        ;;
+    esac
+  done < "$discord_env_file"
+  [[ -n "$discord_token_value" ]] || fail 'approved env file does not contain DISCORD_TOKEN'
+  export DISCORD_TOKEN="$discord_token_value"
+  unset discord_token_value env_line
   docker_args+=(--env DISCORD_TOKEN)
 else
   docker_args+=(--mount "type=bind,src=$DISCORD_TOKEN_FILE,dst=/run/secrets/discord_token,readonly"
                 --env DISCORD_TOKEN_FILE=/run/secrets/discord_token)
 fi
 
-"${docker_args[@]}" "$image" >/dev/null
+"${docker_args[@]}" "$image" --no-migrate >/dev/null
 container_started=true
 
 # Wait for bot container to reach running state
@@ -796,11 +843,33 @@ done
 docker logs "$container_name" 2>&1 | grep -Fq 'Discord global slash command registration succeeded' || fail 'Discord slash command registration log not observed'
 
 record bot-readiness pass 'database readiness, gateway READY, and global slash command registration logs observed'
+ready_inspect_opts=(discord-acceptance --guild-id "$guild_id" --action inspect)
+if [[ -n "$discord_env_file" ]]; then
+  ready_inspect_opts+=(--env-file "$discord_env_file")
+fi
+ready_inspect=$("$bot_bin" "${ready_inspect_opts[@]}")
+printf '%s\n' "$ready_inspect" | grep -Fq '"global_ping_count":1' \
+  || fail 'running bot did not expose exactly one global /ping command'
+printf '%s\n' "$ready_inspect" | grep -Fq '"guild_ping_count":1' \
+  || fail 'running bot did not expose exactly one guild /ping command'
+record command-lists-ready pass 'running bot command lists contain exactly one global and guild /ping'
 
-# Operator command invocation check
+# Discord cannot be invoked through the approved management APIs. Keep the
+# gateway process alive while the operator confirms both command invocations.
 if [[ "$command_observed" != true ]]; then
-  record command-invocation blocked 'manual global/guild /ping invocation is required; rerun with --command-observed after human evidence'
-  blocked 'manual Discord command invocation evidence is required before shutdown/restart checks'
+  printf '%s\n' \
+    'HUMAN_INPUT_REQUEST source=ImplementIssue22 issue=22 action=invoke global and guild /ping in the approved test guild and confirm public pong responses reason=Discord command invocation requires an approved human client interaction; no token or password is requested blocking=yes' \
+    >&2
+  if [[ ! -t 0 ]]; then
+    record command-invocation blocked 'operator input is unavailable; process remains available only for an interactive rerun'
+    blocked 'manual Discord command invocation evidence is required before shutdown/restart checks'
+  fi
+  printf 'Type pass after observing both approved /ping responses: ' >&2
+  IFS= read -r command_result || command_result=
+  if [[ "$command_result" != pass ]]; then
+    record command-invocation blocked 'operator did not confirm both approved /ping responses'
+    blocked 'manual Discord command invocation was not confirmed'
+  fi
 fi
 record command-invocation pass 'manual global and guild /ping invocation observed by operator'
 
@@ -813,7 +882,7 @@ container_started=false
 docker rm "$container_name" >/dev/null
 
 # Restart bot container
-"${docker_args[@]}" "$image" >/dev/null
+"${docker_args[@]}" "$image" --no-migrate >/dev/null
 container_started=true
 
 for _ in {1..45}; do
@@ -845,7 +914,8 @@ if [[ -n "$discord_env_file" ]]; then
 fi
 restart_inspect=$("$bot_bin" "${inspect_opts[@]}")
 printf '%s\n' "$restart_inspect" | grep -Fq '"global_ping_count":1' || fail 'restart produced duplicate global /ping commands'
-record duplicate-registration pass 'restart preserved exactly one global /ping command'
+printf '%s\n' "$restart_inspect" | grep -Fq '"guild_ping_count":1' || fail 'restart changed guild /ping command count'
+record duplicate-registration pass 'restart preserved exactly one global and guild /ping command'
 
 # Clean up created guild ping command if it was created during test
 if [[ "$guild_ping_created" == "true" && -n "$created_guild_ping_id" && "$created_guild_ping_id" != "0" ]]; then
@@ -856,13 +926,11 @@ if [[ "$guild_ping_created" == "true" && -n "$created_guild_ping_id" && "$create
   "$bot_bin" "${clean_opts[@]}" >/dev/null 2>&1 || true
 fi
 
-# Stop restarted container
+# Stop restarted container and remove its credential-bearing mounts.
 docker stop --time 30 "$container_name" >/dev/null
 container_started=false
-if [[ "$cleanup_approved" == true ]]; then
-  docker rm "$container_name" >/dev/null 2>&1 || true
-fi
-record cleanup pass 'test guild commands cleaned, containers stopped, disposable resources cleaned'
+docker rm "$container_name" >/dev/null 2>&1 || true
+record cleanup pass 'bot container stopped and removed; created guild command cleanup completed'
 
 record discord-complete pass 'live Discord gateway and PostgreSQL foundation acceptance completed successfully'
 printf '%s\n' 'Discord startup, registration, readiness, SIGTERM, and restart checks passed.'
