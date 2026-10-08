@@ -41,8 +41,13 @@ The harness never prints, dumps, or adds secret values to command-line arguments
 EOF
 }
 
+current_check=preflight
 fail() {
-  printf 'live-foundation-smoke: %s\n' "$*" >&2
+  local reason=$*
+  if [[ -n "${manifest:-}" && -f "$manifest" ]]; then
+    record "${current_check:-preflight}" fail "$reason"
+  fi
+  printf 'live-foundation-smoke: %s\n' "$reason" >&2
   exit 64
 }
 
@@ -311,8 +316,9 @@ json_escape() {
 
 record() {
   local check=$1 status=$2 detail=$3
-  printf '{"at":"%s","check":"%s","status":"%s","detail":"%s"}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(json_escape "$check")" "$status" "$(json_escape "$detail")" >> "$manifest"
+  jq -cn --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg check "$check" --arg status "$status" --arg detail "$detail" \
+    '{at:$at,check:$check,status:$status,detail:$detail}' >> "$manifest"
 }
 
 cleanup() {
@@ -326,16 +332,14 @@ cleanup() {
   # PostgreSQL containers and private diagnostics on failure for inspection.
   if [[ "$exit_code" -ne 0 && "${container_started:-false}" == true \
     && -n "${evidence_dir:-}" && -d "$evidence_dir" ]]; then
-    {
-      printf '{"check":"bot-container","status":"stopped","exit_code":"'
-      docker inspect --format '{{.State.ExitCode}}' "$container_name" 2>/dev/null || printf 'unknown'
-      printf '","readiness_logs_observed":false}\n'
-    } >"$evidence_dir/cleanup-diagnostic.json"
+    jq -cn --arg check "${current_check:-unknown}" \
+      --arg status fail --arg exit_status "$exit_code" \
+      --arg owner "$(id -u):$(id -g)" --arg evidence "$evidence_dir" \
+      '{check:$check,status:$status,exit_status:$exit_status,evidence_owner:$owner,evidence_path:$evidence,cleanup_status:"started"}' \
+      >"$evidence_dir/cleanup-diagnostic.json"
     chmod 600 "$evidence_dir/cleanup-diagnostic.json"
-    {
-      printf 'failure evidence: bot container did not complete acceptance\n'
-      printf 'raw diagnostics intentionally removed; inspect manifest statuses only\n'
-    } >"$evidence_dir/cleanup-diagnostic.log"
+    printf 'failure_class=%s\nredacted_diagnostics=true\n' "${current_check:-unknown}" \
+      >"$evidence_dir/cleanup-diagnostic.log"
     chmod 600 "$evidence_dir/cleanup-diagnostic.log"
   fi
   if [[ "${container_started:-false}" == true && -n "${container_name:-}" ]]; then
@@ -414,6 +418,7 @@ fi
 
 # --------------------------------------------------------------------------
 # PostgreSQL Acceptance Setup
+current_check=resource-provision
 # --------------------------------------------------------------------------
 
 # If secret files are not externally supplied, provision disposable PostgreSQL in Docker following CI TLS pattern
@@ -653,6 +658,7 @@ expect_psql_failure() {
 }
 
 # 1. Distinct roles check
+current_check=role-boundary
 runtime_user=$(run_psql_query runtime 'SELECT current_user')
 migrator_user=$(run_psql_query migrator 'SELECT current_user')
 runtime_user=${runtime_user//[[:space:]]/}
@@ -673,6 +679,7 @@ run_psql_query migrator "DROP TABLE public._ddl_probe;" >/dev/null
 record migrator-ddl-allowed pass 'migrator DDL privilege is confirmed'
 
 # 4. Fresh migration execution
+current_check=fresh-migration
 migration_log="$tmp_dir/migration.log"
 if DATABASE_URL_FILE="$DATABASE_URL_FILE" \
    MIGRATION_DATABASE_URL_FILE="$MIGRATION_DATABASE_URL_FILE" \
@@ -765,6 +772,7 @@ record upgrade-idempotent pass 'repeat migration preserved schema currency, migr
 run_psql_query runtime "DELETE FROM public.rustplus_push_credentials WHERE id = '$test_row_id';" >/dev/null
 
 # 9. Verify-full positive and TLS negative tests
+current_check=tls-negative
 expect_psql_failure wrong-ca 'SELECT 1' tls-wrong-ca
 expect_psql_failure hostname-mismatch 'SELECT 1' tls-hostname-mismatch
 expect_psql_failure plaintext 'SELECT 1' tls-plaintext-rejected
@@ -778,6 +786,7 @@ fi
 # --------------------------------------------------------------------------
 # Discord Live Acceptance Mode
 # --------------------------------------------------------------------------
+current_check=discord-identity
 
 # Verify Discord identity and slash commands using in-process Serenity HTTP client
 # The token is read in-process directly from the approved file; never printed or serialized.
