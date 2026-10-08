@@ -756,6 +756,7 @@ record reconnect pass 'new runtime PostgreSQL session succeeded after readiness'
 record tls-verify-full pass 'trusted CA and hostname verification accepted a runtime connection'
 
 # 8. Upgrade idempotency & data preservation check
+current_check=upgrade-data-preservation
 DATABASE_URL_FILE="$DATABASE_URL_FILE" \
 MIGRATION_DATABASE_URL_FILE="$MIGRATION_DATABASE_URL_FILE" \
 DATABASE_CA_FILE="$DATABASE_CA_FILE" \
@@ -823,6 +824,7 @@ record discord-error-path pass 'invalid command query returned expected not-foun
 record guild-ping-registration pass 'guild command list contains exactly one /ping without bulk overwrite'
 
 # Run bot container
+current_check=bot-readiness
 bot_env_args=(
   --mount "type=bind,src=${DATABASE_URL_CONTAINER_FILE:-$DATABASE_URL_FILE},dst=/run/secrets/database_url,readonly"
   --mount "type=bind,src=$DATABASE_CA_FILE,dst=/run/secrets/database_ca,readonly"
@@ -848,6 +850,7 @@ docker_args=(docker run -d --name "$container_name" --user "$runtime_uid:$runtim
 if [[ "$(docker image inspect --format '{{.Config.User}}' "$image")" != "10001:10001" ]]; then
   fail 'reviewed image must declare fixed non-root user 10001:10001'
 fi
+current_check=bot-ca-readability
 if ! docker run --rm --user "$runtime_uid:$runtime_gid" \
   --mount "type=bind,src=$DATABASE_CA_FILE,dst=/run/secrets/database_ca,readonly" \
   --entrypoint /bin/sh "$image" -c 'test -s /run/secrets/database_ca -a -r /run/secrets/database_ca'; then
@@ -908,6 +911,7 @@ done
 docker logs "$container_name" 2>&1 | grep -Fq 'Discord global slash command registration succeeded' || fail 'Discord slash command registration log not observed'
 
 record bot-readiness pass 'database readiness, gateway READY, and global slash command registration logs observed'
+current_check=command-registration
 ready_inspect_opts=(discord-acceptance --guild-id "$guild_id" --action inspect)
 if [[ -n "$discord_env_file" ]]; then
   ready_inspect_opts+=(--env-file "$discord_env_file")
@@ -923,6 +927,7 @@ record global-ping-registration pass 'running bot global command list contains e
 # Discord cannot be invoked through the approved management APIs. Keep the
 # gateway process alive while the operator confirms both command invocations.
 if [[ "$command_observed" != true ]]; then
+current_check=command-invocation
   printf '%s\n' \
     'HUMAN_INPUT_REQUEST source=ImplementIssue22 issue=22 action=invoke global and guild /ping in the approved test guild and confirm public pong responses reason=Discord command invocation requires an approved human client interaction; no token or password is requested blocking=yes' \
     >&2
@@ -940,6 +945,7 @@ fi
 record command-invocation pass 'manual global and guild /ping invocation observed by operator'
 
 # Graceful stop via SIGTERM with 30-second grace period
+current_check=graceful-shutdown
 docker stop --time 30 "$container_name" >/dev/null
 exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container_name")
 [[ "$exit_code" == 0 ]] || fail "bot did not exit cleanly on SIGTERM (exit status $exit_code)"
@@ -948,6 +954,7 @@ container_started=false
 docker rm "$container_name" >/dev/null
 
 # Restart bot container
+current_check=restart-readiness
 "${docker_args[@]}" "$image" "${container_command[@]}" >/dev/null
 container_started=true
 
@@ -974,6 +981,7 @@ docker logs "$container_name" 2>&1 | grep -Fq 'Discord global slash command regi
 record restart pass 'bot restarted, reconnected to gateway, and repeated readiness verification'
 
 # Inspect global commands to confirm no duplicate registration
+current_check=duplicate-registration
 inspect_opts=(discord-acceptance --guild-id "$guild_id" --action inspect)
 if [[ -n "$discord_env_file" ]]; then
   inspect_opts+=(--env-file "$discord_env_file")
@@ -987,6 +995,7 @@ printf '%s\n' "$restart_inspect" | grep -Fq '"guild_ping_count":1' || fail 'rest
 record duplicate-registration pass 'restart preserved exactly one global and guild /ping command'
 
 # Clean up only the guild command created by this run, then verify absence.
+current_check=command-cleanup
 if [[ "$guild_ping_created" == "true" && -n "$created_guild_ping_id" && "$created_guild_ping_id" != "0" ]]; then
   clean_opts=(discord-acceptance --guild-id "$guild_id" --action cleanup-guild-ping --command-id "$created_guild_ping_id")
   if [[ -n "$discord_env_file" ]]; then
@@ -1004,6 +1013,7 @@ if [[ "$guild_ping_created" == "true" && -n "$created_guild_ping_id" && "$create
     || { record cleanup fail 'created guild command remained after deletion'; fail 'created guild command remained after deletion'; }
 fi
 # Stop restarted container and remove its credential-bearing mounts.
+current_check=resource-cleanup
 docker stop --time 30 "$container_name" >/dev/null
 container_started=false
 docker rm "$container_name" >/dev/null
