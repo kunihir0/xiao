@@ -107,49 +107,148 @@ async fn run_rustplus(
         .map_err(|error| Box::new(error) as BoxError)
 }
 
-async fn run() -> Result<(), BoxError> {
-    let config = Config::from_env().map_err(|error| Box::new(error) as BoxError)?;
-    let _telemetry = init_from_config(&config).map_err(|error| Box::new(error) as BoxError)?;
-    let database_config = DbConfig::new(config.database_url())?;
-    let database = Arc::new(Db::connect(&database_config).await?);
-    database.initialize().await?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BotMode {
+    Run { migrate_on_startup: bool },
+    MigrateOnly,
+}
 
-    // Database startup is complete before Discord is constructed.
-    let mut composition = Composition::new(CtrlCSignal);
-    if let Some(rustplus_config) = config.rustplus() {
-        // Fail closed before any component starts when the keyring is absent,
-        // malformed, or readable by other users.
-        let keys: Arc<dyn KeyProvider> = Arc::new(FileKeyring::load(
-            rustplus_config.keyring_file(),
-            rustplus_config.active_key_id(),
-        )?);
-        let cancellation = composition.cancellation_token();
-        composition.register(
-            "rustplus-pairing",
-            run_rustplus(
-                Arc::clone(&database),
-                keys,
-                rustplus_config.clone(),
-                cancellation,
-            ),
-        )?;
-    } else {
-        info!("Rust+ pairing disabled: no Rust+ companion configuration");
+pub fn parse_bot_mode(
+    args: &[String],
+    default_migrate_on_startup: bool,
+) -> Result<BotMode, String> {
+    let mut migrate_only = false;
+    let mut migrate_on_startup = default_migrate_on_startup;
+
+    for arg in args {
+        match arg.as_str() {
+            "migrate" | "--migrate" => {
+                migrate_only = true;
+            }
+            "--no-startup-migrations" | "--no-migrate" | "--skip-migrations" => {
+                migrate_on_startup = false;
+            }
+            "--startup-migrations" | "--migrate-on-startup" => {
+                migrate_on_startup = true;
+            }
+            _ => {
+                return Err(format!("unknown command line argument: {arg}"));
+            }
+        }
     }
-    let discord = DiscordHandle::new(DiscordConfig::new(config.discord_token().to_owned())?);
-    let cancellation = composition.cancellation_token();
 
-    composition.register("discord", async move {
-        discord
-            .run(cancellation)
-            .await
-            .map_err(|error| Box::new(error) as BoxError)
-    })?;
-    composition
-        .run()
-        .await
-        .map(|_| ())
-        .map_err(|error| Box::new(error) as BoxError)
+    if migrate_only {
+        Ok(BotMode::MigrateOnly)
+    } else {
+        Ok(BotMode::Run { migrate_on_startup })
+    }
+}
+
+fn create_db_config(
+    database_url: &str,
+    tls_config: &bot_config::DatabaseTlsConfig,
+) -> Result<DbConfig, BoxError> {
+    match tls_config {
+        bot_config::DatabaseTlsConfig::VerifyFull { ca_file } => {
+            DbConfig::verify_full(database_url, ca_file).map_err(|e| Box::new(e) as BoxError)
+        }
+        bot_config::DatabaseTlsConfig::Insecure => {
+            DbConfig::insecure_for_local_dev(database_url).map_err(|e| Box::new(e) as BoxError)
+        }
+    }
+}
+
+async fn run_migrations_command() -> Result<(), BoxError> {
+    let migration_config =
+        bot_config::MigrationConfig::from_env().map_err(|error| Box::new(error) as BoxError)?;
+    let db_config = create_db_config(
+        migration_config.database_url(),
+        migration_config.database_tls(),
+    )?;
+    let database = Db::connect(&db_config).await?;
+    info!("running database migrations");
+    let report = database.run_migrations().await?;
+    info!(
+        applied = report.applied(),
+        "database migrations completed successfully"
+    );
+    database.verify_schema_current().await?;
+    info!("verified database schema is current");
+    Ok(())
+}
+
+async fn run() -> Result<(), BoxError> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode =
+        parse_bot_mode(&args, true).map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
+
+    match mode {
+        BotMode::MigrateOnly => run_migrations_command().await,
+        BotMode::Run {
+            migrate_on_startup: requested_migrate_on_startup,
+        } => {
+            let config = Config::from_env().map_err(|error| Box::new(error) as BoxError)?;
+            let _telemetry =
+                init_from_config(&config).map_err(|error| Box::new(error) as BoxError)?;
+            let migrate_on_startup = if requested_migrate_on_startup {
+                config.database_migrate_on_startup()
+            } else {
+                false
+            };
+            let database_config = create_db_config(config.database_url(), config.database_tls())?;
+            let database = Arc::new(Db::connect(&database_config).await?);
+            if migrate_on_startup {
+                info!("startup migrations enabled: initializing database");
+                let report = database.initialize().await?;
+                info!(
+                    applied = report.applied(),
+                    "startup database initialization complete"
+                );
+            } else {
+                info!("startup migrations disabled: verifying schema is current");
+                database.verify_and_ping().await?;
+                info!("database schema verified current and readiness ping succeeded");
+            }
+
+            // Database startup is complete before Discord is constructed.
+            let mut composition = Composition::new(CtrlCSignal);
+            if let Some(rustplus_config) = config.rustplus() {
+                // Fail closed before starting components when the keyring is
+                // absent, malformed, or not owner-only.
+                let keys: Arc<dyn KeyProvider> = Arc::new(FileKeyring::load(
+                    rustplus_config.keyring_file(),
+                    rustplus_config.active_key_id(),
+                )?);
+                let cancellation = composition.cancellation_token();
+                composition.register(
+                    "rustplus-pairing",
+                    run_rustplus(
+                        Arc::clone(&database),
+                        keys,
+                        rustplus_config.clone(),
+                        cancellation,
+                    ),
+                )?;
+            } else {
+                info!("Rust+ pairing disabled: no Rust+ companion configuration");
+            }
+            let discord =
+                DiscordHandle::new(DiscordConfig::new(config.discord_token().to_owned())?);
+            let cancellation = composition.cancellation_token();
+
+            composition.register("discord", async move {
+                discord
+                    .run(cancellation)
+                    .await
+                    .map_err(|error| Box::new(error) as BoxError)
+            })?;
+            composition
+                .run()
+                .await
+                .map(|_| ())
+                .map_err(|error| Box::new(error) as BoxError)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -249,5 +348,68 @@ mod tests {
         assert_eq!(snapshot.keys.private_key_bytes(), Some([5; 32]));
         assert_eq!(snapshot.keys.auth_secret_bytes(), Some([6; 16]));
         assert!(!format!("{connector:?}").contains("restored-token"));
+    }
+
+    #[test]
+    fn parse_bot_mode_defaults_to_config_setting() -> Result<(), String> {
+        assert_eq!(
+            parse_bot_mode(&[], true)?,
+            BotMode::Run {
+                migrate_on_startup: true
+            }
+        );
+        assert_eq!(
+            parse_bot_mode(&[], false)?,
+            BotMode::Run {
+                migrate_on_startup: false
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_bot_mode_migrate_subcommand_selects_migrate_only() -> Result<(), String> {
+        for arg in ["migrate", "--migrate"] {
+            assert_eq!(
+                parse_bot_mode(&[arg.to_owned()], true)?,
+                BotMode::MigrateOnly
+            );
+            assert_eq!(
+                parse_bot_mode(&[arg.to_owned()], false)?,
+                BotMode::MigrateOnly
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_bot_mode_startup_migration_flags_override_default() -> Result<(), String> {
+        for arg in [
+            "--no-startup-migrations",
+            "--no-migrate",
+            "--skip-migrations",
+        ] {
+            assert_eq!(
+                parse_bot_mode(&[arg.to_owned()], true)?,
+                BotMode::Run {
+                    migrate_on_startup: false
+                }
+            );
+        }
+        for arg in ["--startup-migrations", "--migrate-on-startup"] {
+            assert_eq!(
+                parse_bot_mode(&[arg.to_owned()], false)?,
+                BotMode::Run {
+                    migrate_on_startup: true
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_bot_mode_rejects_unknown_argument() {
+        let result = parse_bot_mode(&["--invalid-arg".to_owned()], true);
+        assert!(matches!(&result, Err(msg) if msg.contains("unknown command line argument")));
     }
 }

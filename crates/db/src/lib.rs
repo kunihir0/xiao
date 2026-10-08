@@ -5,10 +5,15 @@
 //! methods and [`DbError`] only.
 
 use diesel::sql_query;
-use diesel_async::pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool};
+use diesel_async::pooled_connection::{
+    AsyncDieselConnectionManager, ManagerConfig, RecyclingMethod, deadpool::Pool,
+};
 use diesel_async::{AsyncMigrationHarness, AsyncPgConnection, RunQueryDsl};
 use diesel_migrations::{MigrationHarness, embed_migrations};
+use futures_util::FutureExt;
 use std::fmt::{Debug, Formatter};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
@@ -20,16 +25,51 @@ const DEFAULT_MAX_CONNECTIONS: usize = 8;
 type PoolManager = AsyncDieselConnectionManager<AsyncPgConnection>;
 type DatabasePool = Pool<AsyncPgConnection>;
 
+/// PostgreSQL TLS configuration for the persistence adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DbTlsMode {
+    /// Strict TLS: verifies server certificate and hostname against a CA bundle file.
+    VerifyFull { ca_file: PathBuf },
+    /// Explicit local development and test opt-in for unencrypted connections.
+    Insecure,
+}
+
 /// Configuration required to connect to PostgreSQL.
 #[derive(Clone)]
 pub struct DbConfig {
     database_url: String,
     max_connections: usize,
+    tls: DbTlsMode,
 }
 
 impl DbConfig {
-    /// Creates a database configuration from a PostgreSQL connection URL.
-    pub fn new(database_url: impl Into<String>) -> Result<Self, DbError> {
+    /// Creates a database configuration enforcing strict verify-full TLS with a CA certificate file.
+    pub fn verify_full(
+        database_url: impl Into<String>,
+        ca_file: impl Into<PathBuf>,
+    ) -> Result<Self, DbError> {
+        let database_url = database_url.into();
+        if database_url.trim().is_empty() {
+            return Err(DbError::InvalidConfiguration {
+                reason: "database URL must not be empty",
+            });
+        }
+        let ca_file = ca_file.into();
+        if ca_file.as_os_str().is_empty() {
+            return Err(DbError::InvalidConfiguration {
+                reason: "CA certificate path must not be empty",
+            });
+        }
+
+        Ok(Self {
+            database_url,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            tls: DbTlsMode::VerifyFull { ca_file },
+        })
+    }
+
+    /// Explicitly opts into insecure unencrypted database connections for local development or tests.
+    pub fn insecure_for_local_dev(database_url: impl Into<String>) -> Result<Self, DbError> {
         let database_url = database_url.into();
         if database_url.trim().is_empty() {
             return Err(DbError::InvalidConfiguration {
@@ -40,6 +80,7 @@ impl DbConfig {
         Ok(Self {
             database_url,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            tls: DbTlsMode::Insecure,
         })
     }
 
@@ -53,6 +94,40 @@ impl DbConfig {
         self.max_connections = max_connections;
         Ok(self)
     }
+
+    /// Sets the TLS mode.
+    pub fn with_tls(mut self, tls: DbTlsMode) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// Sets strict verify-full TLS with a CA certificate file.
+    pub fn with_tls_verify_full(mut self, ca_file: impl Into<PathBuf>) -> Result<Self, DbError> {
+        let ca_file = ca_file.into();
+        if ca_file.as_os_str().is_empty() {
+            return Err(DbError::InvalidConfiguration {
+                reason: "CA certificate path must not be empty",
+            });
+        }
+        self.tls = DbTlsMode::VerifyFull { ca_file };
+        Ok(self)
+    }
+
+    /// Explicitly opts into insecure unencrypted database connections.
+    pub fn with_insecure_tls(mut self) -> Self {
+        self.tls = DbTlsMode::Insecure;
+        self
+    }
+
+    /// Returns the database connection string.
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    /// Returns the TLS configuration mode.
+    pub fn tls(&self) -> &DbTlsMode {
+        &self.tls
+    }
 }
 
 impl Debug for DbConfig {
@@ -61,6 +136,7 @@ impl Debug for DbConfig {
             .debug_struct("DbConfig")
             .field("database_url", &"<redacted>")
             .field("max_connections", &self.max_connections)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -81,9 +157,15 @@ pub enum DbError {
     /// Embedded migrations could not be applied.
     #[error("database migrations failed")]
     Migration,
+    /// The database schema has unapplied pending migrations.
+    #[error("database schema has pending migrations")]
+    SchemaPending,
     /// The readiness ping failed.
     #[error("database readiness ping failed")]
     Ping,
+    /// PostgreSQL TLS configuration or certificate validation failed.
+    #[error("database TLS configuration error: {reason}")]
+    TlsConfiguration { reason: &'static str },
 }
 
 impl Debug for DbError {
@@ -94,10 +176,52 @@ impl Debug for DbError {
             Self::ConnectionAcquisition => "ConnectionAcquisition",
             Self::Connection => "Connection",
             Self::Migration => "Migration",
+            Self::SchemaPending => "SchemaPending",
             Self::Ping => "Ping",
+            Self::TlsConfiguration { .. } => "TlsConfiguration",
         };
         formatter.debug_tuple("DbError").field(&kind).finish()
     }
+}
+
+fn build_rustls_client_config(ca_file: &Path) -> Result<rustls::ClientConfig, DbError> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_file)
+        .map_err(|_| DbError::TlsConfiguration {
+            reason: "failed to open CA certificate file",
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| DbError::TlsConfiguration {
+            reason: "invalid PEM format in CA certificate file",
+        })?;
+
+    if certs.is_empty() {
+        return Err(DbError::TlsConfiguration {
+            reason: "no valid certificates found in CA certificate file",
+        });
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|_| DbError::TlsConfiguration {
+                reason: "failed to add certificate to root store",
+            })?;
+    }
+
+    let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| DbError::TlsConfiguration {
+        reason: "crypto provider lacks safe TLS versions",
+    })?
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
+
+    Ok(client_config)
 }
 
 /// Number of migrations applied by one migration pass.
@@ -138,7 +262,38 @@ impl Db {
     /// Builds the pool and verifies that at least one PostgreSQL connection can
     /// be established. Migrations are deliberately not run by this method.
     pub async fn connect(config: &DbConfig) -> Result<Self, DbError> {
-        let manager = PoolManager::new(config.database_url.clone());
+        let manager = match &config.tls {
+            DbTlsMode::Insecure => PoolManager::new(config.database_url.clone()),
+            DbTlsMode::VerifyFull { ca_file } => {
+                let client_config = build_rustls_client_config(ca_file)?;
+                let tls_connector = tokio_postgres_rustls::MakeRustlsConnect::new(client_config);
+                let mut manager_config = ManagerConfig::default();
+                manager_config.recycling_method = RecyclingMethod::Verified;
+                manager_config.custom_setup = Box::new(move |url: &str| {
+                    let tls_connector = tls_connector.clone();
+                    let mut pg_config = match url.parse::<tokio_postgres::Config>() {
+                        Ok(pg_config) => pg_config,
+                        Err(err) => {
+                            return futures_util::future::err(
+                                diesel::result::ConnectionError::BadConnection(err.to_string()),
+                            )
+                            .boxed();
+                        }
+                    };
+                    pg_config.ssl_mode(tokio_postgres::config::SslMode::Require);
+                    async move {
+                        let (client, conn) =
+                            pg_config.connect(tls_connector).await.map_err(|err| {
+                                diesel::result::ConnectionError::BadConnection(err.to_string())
+                            })?;
+                        AsyncPgConnection::try_from_client_and_connection(client, conn).await
+                    }
+                    .boxed()
+                });
+                PoolManager::new_with_config(config.database_url.clone(), manager_config)
+            }
+        };
+
         let pool_config = deadpool::managed::PoolConfig {
             max_size: config.max_connections,
             timeouts: deadpool::managed::Timeouts {
@@ -188,9 +343,34 @@ impl Db {
         self.migrations_complete.store(true, Ordering::Release);
         Ok(MigrationReport { applied })
     }
+    /// Verifies that all embedded migrations have been applied without running DDL.
+    pub async fn verify_schema_current(&self) -> Result<(), DbError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.verify_schema_current_locked().await
+    }
 
-    /// Pings PostgreSQL and marks the adapter ready only after migrations have
-    /// completed successfully.
+    async fn verify_schema_current_locked(&self) -> Result<(), DbError> {
+        let connection = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| DbError::ConnectionAcquisition)?;
+        let mut harness = AsyncMigrationHarness::new(connection);
+        let has_pending = harness
+            .has_pending_migration(MIGRATIONS)
+            .map_err(|_| DbError::Migration)?;
+
+        if has_pending {
+            self.ready.store(false, Ordering::Release);
+            self.migrations_complete.store(false, Ordering::Release);
+            return Err(DbError::SchemaPending);
+        }
+
+        self.migrations_complete.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Pings PostgreSQL and verifies that the schema is current before marking ready.
     pub async fn ping(&self) -> Result<(), DbError> {
         let _lifecycle = self.lifecycle.lock().await;
         self.ping_locked().await
@@ -209,13 +389,24 @@ impl Db {
                 DbError::Ping
             })?;
 
-        if AtomicBool::load(&self.migrations_complete, Ordering::Acquire) {
-            self.ready.store(true, Ordering::Release);
+        if !AtomicBool::load(&self.migrations_complete, Ordering::Acquire) {
+            let mut harness = AsyncMigrationHarness::new(connection);
+            let has_pending = harness.has_pending_migration(MIGRATIONS).map_err(|_| {
+                self.ready.store(false, Ordering::Release);
+                DbError::Migration
+            })?;
+            if has_pending {
+                self.ready.store(false, Ordering::Release);
+                return Err(DbError::SchemaPending);
+            }
+            self.migrations_complete.store(true, Ordering::Release);
         }
+
+        self.ready.store(true, Ordering::Release);
         Ok(())
     }
 
-    /// Runs migrations and the readiness ping as one startup operation.
+    /// Runs migrations and verifies readiness as one startup operation.
     pub async fn initialize(&self) -> Result<MigrationReport, DbError> {
         let _lifecycle = self.lifecycle.lock().await;
         let report = self.run_migrations_locked().await?;
@@ -223,11 +414,19 @@ impl Db {
         Ok(report)
     }
 
+    /// Verifies that the database schema is current (without running migrations)
+    /// and performs the readiness ping. Used when startup migrations are disabled.
+    pub async fn verify_and_ping(&self) -> Result<(), DbError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.verify_schema_current_locked().await?;
+        self.ping_locked().await?;
+        Ok(())
+    }
+
     /// Returns whether migrations and the readiness ping have both succeeded.
     pub fn is_ready(&self) -> bool {
         AtomicBool::load(&self.ready, Ordering::Acquire)
     }
-
     async fn acquire_connection(&self) -> Result<(), DbError> {
         self.pool
             .get()
@@ -253,14 +452,98 @@ pub use secrets::{DataKey, FileKeyring, KeyId, KeyProvider, KeyringError, Secret
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+    #[test]
+    fn db_config_constructors_require_explicit_tls_mode() -> Result<(), BoxError> {
+        let insecure = DbConfig::insecure_for_local_dev("postgres://localhost/bot")?;
+        assert_eq!(insecure.tls(), &DbTlsMode::Insecure);
+        assert_eq!(insecure.max_connections, DEFAULT_MAX_CONNECTIONS);
+
+        let secure = DbConfig::verify_full("postgres://localhost/bot", "/path/to/ca.crt")?;
+        assert_eq!(
+            secure.tls(),
+            &DbTlsMode::VerifyFull {
+                ca_file: PathBuf::from("/path/to/ca.crt")
+            }
+        );
+        let debug = format!("{secure:?}");
+        assert!(debug.contains("/path/to/ca.crt"));
+        assert!(!debug.contains("postgres://localhost/bot"));
+        Ok(())
+    }
+
+    #[test]
+    fn db_config_rejects_empty_inputs() {
+        assert!(matches!(
+            DbConfig::insecure_for_local_dev("   "),
+            Err(DbError::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            DbConfig::verify_full("postgres://localhost/bot", ""),
+            Err(DbError::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            DbConfig::insecure_for_local_dev("postgres://localhost/bot")
+                .and_then(|c| c.with_max_connections(0)),
+            Err(DbError::InvalidConfiguration { .. })
+        ));
+    }
+    #[test]
+    fn db_error_debug_does_not_leak_details() {
+        for (error, expected_name) in [
+            (
+                DbError::InvalidConfiguration {
+                    reason: "secret-leak",
+                },
+                "InvalidConfiguration",
+            ),
+            (DbError::PoolConstruction, "PoolConstruction"),
+            (DbError::ConnectionAcquisition, "ConnectionAcquisition"),
+            (DbError::Connection, "Connection"),
+            (DbError::Migration, "Migration"),
+            (DbError::SchemaPending, "SchemaPending"),
+            (DbError::Ping, "Ping"),
+            (
+                DbError::TlsConfiguration {
+                    reason: "secret-ca",
+                },
+                "TlsConfiguration",
+            ),
+        ] {
+            let debug = format!("{error:?}");
+            assert_eq!(debug, format!("DbError(\"{expected_name}\")"));
+            assert!(!debug.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn build_rustls_client_config_fails_on_missing_file() {
+        let result = build_rustls_client_config(Path::new("/nonexistent/ca.crt"));
+        assert!(matches!(result, Err(DbError::TlsConfiguration { .. })));
+    }
+
+    #[test]
+    fn build_rustls_client_config_fails_on_empty_or_invalid_file() -> Result<(), BoxError> {
+        let dir = std::env::temp_dir();
+        let file_path = dir.join(format!("test_empty_ca_{}.pem", std::process::id()));
+        {
+            let mut file = std::fs::File::create(&file_path)?;
+            file.write_all(b"not a valid certificate")?;
+        }
+        let result = build_rustls_client_config(&file_path);
+        let _ = std::fs::remove_file(&file_path);
+        assert!(matches!(result, Err(DbError::TlsConfiguration { .. })));
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and a real PostgreSQL service"]
     async fn pool_exhaustion_returns_typed_timeout_error() -> Result<(), BoxError> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL is required for the PostgreSQL pool test")?;
-        let config = DbConfig::new(database_url)?.with_max_connections(1)?;
+        let config = DbConfig::insecure_for_local_dev(database_url)?.with_max_connections(1)?;
         let database = Db::connect(&config).await?;
         let _held_connection = database
             .pool

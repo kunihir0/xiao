@@ -1,0 +1,11 @@
+# Keep OCI context deterministic and free of local credentials/artifacts.
+.git
+.gitignore
+.omp
+target
+**/target
+.env
+.env.*
+!.env.example
+**/.data
+.DS_Store

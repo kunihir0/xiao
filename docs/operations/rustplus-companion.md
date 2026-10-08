@@ -18,6 +18,19 @@ secrets under `/run/secrets`). Both files must be regular files with no
 group/other permission bits (`chmod 600`, owned by the bot's UID); otherwise
 startup fails closed.
 
+For production Compose, copy `.env.rustplus.example` to an untracked file and
+set the three `*_SOURCE` host paths plus Steam/key metadata. Source files MUST
+already be owned by `10001:10001`, mode `0400`; Compose local-file secrets may
+ignore requested uid/mode fields. Deploy with both manifests:
+
+```console
+scripts/validate-production-env.sh
+docker compose --env-file /run/secrets/xiao-production.env \
+  --env-file /run/secrets/xiao-rustplus.env \
+  -f deploy/production/compose.yml \
+  -f deploy/production/compose.rustplus.yml up -d bot
+```
+
 ## Keyring
 
 One entry per line, `key_id:<64 lowercase or uppercase hex chars>`; blank

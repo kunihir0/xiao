@@ -26,7 +26,7 @@ async fn setup() -> Result<(String, String, Arc<Db>), Box<dyn std::error::Error 
         .execute(&mut connection)
         .await?;
     drop(connection);
-    let config = DbConfig::new(schema_url(&base, &schema))?;
+    let config = DbConfig::insecure_for_local_dev(schema_url(&base, &schema))?;
     let db = Arc::new(Db::connect(&config).await?);
     db.initialize().await?;
     Ok((base, schema, db))
@@ -84,7 +84,12 @@ async fn credentials_restart_and_duplicate_conflict()
     );
     drop(store);
     drop(db);
-    let restarted = Arc::new(Db::connect(&DbConfig::new(schema_url(&base, &schema))?).await?);
+    let restarted = Arc::new(
+        Db::connect(&DbConfig::insecure_for_local_dev(schema_url(
+            &base, &schema,
+        ))?)
+        .await?,
+    );
     restarted.initialize().await?;
     let restarted_store = PostgresPushCredentialStore::new(restarted.clone(), keys.clone());
     assert_eq!(
