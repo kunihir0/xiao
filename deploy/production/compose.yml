@@ -1,0 +1,113 @@
+# Production application and migration service.
+# PostgreSQL is provisioned externally with TLS and automated backups.
+# Set XIAO_IMAGE to an immutable registry reference with digest (@sha256:...).
+secrets:
+  discord_token:
+    file: "${DISCORD_TOKEN_FILE:?set DISCORD_TOKEN_FILE to a secret-manager-mounted file}"
+  database_url:
+    file: "${DATABASE_URL_FILE:?set DATABASE_URL_FILE to a secret-manager-mounted file}"
+  migration_database_url:
+    file: "${MIGRATION_DATABASE_URL_FILE:?set MIGRATION_DATABASE_URL_FILE to the DDL-role secret file}"
+  database_ca:
+    file: "${DATABASE_CA_SOURCE:?set DATABASE_CA_SOURCE to the PostgreSQL CA bundle}"
+
+services:
+  # One-shot migration job run before deploying the bot container.
+  # Mounts only the migration DDL credential and CA bundle.
+  # Run via: docker compose run --rm migrate
+  migrate:
+    image: "${XIAO_IMAGE:?set XIAO_IMAGE to an immutable image digest}"
+    init: true
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    command: ["migrate"]
+    environment:
+      MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_database_url
+      DATABASE_CA_FILE: /run/secrets/database_ca
+      DATABASE_TLS_MODE: "${DATABASE_TLS_MODE:-verify-full}"
+      RUST_LOG: "${RUST_LOG:-info}"
+      TELEMETRY_FORMAT: "${TELEMETRY_FORMAT:-json}"
+    secrets:
+      - source: migration_database_url
+        target: migration_database_url
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: database_ca
+        target: database_ca
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+          pids: 64
+
+  # Long-running bot process using least-privilege DML connection only.
+  # Does NOT mount the DDL migration credentials.
+  bot:
+    image: "${XIAO_IMAGE:?set XIAO_IMAGE to an immutable image digest}"
+    init: true
+    restart: "on-failure:5"
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DISCORD_TOKEN_FILE: /run/secrets/discord_token
+      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_CA_FILE: /run/secrets/database_ca
+      DATABASE_TLS_MODE: "${DATABASE_TLS_MODE:-verify-full}"
+      DATABASE_MIGRATE_ON_STARTUP: "${DATABASE_MIGRATE_ON_STARTUP:-false}"
+      RUST_LOG: "${RUST_LOG:-info}"
+      TELEMETRY_FORMAT: "${TELEMETRY_FORMAT:-json}"
+    secrets:
+      - source: discord_token
+        target: discord_token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: database_url
+        target: database_url
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: database_ca
+        target: database_ca
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+          pids: 128
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      # There is deliberately no HTTP health server. PID 1 is healthy while alive;
+      # migration/readiness failures make the process exit and trigger finite retries.
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

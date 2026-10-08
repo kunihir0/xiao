@@ -11,3 +11,7 @@ workspace = true
 
 [dependencies]
 url.workspace = true
+zeroize = { version = "1.9.1", features = ["zeroize_derive"] }
+rustix = { version = "1.1.5", features = ["process", "fs"] }
+[dev-dependencies]
+tempfile = "3.27.0"
