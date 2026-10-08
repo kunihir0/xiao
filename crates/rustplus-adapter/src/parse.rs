@@ -543,7 +543,9 @@ mod tests {
                 ..ParseConfig::default()
             };
             let result = parse_notification(&push, &config);
-            if value.len() > config.max_value_bytes {
+            // The parser bounds the trimmed app-data value; surrounding
+            // whitespace is ignored before admission.
+            if value.trim().len() > config.max_value_bytes {
                 prop_assert_eq!(result, Err(ParseError::TooLarge));
             }
         }
