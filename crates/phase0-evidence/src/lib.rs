@@ -97,19 +97,19 @@ mod tests {
         assert_eq!(manifest.routes.len(), 6);
         assert_eq!(
             manifest.manifest_sha256,
-            "dd7d7442d185cf7132a402b78d1488591f5c133a882e1976e728d326a68a1541"
+            "fd2ba8e4f6aebff31a7422d7ce2201500857845a1ba0fefa03819c2675d164c6"
         );
 
         let expected_hashes = [
             (
                 "enrollment",
-                "ce6486b2e73092365d466ba4fa743b99a0f086e31267ce4457d3e932a13fa6f7",
-                "f3b38278e87205f0e34e881eb311963b373f8be8e5590844803cad3fae0cc6b6",
+                "c6f7e716aa3e952771a22139a0d4b950a256c7d32e74f96c3de738322b5b363e",
+                "5db84e4ffa250cb6cbc6c463a4e37eab5bb5a2492d99b7c2984de9b595b7ef0a",
             ),
             (
                 "mcs_readiness",
-                "c895d25113399e9a36002f6e8ad9bf8555086928761db5a2ff3613b0d5391a88",
-                "c895d25113399e9a36002f6e8ad9bf8555086928761db5a2ff3613b0d5391a88",
+                "f60f1297b71032389bc7e1a6c6572a8760de045eba8f6210290853d3e979c8d6",
+                "f60f1297b71032389bc7e1a6c6572a8760de045eba8f6210290853d3e979c8d6",
             ),
             (
                 "pairing",

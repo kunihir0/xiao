@@ -145,11 +145,14 @@ fn is_sensitive_key(k: &str) -> bool {
 
 fn validate_key_and_value(key: &str, value: &Value, path: &str) -> Result<(), EvidenceError> {
     if is_sensitive_key(key) {
+        let nested_redacted_auth = key.eq_ignore_ascii_case("authToken")
+            && matches!(value, Value::Object(obj) if obj.get("token") == Some(&Value::String(REDACTED_MARKER.to_owned())));
         match value {
             Value::String(s) if s == REDACTED_MARKER => {}
+            _ if nested_redacted_auth => {}
             _ => {
                 return Err(EvidenceError::Secret(format!(
-                    "key '{key}' at {path} must have value '{REDACTED_MARKER}'"
+                    "key '{key}' at {path} must have a redacted value"
                 )));
             }
         }
@@ -230,8 +233,10 @@ fn is_allowed_token_shaped_string(s: &str, known_hashes: &BTreeSet<&str>) -> boo
     if ALLOWED_SYNTHETIC_STRINGS.contains(&s) {
         return true;
     }
-    if s == "49451aca-a822-41e6-ad59-955718d0ff9c"
+    if s == "wp:receiver.push.com#123e4567-e89b-12d3-a456-426614174000"
+        || s == "49451aca-a822-41e6-ad59-955718d0ff9c"
         || s == "com.facepunch.rust.companion"
+        || s == "android-min-sdk/23 fire-core/20.0.0"
         || s == "org.chromium.linux"
         || s == "org.mozilla.firefox"
         || s == "chrome-63.0.3234.0"
@@ -338,10 +343,34 @@ fn validate_string_content(
             )));
         }
     }
+    const SECRET_WORDS: &[&str] = &[
+        "secret",
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "private_key",
+        "private key",
+        "real_token",
+    ];
+    if SECRET_WORDS.iter().any(|word| lower.contains(word)) {
+        return Err(EvidenceError::Secret(
+            "credential-shaped content detected".to_owned(),
+        ));
+    }
 
-    // URL validation
+    // URLs are permitted only in typed endpoint/source fields and may not carry
+    // credential-shaped path segments.
     if s.contains("://") {
         validate_url(s, path)?;
+        let url_lower = s.to_ascii_lowercase();
+        if SECRET_WORDS.iter().any(|word| url_lower.contains(word)) {
+            return Err(EvidenceError::Secret(
+                "credential-shaped URL detected".to_owned(),
+            ));
+        }
     }
 
     // SteamID64 production-shaped checks
@@ -369,7 +398,7 @@ fn validate_string_content(
     }
 
     // Check for random high-entropy token-shaped string under any key
-    if s.len() >= 16 && !s.contains(' ') && !is_allowed_token_shaped_string(s, known_hashes) {
+    if s.len() >= 16 && !is_allowed_token_shaped_string(s, known_hashes) {
         return Err(EvidenceError::Secret(format!(
             "unredacted credential-shaped value detected at {path}"
         )));

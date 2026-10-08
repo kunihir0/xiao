@@ -88,7 +88,7 @@
             },
             "payload": {
               "app": "org.chromium.linux",
-              "X-subtype": "com.facepunch.rust.companion",
+              "X-subtype": "wp:receiver.push.com#123e4567-e89b-12d3-a456-426614174000",
               "device": "[REDACTED]",
               "sender": "[REDACTED]"
             },
@@ -170,7 +170,9 @@
               "sdkVersion": "a:17.0.0"
             },
             "response": {
-              "authToken": "[REDACTED]",
+              "authToken": {
+                "token": "[REDACTED]"
+              },
               "fid": "synthetic-fid-01",
               "refreshToken": "[REDACTED]"
             }
@@ -320,7 +322,11 @@
         "readiness_response": {
           "tag": 3,
           "name": "LoginResponse",
-          "heartbeat_stat_supported": true
+          "heartbeat_config": {
+            "upload_stat": false,
+            "ip": "[REDACTED]",
+            "interval_ms": 300000
+          }
         }
       },
       "modern": {
@@ -352,7 +358,11 @@
         "readiness_response": {
           "tag": 3,
           "name": "LoginResponse",
-          "heartbeat_stat_supported": true
+          "heartbeat_config": {
+            "upload_stat": false,
+            "ip": "[REDACTED]",
+            "interval_ms": 300000
+          }
         }
       },
       "expected_assertions": [

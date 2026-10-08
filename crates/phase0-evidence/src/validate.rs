@@ -104,17 +104,12 @@ pub fn validate_evidence(input: &EvidenceInput) -> Result<Vec<ManifestRoute>, Ev
                 && *path == source.path.as_str()
         });
         if matching_allowed.is_none() {
-            return Err(EvidenceError::Malformed(format!(
-                "source '{}' is not an approved pinned source or has mismatched repository/commit/path",
-                source.name
-            )));
+            return Err(EvidenceError::Malformed(
+                "source is not an approved pinned source".to_owned(),
+            ));
         }
-
         if source_map.insert(source.name.as_str(), source).is_some() {
-            return Err(EvidenceError::Malformed(format!(
-                "duplicate source name '{}'",
-                source.name
-            )));
+            return Err(EvidenceError::Malformed("duplicate source name".to_owned()));
         }
 
         if source.repository.is_empty() {
@@ -230,6 +225,29 @@ pub fn validate_evidence(input: &EvidenceInput) -> Result<Vec<ManifestRoute>, Ev
             live_proof_needed: route_entry.live_proof_needed().to_vec(),
         });
     }
+    // Alarm broadcasts must be linked to the exact primed getEntityInfo Alarm.
+    let entity_route = input.routes.iter().find_map(|r| match r {
+        RouteEntry::GetEntityInfo(route) => Some(route.as_ref()),
+        _ => None,
+    });
+    if let Some(entity) = entity_route {
+        for alarm in input.routes.iter().filter_map(|r| match r {
+            RouteEntry::Alarm2False(route) | RouteEntry::Alarm2True(route) => Some(route.as_ref()),
+            _ => None,
+        }) {
+            if alarm.current.primed_entity.entity_id != entity.current.request.entity_id
+                || alarm.current.primed_entity.entity_type
+                    != entity.current.response.entity_info.entity_type
+                || alarm.modern.primed_entity.entity_id != entity.modern.request.entity_id
+                || alarm.modern.primed_entity.entity_type
+                    != entity.modern.response.entity_info.entity_type
+            {
+                return Err(EvidenceError::Malformed(
+                    "alarm priming does not match getEntityInfo".to_owned(),
+                ));
+            }
+        }
+    }
 
     const REQUIRED_ROUTES: [&str; 6] = [
         "enrollment",
@@ -258,32 +276,23 @@ fn validate_source_ref(
     side: &str,
 ) -> Result<(), EvidenceError> {
     if reference.is_empty() {
-        return Err(EvidenceError::Malformed(format!(
-            "route '{route_name}' has empty {side}_source"
-        )));
+        return Err(EvidenceError::Malformed(
+            "route source reference is empty".to_owned(),
+        ));
     }
-
     for part in reference.split(';') {
         let (name, sha) = part.split_once('@').ok_or_else(|| {
-            EvidenceError::Malformed(format!(
-                "route '{route_name}' {side}_source invalid format '{part}' (expected name@sha)"
-            ))
+            EvidenceError::Malformed("route source reference has invalid format".to_owned())
         })?;
-
         let source = sources.get(name).ok_or_else(|| {
-            EvidenceError::Malformed(format!(
-                "route '{route_name}' {side}_source references undeclared source '{name}'"
-            ))
+            EvidenceError::Malformed("route source reference is undeclared".to_owned())
         })?;
-
         if source.commit_or_version != sha {
-            return Err(EvidenceError::Malformed(format!(
-                "route '{route_name}' {side}_source commit '{sha}' does not match declared source commit '{}'",
-                source.commit_or_version
-            )));
+            return Err(EvidenceError::Malformed(
+                "route source commit does not match declared source".to_owned(),
+            ));
         }
     }
-
     Ok(())
 }
 
@@ -326,6 +335,33 @@ fn validate_enrollment_route(
     }
     for s in &route.modern.steps {
         validate_step_keys(s)?;
+    }
+    let register = route
+        .current
+        .steps
+        .iter()
+        .find(|step| step.step == "register3")
+        .ok_or_else(|| EvidenceError::Malformed("current register3 step missing".to_owned()))?;
+    let subtype = register
+        .payload
+        .get("X-subtype")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            EvidenceError::Malformed("current register3 X-subtype missing".to_owned())
+        })?;
+    let uuid = subtype.strip_prefix("wp:receiver.push.com#").unwrap_or("");
+    if uuid.len() != 36
+        || !uuid.chars().enumerate().all(|(i, c)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err(EvidenceError::Malformed(
+            "current register3 X-subtype has invalid synthetic UUID".to_owned(),
+        ));
     }
 
     let cur_step_names: Vec<&str> = route
@@ -482,10 +518,9 @@ fn validate_step_keys(step: &EnrollmentStep) -> Result<(), EvidenceError> {
             &["authToken", "fid", "refreshToken"],
         ),
         _ => {
-            return Err(EvidenceError::Malformed(format!(
-                "unrecognized enrollment step name '{}'",
-                step.step
-            )));
+            return Err(EvidenceError::Malformed(
+                "unrecognized enrollment step name".to_owned(),
+            ));
         }
     };
     let required_payload: &[&str] = match step.step.as_str() {
@@ -523,47 +558,56 @@ fn validate_step_keys(step: &EnrollmentStep) -> Result<(), EvidenceError> {
         "firebase_installations" => &["authToken", "fid", "refreshToken"],
         _ => &[],
     };
+    if !matches!(&step.payload, Value::Object(_)) {
+        return Err(EvidenceError::Malformed(
+            "enrollment payload must be an object".to_owned(),
+        ));
+    }
     if let Value::Object(obj) = &step.payload {
         for k in obj.keys() {
             if !allowed_payload.contains(&k.as_str()) {
-                return Err(EvidenceError::Malformed(format!(
-                    "unexpected payload key in enrollment step '{}'",
-                    step.step
-                )));
+                return Err(EvidenceError::Malformed(
+                    "unexpected enrollment payload key".to_owned(),
+                ));
             }
         }
         if required_payload.iter().any(|key| !obj.contains_key(*key)) {
-            return Err(EvidenceError::Malformed(format!(
-                "required payload field missing for enrollment step '{}'",
-                step.step
-            )));
+            return Err(EvidenceError::Malformed(
+                "required enrollment payload field missing".to_owned(),
+            ));
         }
-    } else {
-        return Err(EvidenceError::Malformed(format!(
-            "enrollment step '{}' payload must be an object",
-            step.step
-        )));
+    }
+    if !matches!(&step.response, Value::Object(_)) {
+        return Err(EvidenceError::Malformed(
+            "enrollment response must be an object".to_owned(),
+        ));
     }
     if let Value::Object(obj) = &step.response {
         for k in obj.keys() {
             if !allowed_response.contains(&k.as_str()) {
-                return Err(EvidenceError::Malformed(format!(
-                    "unexpected response key in enrollment step '{}'",
-                    step.step
-                )));
+                return Err(EvidenceError::Malformed(
+                    "unexpected enrollment response key".to_owned(),
+                ));
             }
         }
         if required_response.iter().any(|key| !obj.contains_key(*key)) {
-            return Err(EvidenceError::Malformed(format!(
-                "required response field missing for enrollment step '{}'",
-                step.step
-            )));
+            return Err(EvidenceError::Malformed(
+                "required enrollment response field missing".to_owned(),
+            ));
         }
-    } else {
-        return Err(EvidenceError::Malformed(format!(
-            "enrollment step '{}' response must be an object",
-            step.step
-        )));
+    }
+    if step.step == "firebase_installations" {
+        let valid_auth = matches!(
+            step.response.get("authToken"),
+            Some(Value::Object(auth))
+                if auth.len() == 1
+                    && auth.get("token") == Some(&Value::String("[REDACTED]".to_owned()))
+        );
+        if !valid_auth {
+            return Err(EvidenceError::Malformed(
+                "firebase authToken must contain only redacted token".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -624,8 +668,12 @@ fn validate_mcs_route(
         && md.readiness_response.tag == 3
         && cur.readiness_response.name == "LoginResponse"
         && md.readiness_response.name == "LoginResponse"
-        && cur.readiness_response.heartbeat_stat_supported
-        && md.readiness_response.heartbeat_stat_supported
+        && !cur.readiness_response.heartbeat_config.upload_stat
+        && !md.readiness_response.heartbeat_config.upload_stat
+        && cur.readiness_response.heartbeat_config.ip == "[REDACTED]"
+        && md.readiness_response.heartbeat_config.ip == "[REDACTED]"
+        && cur.readiness_response.heartbeat_config.interval_ms == 300_000
+        && md.readiness_response.heartbeat_config.interval_ms == 300_000
     {
         actual_assertions.insert(AssertionId::McsReadinessTagIsLoginResponse);
     }

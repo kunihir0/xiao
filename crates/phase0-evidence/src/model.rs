@@ -265,9 +265,16 @@ pub struct McsSetting {
 pub struct McsReadinessResponse {
     pub tag: u32,
     pub name: String,
-    pub heartbeat_stat_supported: bool,
+    pub heartbeat_config: HeartbeatConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeartbeatConfig {
+    pub upload_stat: bool,
+    pub ip: String,
+    pub interval_ms: i32,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairingRoute {
