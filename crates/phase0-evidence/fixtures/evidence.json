@@ -1,0 +1,608 @@
+{
+  "schema_version": 1,
+  "snapshot_date": "2026-10-07",
+  "retention_days": 30,
+  "sources": [
+    {
+      "name": "xiao-current-rustplus",
+      "repository": "https://github.com/kunihir0/xiao",
+      "commit_or_version": "469c98435647fa2582b8d14339cd385a686a79e6",
+      "path": "crates/push-receiver/src/transport.rs;crates/rustplus-adapter/src/registration.rs;crates/rustplus-adapter/src/parse.rs;crates/rustplus-adapter/src/session.rs",
+      "reviewed_on": "2026-10-07",
+      "classification": "fact"
+    },
+    {
+      "name": "rustplus-current-protocol",
+      "repository": "https://github.com/kunihir0/rustplus",
+      "commit_or_version": "5b9a0803ac404a00b7f58e298c91b1130504d5c7",
+      "path": "proto/rustplus.proto;src/client.rs",
+      "reviewed_on": "2026-10-07",
+      "classification": "fact"
+    },
+    {
+      "name": "push-receiver-current",
+      "repository": "https://github.com/kunihir0/push-receiver",
+      "commit_or_version": "3b5b741c7ef52c2da26414bad2cffbf778644fdc",
+      "path": "src/checkin.rs;src/register.rs;src/mcs.rs;proto/mcs.proto",
+      "reviewed_on": "2026-10-07",
+      "classification": "fact"
+    },
+    {
+      "name": "rustplus-js-modern",
+      "repository": "https://github.com/liamcottle/rustplus.js",
+      "commit_or_version": "75915f25fc7c1718f7c23c419953f4655840fade",
+      "path": "cli/index.js;docs/PairingFlow.md;rustplus.js;rustplus.proto",
+      "reviewed_on": "2026-10-07",
+      "classification": "fact"
+    },
+    {
+      "name": "liam-push-receiver",
+      "repository": "https://github.com/liamcottle/push-receiver",
+      "commit_or_version": "ecc93a37ca618859eaacae71ec0c0136ce1621f5",
+      "path": "src/android/fcm.js;src/client.js;src/mcs.proto;src/gcm/index.js",
+      "reviewed_on": "2026-10-07",
+      "classification": "fact"
+    }
+  ],
+  "routes": [
+    {
+      "name": "enrollment",
+      "current_source": "xiao-current-rustplus@469c98435647fa2582b8d14339cd385a686a79e6;push-receiver-current@3b5b741c7ef52c2da26414bad2cffbf778644fdc",
+      "modern_source": "rustplus-js-modern@75915f25fc7c1718f7c23c419953f4655840fade;liam-push-receiver@ecc93a37ca618859eaacae71ec0c0136ce1621f5",
+      "current": {
+        "steps": [
+          {
+            "step": "checkin",
+            "endpoint": "https://android.clients.google.com/checkin",
+            "method": "POST",
+            "headers": {
+              "content-type": "application/x-protobuf"
+            },
+            "payload": {
+              "user_serial_number": 0,
+              "checkin": {
+                "type": 3,
+                "chrome_build": {
+                  "platform": 2,
+                  "chrome_version": "63.0.3234.0",
+                  "channel": 1
+                }
+              },
+              "version": 3,
+              "id": "[REDACTED]",
+              "security_token": "[REDACTED]"
+            },
+            "response": {
+              "android_id": "[REDACTED]",
+              "security_token": "[REDACTED]"
+            }
+          },
+          {
+            "step": "register3",
+            "endpoint": "https://android.clients.google.com/c2dm/register3",
+            "method": "POST",
+            "auth_scheme": "AidLogin",
+            "headers": {
+              "content-type": "application/x-www-form-urlencoded",
+              "authorization": "[REDACTED]"
+            },
+            "payload": {
+              "app": "org.chromium.linux",
+              "X-subtype": "wp:receiver.push.com#123e4567-e89b-12d3-a456-426614174000",
+              "device": "[REDACTED]",
+              "sender": "[REDACTED]"
+            },
+            "response": {
+              "token": "[REDACTED]"
+            }
+          },
+          {
+            "step": "fcm_subscribe",
+            "endpoint": "https://fcm.googleapis.com/fcm/connect/subscribe",
+            "method": "POST",
+            "headers": {
+              "content-type": "application/x-www-form-urlencoded"
+            },
+            "payload": {
+              "authorized_entity": "[REDACTED]",
+              "endpoint": "https://fcm.googleapis.com/fcm/send/[REDACTED]",
+              "encryption_key": "[REDACTED]",
+              "encryption_auth": "[REDACTED]"
+            },
+            "response": {
+              "token": "[REDACTED]"
+            }
+          },
+          {
+            "step": "expo_push_token",
+            "endpoint": "https://exp.host/--/api/v2/push/getExpoPushToken",
+            "method": "POST",
+            "headers": {
+              "content-type": "application/json"
+            },
+            "payload": {
+              "type": "fcm",
+              "deviceId": "synthetic-device-01",
+              "development": false,
+              "appId": "com.facepunch.rust.companion",
+              "deviceToken": "[REDACTED]",
+              "projectId": "49451aca-a822-41e6-ad59-955718d0ff9c"
+            },
+            "response": {
+              "data": {
+                "expoPushToken": "[REDACTED]"
+              }
+            }
+          },
+          {
+            "step": "facepunch_register",
+            "endpoint": "https://companion-rust.facepunch.com/api/push/register",
+            "method": "POST",
+            "headers": {
+              "content-type": "application/json"
+            },
+            "payload": {
+              "AuthToken": "[REDACTED]",
+              "DeviceId": "synthetic-device-01",
+              "PushKind": 3,
+              "PushToken": "[REDACTED]"
+            },
+            "response": {
+              "success": true
+            }
+          }
+        ]
+      },
+      "modern": {
+        "steps": [
+          {
+            "step": "firebase_installations",
+            "endpoint": "https://firebaseinstallations.googleapis.com/v1/projects/rust-companion-app/installations",
+            "method": "POST",
+            "headers": {
+              "content-type": "application/json",
+              "x-goog-api-key": "[REDACTED]"
+            },
+            "payload": {
+              "appId": "1:976529667804:android:d6f1ddeb4403b338fea619",
+              "authVersion": "FIS_v2",
+              "fid": "synthetic-fid-01",
+              "sdkVersion": "a:17.0.0"
+            },
+            "response": {
+              "authToken": {
+                "token": "[REDACTED]"
+              },
+              "fid": "synthetic-fid-01",
+              "refreshToken": "[REDACTED]"
+            }
+          },
+          {
+            "step": "checkin",
+            "endpoint": "https://android.clients.google.com/checkin",
+            "method": "POST",
+            "headers": {
+              "content-type": "application/x-protobuf"
+            },
+            "payload": {
+              "user_serial_number": 0,
+              "checkin": {
+                "type": 3,
+                "chrome_build": {
+                  "platform": 2,
+                  "chrome_version": "63.0.3234.0",
+                  "channel": 1
+                }
+              },
+              "version": 3,
+              "id": "[REDACTED]",
+              "security_token": "[REDACTED]"
+            },
+            "response": {
+              "android_id": "[REDACTED]",
+              "security_token": "[REDACTED]"
+            }
+          },
+          {
+            "step": "register3",
+            "endpoint": "https://android.clients.google.com/c2dm/register3",
+            "method": "POST",
+            "auth_scheme": "AidLogin",
+            "headers": {
+              "content-type": "application/x-www-form-urlencoded",
+              "authorization": "[REDACTED]"
+            },
+            "payload": {
+              "app": "com.facepunch.rust.companion",
+              "cert": "[REDACTED]",
+              "app_ver": "1",
+              "X-subtype": "976529667804",
+              "X-app_ver": "1",
+              "X-osv": "29",
+              "X-cliv": "fiid-21.1.1",
+              "X-gmsv": "220217001",
+              "X-scope": "*",
+              "X-Goog-Firebase-Installations-Auth": "[REDACTED]",
+              "X-gms_app_id": "1:976529667804:android:d6f1ddeb4403b338fea619",
+              "X-Firebase-Client": "android-min-sdk/23 fire-core/20.0.0",
+              "X-Firebase-Client-Log-Type": "1",
+              "X-app_ver_name": "1",
+              "target_ver": "31",
+              "sender": "976529667804",
+              "device": "[REDACTED]"
+            },
+            "response": {
+              "token": "[REDACTED]"
+            }
+          },
+          {
+            "step": "expo_push_token",
+            "endpoint": "https://exp.host/--/api/v2/push/getExpoPushToken",
+            "method": "POST",
+            "headers": {
+              "content-type": "application/json"
+            },
+            "payload": {
+              "type": "fcm",
+              "deviceId": "synthetic-device-01",
+              "development": false,
+              "appId": "com.facepunch.rust.companion",
+              "deviceToken": "[REDACTED]",
+              "projectId": "49451aca-a822-41e6-ad59-955718d0ff9c"
+            },
+            "response": {
+              "data": {
+                "expoPushToken": "[REDACTED]"
+              }
+            }
+          },
+          {
+            "step": "facepunch_register",
+            "endpoint": "https://companion-rust.facepunch.com/api/push/register",
+            "method": "POST",
+            "headers": {
+              "content-type": "application/json"
+            },
+            "payload": {
+              "AuthToken": "[REDACTED]",
+              "DeviceId": "synthetic-device-01",
+              "PushKind": 3,
+              "PushToken": "[REDACTED]"
+            },
+            "response": {
+              "success": true
+            }
+          }
+        ]
+      },
+      "expected_assertions": [
+        "ENROLLMENT_SEQUENCE_STEPS_MATCH",
+        "ENROLLMENT_CHECKIN_ENDPOINT_MATCH",
+        "ENROLLMENT_REGISTER3_ENDPOINT_MATCH",
+        "ENROLLMENT_EXPO_ENDPOINT_MATCH",
+        "ENROLLMENT_FACEPUNCH_ENDPOINT_MATCH",
+        "ENROLLMENT_FACEPUNCH_HOST_IS_COMPANION_RUST",
+        "ENROLLMENT_CREDENTIALS_REDACTED"
+      ],
+      "live_proof_needed": [
+        "STEAM_ACCOUNT_COMPANION_AUTHENTICATION",
+        "LIVE_PROVIDER_PUSH_DELIVERY"
+      ]
+    },
+    {
+      "name": "mcs_readiness",
+      "current_source": "push-receiver-current@3b5b741c7ef52c2da26414bad2cffbf778644fdc",
+      "modern_source": "liam-push-receiver@ecc93a37ca618859eaacae71ec0c0136ce1621f5",
+      "current": {
+        "endpoint": "tcp+tls://mtalk.google.com:5228",
+        "method": "MCS_FRAMED_PROTOBUF",
+        "protocol_version": 41,
+        "transport": "tcp_tls",
+        "framing": "mcs_version_tag_delimited",
+        "login_request": {
+          "id": "chrome-63.0.3234.0",
+          "domain": "mcs.android.com",
+          "user": "[REDACTED]",
+          "resource": "[REDACTED]",
+          "auth_token": "[REDACTED]",
+          "device_id": "[REDACTED]",
+          "last_rmq_id": 0,
+          "setting": [
+            {
+              "name": "new_vc",
+              "value": "1"
+            }
+          ],
+          "received_persistent_id": [],
+          "adaptive_heartbeat": false,
+          "use_rmq2": true,
+          "auth_service": 2,
+          "network_type": 1
+        },
+        "readiness_response": {
+          "tag": 3,
+          "name": "LoginResponse",
+          "heartbeat_config": {
+            "upload_stat": false,
+            "ip": "[REDACTED]",
+            "interval_ms": 300000
+          }
+        }
+      },
+      "modern": {
+        "endpoint": "tcp+tls://mtalk.google.com:5228",
+        "method": "MCS_FRAMED_PROTOBUF",
+        "protocol_version": 41,
+        "transport": "tcp_tls",
+        "framing": "mcs_version_tag_delimited",
+        "login_request": {
+          "id": "chrome-63.0.3234.0",
+          "domain": "mcs.android.com",
+          "user": "[REDACTED]",
+          "resource": "[REDACTED]",
+          "auth_token": "[REDACTED]",
+          "device_id": "[REDACTED]",
+          "last_rmq_id": 0,
+          "setting": [
+            {
+              "name": "new_vc",
+              "value": "1"
+            }
+          ],
+          "received_persistent_id": [],
+          "adaptive_heartbeat": false,
+          "use_rmq2": true,
+          "auth_service": 2,
+          "network_type": 1
+        },
+        "readiness_response": {
+          "tag": 3,
+          "name": "LoginResponse",
+          "heartbeat_config": {
+            "upload_stat": false,
+            "ip": "[REDACTED]",
+            "interval_ms": 300000
+          }
+        }
+      },
+      "expected_assertions": [
+        "MCS_ENDPOINT_MATCHES_MTALK",
+        "MCS_TRANSPORT_IS_RAW_TCP_TLS",
+        "MCS_PROTOCOL_VERSION_41",
+        "MCS_LOGIN_PAYLOAD_FIELDSET_COMPLETE",
+        "MCS_LOGIN_CREDENTIALS_REDACTED",
+        "MCS_READINESS_TAG_IS_LOGIN_RESPONSE"
+      ],
+      "live_proof_needed": [
+        "LIVE_PROVIDER_PUSH_DELIVERY"
+      ]
+    },
+    {
+      "name": "pairing",
+      "current_source": "xiao-current-rustplus@469c98435647fa2582b8d14339cd385a686a79e6",
+      "modern_source": "rustplus-js-modern@75915f25fc7c1718f7c23c419953f4655840fade;liam-push-receiver@ecc93a37ca618859eaacae71ec0c0136ce1621f5",
+      "current": {
+        "endpoint": "fcm://notification/app-data",
+        "method": "FCM_NOTIFICATION_APP_DATA",
+        "app_data": [
+          {
+            "key": "pairing",
+            "value": "{\"ip\":\"203.0.113.10\",\"port\":28082,\"playerId\":1001,\"playerToken\":\"[REDACTED]\",\"type\":\"server\"}"
+          }
+        ],
+        "normalized_pairing": {
+          "host": "203.0.113.10",
+          "port": 28082,
+          "player_id": 1001,
+          "player_token": "[REDACTED]",
+          "entity": null,
+          "pairing_type": "server"
+        }
+      },
+      "modern": {
+        "endpoint": "fcm://notification/app-data",
+        "method": "FCM_NOTIFICATION_APP_DATA",
+        "app_data": [
+          {
+            "key": "pairing",
+            "value": "{\"ip\":\"203.0.113.10\",\"port\":28082,\"playerId\":1001,\"playerToken\":\"[REDACTED]\",\"type\":\"server\"}"
+          }
+        ],
+        "normalized_pairing": {
+          "host": "203.0.113.10",
+          "port": 28082,
+          "player_id": 1001,
+          "player_token": "[REDACTED]",
+          "entity": null,
+          "pairing_type": "server"
+        }
+      },
+      "expected_assertions": [
+        "PAIRING_METHOD_IS_FCM_APP_DATA",
+        "PAIRING_SYNTHETIC_PLAYER_ID_MATCHES_NORMALIZED",
+        "PAIRING_PLAYER_TOKEN_REDACTED",
+        "PAIRING_NORMALIZED_ADDRESS_MATCHES_NESTED",
+        "PAIRING_NO_INVENTED_PROVIDER_RESPONSE"
+      ],
+      "live_proof_needed": [
+        "LIVE_PROVIDER_PUSH_DELIVERY"
+      ]
+    },
+    {
+      "name": "getEntityInfo",
+      "current_source": "xiao-current-rustplus@469c98435647fa2582b8d14339cd385a686a79e6;rustplus-current-protocol@5b9a0803ac404a00b7f58e298c91b1130504d5c7",
+      "modern_source": "rustplus-js-modern@75915f25fc7c1718f7c23c419953f4655840fade",
+      "current": {
+        "endpoint": "wss://203.0.113.10:28082/",
+        "method": "PROTOBUF_RPC",
+        "request": {
+          "seq": 100,
+          "player_id": 1001,
+          "player_token": "[REDACTED]",
+          "entity_id": 4242,
+          "get_entity_info": {}
+        },
+        "response": {
+          "seq": 100,
+          "entity_info": {
+            "type": 2,
+            "payload": {
+              "value": false
+            }
+          }
+        }
+      },
+      "modern": {
+        "endpoint": "ws://203.0.113.10:28082/",
+        "method": "PROTOBUF_RPC",
+        "request": {
+          "seq": 100,
+          "player_id": 1001,
+          "player_token": "[REDACTED]",
+          "entity_id": 4242,
+          "get_entity_info": {}
+        },
+        "response": {
+          "seq": 100,
+          "entity_info": {
+            "type": 2,
+            "payload": {
+              "value": false
+            }
+          }
+        }
+      },
+      "expected_assertions": [
+        "GET_ENTITY_INFO_WEBSOCKET_ENDPOINT_NO_PATH",
+        "GET_ENTITY_INFO_CURRENT_IS_WSS_AND_MODERN_IS_WS",
+        "GET_ENTITY_INFO_REQUEST_HAS_ENTITY_ID_AND_PLAYER",
+        "GET_ENTITY_INFO_RESPONSE_TYPE_IS_ALARM_2",
+        "GET_ENTITY_INFO_SEQUENCE_MATCHES",
+        "GET_ENTITY_INFO_PLAYER_CREDENTIALS_REDACTED"
+      ],
+      "live_proof_needed": [
+        "IN_GAME_SMART_ALARM_STATE_CHANGE"
+      ]
+    },
+    {
+      "name": "alarm_2_false",
+      "current_source": "xiao-current-rustplus@469c98435647fa2582b8d14339cd385a686a79e6;rustplus-current-protocol@5b9a0803ac404a00b7f58e298c91b1130504d5c7",
+      "modern_source": "rustplus-js-modern@75915f25fc7c1718f7c23c419953f4655840fade",
+      "current": {
+        "endpoint": "wss://203.0.113.10:28082/",
+        "method": "PROTOBUF_BROADCAST",
+        "primed_entity": {
+          "entity_id": 4242,
+          "entity_type": 2
+        },
+        "broadcast": {
+          "entity_changed": {
+            "entity_id": 4242,
+            "payload": {
+              "value": false
+            }
+          }
+        },
+        "normalized_event": {
+          "entity_id": 4242,
+          "entity_type": 2,
+          "value": false
+        }
+      },
+      "modern": {
+        "endpoint": "ws://203.0.113.10:28082/",
+        "method": "PROTOBUF_BROADCAST",
+        "primed_entity": {
+          "entity_id": 4242,
+          "entity_type": 2
+        },
+        "broadcast": {
+          "entity_changed": {
+            "entity_id": 4242,
+            "payload": {
+              "value": false
+            }
+          }
+        },
+        "normalized_event": {
+          "entity_id": 4242,
+          "entity_type": 2,
+          "value": false
+        }
+      },
+      "expected_assertions": [
+        "ALARM_METHOD_IS_PROTOBUF_BROADCAST",
+        "ALARM_CURRENT_IS_WSS_AND_MODERN_IS_WS",
+        "ALARM_BROADCAST_HAS_ENTITY_CHANGED",
+        "ALARM_PRIMED_ENTITY_ID_MATCHES",
+        "ALARM_PRIMED_ENTITY_TYPE_IS_ALARM_2",
+        "ALARM_NORMALIZED_EVENT_MATCHES_PAYLOAD",
+        "ALARM_LIVE_PROOF_NEEDED_DECLARED"
+      ],
+      "live_proof_needed": [
+        "IN_GAME_SMART_ALARM_STATE_CHANGE",
+        "RUST_SERVER_TO_CLIENT_WEBSOCKET_BROADCAST_DELIVERY"
+      ]
+    },
+    {
+      "name": "alarm_2_true",
+      "current_source": "xiao-current-rustplus@469c98435647fa2582b8d14339cd385a686a79e6;rustplus-current-protocol@5b9a0803ac404a00b7f58e298c91b1130504d5c7",
+      "modern_source": "rustplus-js-modern@75915f25fc7c1718f7c23c419953f4655840fade",
+      "current": {
+        "endpoint": "wss://203.0.113.10:28082/",
+        "method": "PROTOBUF_BROADCAST",
+        "primed_entity": {
+          "entity_id": 4242,
+          "entity_type": 2
+        },
+        "broadcast": {
+          "entity_changed": {
+            "entity_id": 4242,
+            "payload": {
+              "value": true
+            }
+          }
+        },
+        "normalized_event": {
+          "entity_id": 4242,
+          "entity_type": 2,
+          "value": true
+        }
+      },
+      "modern": {
+        "endpoint": "ws://203.0.113.10:28082/",
+        "method": "PROTOBUF_BROADCAST",
+        "primed_entity": {
+          "entity_id": 4242,
+          "entity_type": 2
+        },
+        "broadcast": {
+          "entity_changed": {
+            "entity_id": 4242,
+            "payload": {
+              "value": true
+            }
+          }
+        },
+        "normalized_event": {
+          "entity_id": 4242,
+          "entity_type": 2,
+          "value": true
+        }
+      },
+      "expected_assertions": [
+        "ALARM_METHOD_IS_PROTOBUF_BROADCAST",
+        "ALARM_CURRENT_IS_WSS_AND_MODERN_IS_WS",
+        "ALARM_BROADCAST_HAS_ENTITY_CHANGED",
+        "ALARM_PRIMED_ENTITY_ID_MATCHES",
+        "ALARM_PRIMED_ENTITY_TYPE_IS_ALARM_2",
+        "ALARM_NORMALIZED_EVENT_MATCHES_PAYLOAD",
+        "ALARM_LIVE_PROOF_NEEDED_DECLARED"
+      ],
+      "live_proof_needed": [
+        "IN_GAME_SMART_ALARM_STATE_CHANGE",
+        "RUST_SERVER_TO_CLIENT_WEBSOCKET_BROADCAST_DELIVERY"
+      ]
+    }
+  ]
+}

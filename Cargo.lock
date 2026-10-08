@@ -1688,6 +1688,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "phase0-evidence"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
 name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
