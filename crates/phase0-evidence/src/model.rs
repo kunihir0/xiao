@@ -53,13 +53,15 @@ pub enum AssertionId {
     McsLoginCredentialsRedacted,
     McsReadinessTagIsLoginResponse,
     // Pairing assertions
-    PairingMethodIsFcmAppData,
+    PairingCurrentIsFcmAppData,
+    PairingModernIsExpoNotification,
     PairingSyntheticPlayerIdMatchesNormalized,
     PairingPlayerTokenRedacted,
     PairingNormalizedAddressMatchesNested,
     PairingNoInventedProviderResponse,
     // getEntityInfo assertions
     GetEntityInfoWebsocketEndpointNoPath,
+    GetEntityInfoCurrentIsWssAndModernIsWs,
     GetEntityInfoRequestHasEntityIdAndPlayer,
     #[serde(rename = "GET_ENTITY_INFO_RESPONSE_TYPE_IS_ALARM_2")]
     GetEntityInfoResponseTypeIsAlarm2,
@@ -67,6 +69,7 @@ pub enum AssertionId {
     GetEntityInfoPlayerCredentialsRedacted,
     // Alarm transition assertions
     AlarmMethodIsProtobufBroadcast,
+    AlarmCurrentIsWssAndModernIsWs,
     AlarmBroadcastHasEntityChanged,
     AlarmPrimedEntityIdMatches,
     #[serde(rename = "ALARM_PRIMED_ENTITY_TYPE_IS_ALARM_2")]
@@ -271,18 +274,27 @@ pub struct McsReadinessResponse {
 pub struct PairingRoute {
     pub current_source: String,
     pub modern_source: String,
-    pub current: PairingSide,
-    pub modern: PairingSide,
+    pub current: CurrentPairingSide,
+    pub modern: ModernPairingSide,
     pub expected_assertions: Vec<AssertionId>,
     pub live_proof_needed: Vec<LiveProofNeed>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PairingSide {
+pub struct CurrentPairingSide {
     pub endpoint: String,
     pub method: String,
     pub app_data: Vec<AppDataItem>,
+    pub normalized_pairing: NormalizedPairing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModernPairingSide {
+    pub endpoint: String,
+    pub method: String,
+    pub notification_data: Map<String, Value>,
     pub normalized_pairing: NormalizedPairing,
 }
 

@@ -168,14 +168,50 @@ fn validate_key_and_value(key: &str, value: &Value, path: &str) -> Result<(), Ev
     Ok(())
 }
 
+const ALLOWED_ASSERTIONS_AND_PROOFS: &[&str] = &[
+    "ENROLLMENT_SEQUENCE_STEPS_MATCH",
+    "ENROLLMENT_CHECKIN_ENDPOINT_MATCH",
+    "ENROLLMENT_REGISTER3_ENDPOINT_MATCH",
+    "ENROLLMENT_EXPO_ENDPOINT_MATCH",
+    "ENROLLMENT_FACEPUNCH_ENDPOINT_MATCH",
+    "ENROLLMENT_FACEPUNCH_HOST_IS_COMPANION_RUST",
+    "ENROLLMENT_CREDENTIALS_REDACTED",
+    "MCS_ENDPOINT_MATCHES_MTALK",
+    "MCS_TRANSPORT_IS_RAW_TCP_TLS",
+    "MCS_PROTOCOL_VERSION_41",
+    "MCS_LOGIN_PAYLOAD_FIELDSET_COMPLETE",
+    "MCS_LOGIN_CREDENTIALS_REDACTED",
+    "MCS_READINESS_TAG_IS_LOGIN_RESPONSE",
+    "PAIRING_CURRENT_IS_FCM_APP_DATA",
+    "PAIRING_MODERN_IS_EXPO_NOTIFICATION",
+    "PAIRING_SYNTHETIC_PLAYER_ID_MATCHES_NORMALIZED",
+    "PAIRING_PLAYER_TOKEN_REDACTED",
+    "PAIRING_NORMALIZED_ADDRESS_MATCHES_NESTED",
+    "PAIRING_NO_INVENTED_PROVIDER_RESPONSE",
+    "GET_ENTITY_INFO_WEBSOCKET_ENDPOINT_NO_PATH",
+    "GET_ENTITY_INFO_CURRENT_IS_WSS_AND_MODERN_IS_WS",
+    "GET_ENTITY_INFO_REQUEST_HAS_ENTITY_ID_AND_PLAYER",
+    "GET_ENTITY_INFO_RESPONSE_TYPE_IS_ALARM_2",
+    "GET_ENTITY_INFO_SEQUENCE_MATCHES",
+    "GET_ENTITY_INFO_PLAYER_CREDENTIALS_REDACTED",
+    "ALARM_METHOD_IS_PROTOBUF_BROADCAST",
+    "ALARM_CURRENT_IS_WSS_AND_MODERN_IS_WS",
+    "ALARM_BROADCAST_HAS_ENTITY_CHANGED",
+    "ALARM_PRIMED_ENTITY_ID_MATCHES",
+    "ALARM_PRIMED_ENTITY_TYPE_IS_ALARM_2",
+    "ALARM_NORMALIZED_EVENT_MATCHES_PAYLOAD",
+    "ALARM_LIVE_PROOF_NEEDED_DECLARED",
+    "IN_GAME_SMART_ALARM_STATE_CHANGE",
+    "RUST_SERVER_TO_CLIENT_WEBSOCKET_BROADCAST_DELIVERY",
+    "STEAM_ACCOUNT_COMPANION_AUTHENTICATION",
+    "LIVE_PROVIDER_PUSH_DELIVERY",
+];
 fn is_allowed_token_shaped_string(s: &str, known_hashes: &BTreeSet<&str>) -> bool {
     if s == REDACTED_MARKER {
         return true;
     }
-    // Allow uppercase enum/constant identifiers
-    if s.chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-    {
+    // Allow known assertion and live proof identifiers exactly
+    if ALLOWED_ASSERTIONS_AND_PROOFS.contains(&s) {
         return true;
     }
     // Allow JSON-delimited strings (their parsed structure is scanned separately)
@@ -201,14 +237,30 @@ fn is_allowed_token_shaped_string(s: &str, known_hashes: &BTreeSet<&str>) -> boo
         || s == "mcs.android.com"
         || s == "1:976529667804:android:d6f1ddeb4403b338fea619"
         || s == "2026-10-07"
+        || s.starts_with("application/")
+        || s == "mcs_version_tag_delimited"
+        || s == "facepunch_register"
+        || s == "firebase_installations"
+        || s == "FCM_NOTIFICATION_APP_DATA"
+        || s == "EXPO_PUSH_NOTIFICATION"
+        || s == "MCS_FRAMED_PROTOBUF"
+        || s == "PROTOBUF_BROADCAST"
+        || s == "PROTOBUF_RPC"
+        || s == "xiao-current-rustplus"
+        || s == "rustplus-current-protocol"
+        || s == "push-receiver-current"
+        || s == "rustplus-js-modern"
+        || s == "liam-push-receiver"
     {
         return true;
     }
     // Allow URL forms without query/userinfo
     if s.starts_with("https://")
         || s.starts_with("wss://")
+        || s.starts_with("ws://")
         || s.starts_with("tcp+tls://")
         || s.starts_with("fcm://")
+        || s.starts_with("expo://")
     {
         return true;
     }
@@ -316,13 +368,9 @@ fn validate_string_content(
 
     // Check for random high-entropy token-shaped string under any key
     if s.len() >= 16 && !s.contains(' ') && !is_allowed_token_shaped_string(s, known_hashes) {
-        let has_alpha = s.chars().any(|c| c.is_ascii_alphabetic());
-        let has_digit = s.chars().any(|c| c.is_ascii_digit());
-        if has_alpha && has_digit {
-            return Err(EvidenceError::Secret(format!(
-                "unredacted credential-shaped value detected at {path}"
-            )));
-        }
+        return Err(EvidenceError::Secret(format!(
+            "unredacted credential-shaped value detected at {path}"
+        )));
     }
 
     Ok(())

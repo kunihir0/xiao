@@ -1,6 +1,7 @@
 use phase0_evidence::{EvidenceError, MAX_INPUT_BYTES, render, render_embedded};
 use std::env;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -9,12 +10,13 @@ fn main() {
     let result = match args.len() {
         1 => render_embedded(),
         2 if args[1] == "--help" || args[1] == "-h" => {
-            println!("Usage: phase0-evidence [--input <PATH>]");
+            println!("Usage: phase0-evidence [--input <PATH> | -]");
             return;
         }
+        2 if args[1] == "-" => read_stdin_and_render(),
         3 if args[1] == "--input" => read_file_and_render(&args[2]),
         _ => {
-            eprintln!("Usage: phase0-evidence [--input <PATH>]");
+            eprintln!("Usage: phase0-evidence [--input <PATH> | -]");
             process::exit(2);
         }
     };
@@ -53,6 +55,13 @@ fn validate_safe_input_path(path_str: &str) -> Result<PathBuf, EvidenceError> {
     }
 
     let path = Path::new(path_str);
+
+    // Reject symlinks
+    let sym_meta = fs::symlink_metadata(path).map_err(|e| EvidenceError::Io(e.to_string()))?;
+    if sym_meta.file_type().is_symlink() {
+        return Err(EvidenceError::Blocked("symlinks are forbidden".to_owned()));
+    }
+
     if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
         return Err(EvidenceError::Blocked(
             "input must be a .json file".to_owned(),
@@ -69,6 +78,20 @@ fn validate_safe_input_path(path_str: &str) -> Result<PathBuf, EvidenceError> {
     let canonical = path
         .canonicalize()
         .map_err(|e| EvidenceError::Io(e.to_string()))?;
+
+    let is_in_fixtures = canonical.components().any(|c| c.as_os_str() == "fixtures");
+    let is_in_target = canonical.components().any(|c| c.as_os_str() == "target");
+    let temp_dir = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let is_in_temp = canonical.starts_with(&temp_dir);
+
+    if !is_in_fixtures && !is_in_temp && !is_in_target {
+        return Err(EvidenceError::Blocked(
+            "input file must be within an allowed fixtures or temporary test directory".to_owned(),
+        ));
+    }
+
     let canonical_str = canonical.to_string_lossy().to_ascii_lowercase();
     for blocked in BLOCKED_SUBSTRINGS {
         if canonical_str.contains(blocked) {
@@ -84,5 +107,21 @@ fn validate_safe_input_path(path_str: &str) -> Result<PathBuf, EvidenceError> {
 fn read_file_and_render(path_str: &str) -> Result<String, EvidenceError> {
     let canonical = validate_safe_input_path(path_str)?;
     let content = fs::read_to_string(canonical).map_err(|e| EvidenceError::Io(e.to_string()))?;
+    render(&content)
+}
+
+fn read_stdin_and_render() -> Result<String, EvidenceError> {
+    let mut buffer = Vec::new();
+    let mut take = io::stdin().take((MAX_INPUT_BYTES + 1) as u64);
+    take.read_to_end(&mut buffer)
+        .map_err(|e| EvidenceError::Io(e.to_string()))?;
+
+    if buffer.len() > MAX_INPUT_BYTES {
+        return Err(EvidenceError::LimitExceeded(format!(
+            "stdin input exceeds {MAX_INPUT_BYTES} bytes"
+        )));
+    }
+
+    let content = String::from_utf8(buffer).map_err(|e| EvidenceError::Malformed(e.to_string()))?;
     render(&content)
 }

@@ -15,7 +15,7 @@
       "name": "rustplus-current-protocol",
       "repository": "https://github.com/kunihir0/rustplus",
       "commit_or_version": "5b9a0803ac404a00b7f58e298c91b1130504d5c7",
-      "path": "proto/rustplus.proto",
+      "path": "proto/rustplus.proto;src/client.rs",
       "reviewed_on": "2026-10-07",
       "classification": "fact"
     },
@@ -23,7 +23,7 @@
       "name": "push-receiver-current",
       "repository": "https://github.com/kunihir0/push-receiver",
       "commit_or_version": "3b5b741c7ef52c2da26414bad2cffbf778644fdc",
-      "path": "src/transport.rs;src/mcs.rs;fixtures/registration_response.txt",
+      "path": "src/checkin.rs;src/register.rs;src/mcs.rs;proto/mcs.proto",
       "reviewed_on": "2026-10-07",
       "classification": "fact"
     },
@@ -31,7 +31,7 @@
       "name": "rustplus-js-modern",
       "repository": "https://github.com/liamcottle/rustplus.js",
       "commit_or_version": "75915f25fc7c1718f7c23c419953f4655840fade",
-      "path": "cli/index.js;docs/PairingFlow.md;rustplus.proto",
+      "path": "cli/index.js;docs/PairingFlow.md;rustplus.js;rustplus.proto",
       "reviewed_on": "2026-10-07",
       "classification": "fact"
     },
@@ -390,14 +390,11 @@
         }
       },
       "modern": {
-        "endpoint": "fcm://notification/app-data",
-        "method": "FCM_NOTIFICATION_APP_DATA",
-        "app_data": [
-          {
-            "key": "pairing",
-            "value": "{\"ip\":\"203.0.113.10\",\"port\":28082,\"playerId\":1001,\"playerToken\":\"[REDACTED]\",\"type\":\"server\"}"
-          }
-        ],
+        "endpoint": "expo://notification/delivery",
+        "method": "EXPO_PUSH_NOTIFICATION",
+        "notification_data": {
+          "body": "{\"ip\":\"203.0.113.10\",\"port\":28082,\"playerId\":1001,\"playerToken\":\"[REDACTED]\",\"type\":\"server\"}"
+        },
         "normalized_pairing": {
           "host": "203.0.113.10",
           "port": 28082,
@@ -408,7 +405,8 @@
         }
       },
       "expected_assertions": [
-        "PAIRING_METHOD_IS_FCM_APP_DATA",
+        "PAIRING_CURRENT_IS_FCM_APP_DATA",
+        "PAIRING_MODERN_IS_EXPO_NOTIFICATION",
         "PAIRING_SYNTHETIC_PLAYER_ID_MATCHES_NORMALIZED",
         "PAIRING_PLAYER_TOKEN_REDACTED",
         "PAIRING_NORMALIZED_ADDRESS_MATCHES_NESTED",
@@ -443,7 +441,7 @@
         }
       },
       "modern": {
-        "endpoint": "wss://203.0.113.10:28082/",
+        "endpoint": "ws://203.0.113.10:28082/",
         "method": "PROTOBUF_RPC",
         "request": {
           "seq": 100,
@@ -464,6 +462,7 @@
       },
       "expected_assertions": [
         "GET_ENTITY_INFO_WEBSOCKET_ENDPOINT_NO_PATH",
+        "GET_ENTITY_INFO_CURRENT_IS_WSS_AND_MODERN_IS_WS",
         "GET_ENTITY_INFO_REQUEST_HAS_ENTITY_ID_AND_PLAYER",
         "GET_ENTITY_INFO_RESPONSE_TYPE_IS_ALARM_2",
         "GET_ENTITY_INFO_SEQUENCE_MATCHES",
@@ -499,7 +498,7 @@
         }
       },
       "modern": {
-        "endpoint": "wss://203.0.113.10:28082/",
+        "endpoint": "ws://203.0.113.10:28082/",
         "method": "PROTOBUF_BROADCAST",
         "primed_entity": {
           "entity_id": 4242,
@@ -521,6 +520,7 @@
       },
       "expected_assertions": [
         "ALARM_METHOD_IS_PROTOBUF_BROADCAST",
+        "ALARM_CURRENT_IS_WSS_AND_MODERN_IS_WS",
         "ALARM_BROADCAST_HAS_ENTITY_CHANGED",
         "ALARM_PRIMED_ENTITY_ID_MATCHES",
         "ALARM_PRIMED_ENTITY_TYPE_IS_ALARM_2",
@@ -558,7 +558,7 @@
         }
       },
       "modern": {
-        "endpoint": "wss://203.0.113.10:28082/",
+        "endpoint": "ws://203.0.113.10:28082/",
         "method": "PROTOBUF_BROADCAST",
         "primed_entity": {
           "entity_id": 4242,
@@ -580,6 +580,7 @@
       },
       "expected_assertions": [
         "ALARM_METHOD_IS_PROTOBUF_BROADCAST",
+        "ALARM_CURRENT_IS_WSS_AND_MODERN_IS_WS",
         "ALARM_BROADCAST_HAS_ENTITY_CHANGED",
         "ALARM_PRIMED_ENTITY_ID_MATCHES",
         "ALARM_PRIMED_ENTITY_TYPE_IS_ALARM_2",

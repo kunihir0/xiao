@@ -97,7 +97,7 @@ mod tests {
         assert_eq!(manifest.routes.len(), 6);
         assert_eq!(
             manifest.manifest_sha256,
-            "84e4b64ca0ab8dc86c11dee5266600f6edcf1a7251e9352db91dcfeac0d3cea6"
+            "c41d573305075265cdd8adc89a7b0139a586da3527b0bdf785fa0b613630e9eb"
         );
 
         let expected_hashes = [
@@ -114,22 +114,22 @@ mod tests {
             (
                 "pairing",
                 "f3469e22582638a18d7911aee3b67c080db6d9e6d6cd3673a3a978ece7aaa93d",
-                "f3469e22582638a18d7911aee3b67c080db6d9e6d6cd3673a3a978ece7aaa93d",
+                "9d043b531a6dcf0bfe44dee56356a4fbed00a3dd52217ea873d09dfdc3a81c4a",
             ),
             (
                 "getEntityInfo",
                 "ce0ff7782111194d1ca065bef3acdcf06419b14d62809d11eb7b9b64d4f1ce64",
-                "ce0ff7782111194d1ca065bef3acdcf06419b14d62809d11eb7b9b64d4f1ce64",
+                "5c206e6ad5d11dfdbf03501b283e036c4dca28893ecac1d3b934216293a7e780",
             ),
             (
                 "alarm_2_false",
                 "4ad577a41e679feafe01e85d59b32d95c87f599476c0d07f3cc0e8424c072389",
-                "4ad577a41e679feafe01e85d59b32d95c87f599476c0d07f3cc0e8424c072389",
+                "1fc510e03d40cc888f2cd917343a841ff0b88a84ecbb2ae98566fee8ed0f7b9a",
             ),
             (
                 "alarm_2_true",
                 "368d98f37f49e20094bcf429b6190d6b9fa0491e903b165c6d52c53d87de2bfc",
-                "368d98f37f49e20094bcf429b6190d6b9fa0491e903b165c6d52c53d87de2bfc",
+                "707f183fc04816e8f91e5b2511e76c73ed3ab54aeeccbbfc19f46942b91e9918",
             ),
         ];
 
@@ -251,6 +251,11 @@ mod tests {
                 "API key prefix",
                 "routes[0].expected_assertions[0]",
                 "AIzaSyB5y2yTzqb4",
+            ),
+            (
+                "Uppercase unredacted token",
+                "routes[0].expected_assertions[0]",
+                "SUPERSECRETUPPERCASETOKEN123",
             ),
         ];
 
