@@ -8,6 +8,15 @@ fn schema_url(base_url: &str, schema: &str) -> String {
     format!("{base_url}{separator}options=-c%20search_path%3D{schema}%2Cpublic")
 }
 
+fn embedded_migration_count() -> Result<usize, std::io::Error> {
+    Ok(
+        std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations"))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join("up.sql").is_file())
+            .count(),
+    )
+}
+
 async fn create_schema(
     base_url: &str,
     schema: &str,
@@ -66,10 +75,7 @@ async fn applies_pending_migrations_idempotently_and_sets_readiness()
             return Err("database should not be ready before migrations".into());
         }
 
-        let expected = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations"))?
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().join("up.sql").is_file())
-            .count();
+        let expected = embedded_migration_count()?;
         let first = db.run_migrations().await?;
         if expected == 0 || first.applied() != expected {
             return Err(format!(
@@ -152,10 +158,17 @@ async fn unmigrated_schema_fails_readiness_and_verify_and_ping_succeeds_once_mig
             .into());
         }
 
-        // Apply migrations
+        // Apply every embedded migration. This assertion deliberately derives
+        // the count so future expand migrations extend rather than break the
+        // readiness contract test.
+        let expected = embedded_migration_count()?;
         let report = db.run_migrations().await?;
-        if report.applied() != 1 {
-            return Err(format!("expected one applied migration, got {}", report.applied()).into());
+        if expected == 0 || report.applied() != expected {
+            return Err(format!(
+                "expected all {expected} embedded migrations, got {}",
+                report.applied()
+            )
+            .into());
         }
 
         // Now verify_and_ping succeeds and sets is_ready to true
