@@ -81,9 +81,6 @@ fn validate_safe_input_path(path_str: &str) -> Result<PathBuf, EvidenceError> {
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let allowed_fixtures_dir = manifest_dir.join("fixtures").canonicalize().ok();
-    let temp_dir = std::env::temp_dir()
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir());
     let target_tmp = manifest_dir
         .parent()
         .and_then(|p| p.parent())
@@ -93,7 +90,6 @@ fn validate_safe_input_path(path_str: &str) -> Result<PathBuf, EvidenceError> {
     let is_contained = allowed_fixtures_dir
         .as_ref()
         .is_some_and(|dir| canonical.starts_with(dir))
-        || canonical.starts_with(&temp_dir)
         || target_tmp
             .as_ref()
             .is_some_and(|dir| canonical.starts_with(dir));

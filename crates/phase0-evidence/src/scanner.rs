@@ -238,7 +238,9 @@ fn is_allowed_token_shaped_string(s: &str, known_hashes: &BTreeSet<&str>) -> boo
         || s == "mcs.android.com"
         || s == "1:976529667804:android:d6f1ddeb4403b338fea619"
         || s == "2026-10-07"
-        || s.starts_with("application/")
+        || s == "application/json"
+        || s == "application/x-protobuf"
+        || s == "application/x-www-form-urlencoded"
         || s == "mcs_version_tag_delimited"
         || s == "facepunch_register"
         || s == "firebase_installations"
