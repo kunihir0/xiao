@@ -97,7 +97,7 @@ mod tests {
         assert_eq!(manifest.routes.len(), 6);
         assert_eq!(
             manifest.manifest_sha256,
-            "1100634186bd81ec9a9ade839a875d9d48f90c64a01edd19a8f105c7274a0081"
+            "dd7d7442d185cf7132a402b78d1488591f5c133a882e1976e728d326a68a1541"
         );
 
         let expected_hashes = [

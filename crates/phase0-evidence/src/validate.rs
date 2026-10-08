@@ -37,7 +37,7 @@ pub const ALLOWED_SOURCES: &[(&str, &str, &str, &str)] = &[
         "xiao-current-rustplus",
         "https://github.com/kunihir0/xiao",
         "469c98435647fa2582b8d14339cd385a686a79e6",
-        "crates/push-receiver/src/transport.rs;crates/rustplus-adapter/src/registration.rs;crates/rustplus-adapter/src/parse.rs",
+        "crates/push-receiver/src/transport.rs;crates/rustplus-adapter/src/registration.rs;crates/rustplus-adapter/src/parse.rs;crates/rustplus-adapter/src/session.rs",
     ),
     (
         "rustplus-current-protocol",

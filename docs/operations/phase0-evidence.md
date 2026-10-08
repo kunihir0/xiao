@@ -36,7 +36,7 @@ cmp -s /tmp/phase0-a.json /tmp/phase0-b.json
 All contract definitions are tied to specific source files and immutable commit hashes:
 
 1. **`xiao-current-rustplus`**: `https://github.com/kunihir0/xiao` @ `469c98435647fa2582b8d14339cd385a686a79e6`
-   - Paths: `crates/push-receiver/src/transport.rs;crates/rustplus-adapter/src/registration.rs;crates/rustplus-adapter/src/parse.rs`
+   - Paths: `crates/push-receiver/src/transport.rs;crates/rustplus-adapter/src/registration.rs;crates/rustplus-adapter/src/parse.rs;crates/rustplus-adapter/src/session.rs`
 2. **`rustplus-current-protocol`**: `https://github.com/kunihir0/rustplus` @ `5b9a0803ac404a00b7f58e298c91b1130504d5c7`
    - Paths: `proto/rustplus.proto;src/client.rs`
 3. **`push-receiver-current`**: `https://github.com/kunihir0/push-receiver` @ `3b5b741c7ef52c2da26414bad2cffbf778644fdc`
@@ -61,11 +61,10 @@ The harness validates contracts across six routes:
    - Protocol version: 41. Framing: tag-delimited length prefix.
    - LoginRequest payload: fields matching `mcs.proto` (`id`, `domain`, `user`, `resource`, `auth_token`, `device_id`, `last_rmq_id`, `setting`, `received_persistent_id`).
    - Readiness: receipt of tag 3 (`LoginResponse`), with heartbeat support verified. No HTTP headers.
-3. **`pairing`**: Evaluates parsing of inbound notifications.
-   - Current: `fcm://notification/app-data` containing JSON payload under the `pairing` key.
-   - Modern: `expo://notification/delivery` containing JSON payload under `body` key.
-   - Outbound: Normalized `Pairing` struct matching `crates/rustplus-adapter/src/parse.rs`.
-   - Uses synthetic player ID (`1001`) and test address (`203.0.113.10:28082`). No fabricated server response is generated.
+3. **`pairing`**: Evaluates parsing of inbound FCM/MCS app-data notifications.
+   - Current and modern inbound deliveries are represented as `fcm://notification/app-data` from the `PushReceiverClient` app-data event path. Expo is the registration-token exchange, not the inbound delivery transport.
+   - Outbound: Normalized `Pairing` struct matching `crates/rustplus-adapter/src/parse.rs`; reserved TEST-NET-3 address `203.0.113.10:28082` is an inference fixture and is not claimed to pass the adapter's public-IP validation.
+   - Uses synthetic player ID (`1001`). No fabricated server response is generated.
 4. **`getEntityInfo`**: Protobuf request/response over WebSocket.
    - Current: `wss://203.0.113.10:28082/` (enforces TLS).
    - Modern: `ws://203.0.113.10:28082/` (direct unencrypted WebSocket default).
