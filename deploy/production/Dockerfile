@@ -3,6 +3,7 @@
 ARG BUILD_IMAGE=rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6
 ARG RUNTIME_IMAGE=debian:bookworm-20250929-slim@sha256:7e490910eea2861b9664577a96b54ce68ea3e02ce7f51d89cb0103a6f9c386e0
 ARG DEBIAN_SNAPSHOT=20261005T000000Z
+ARG SOURCE_SHA=unknown
 
 FROM ${BUILD_IMAGE} AS build
 ARG DEBIAN_SNAPSHOT
@@ -37,6 +38,8 @@ COPY migrations ./migrations
 RUN cargo build --locked --release --package bot
 
 FROM ${RUNTIME_IMAGE} AS runtime
+ARG SOURCE_SHA=unknown
+LABEL org.opencontainers.image.revision="${SOURCE_SHA}"
 ARG DEBIAN_SNAPSHOT
 
 RUN rm -f /etc/apt/sources.list.d/debian.sources \

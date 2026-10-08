@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+live-acceptance = ["bot-discord/live-acceptance", "dep:zeroize"]
+
 [lints]
 workspace = true
 
@@ -22,6 +26,8 @@ push-receiver = { version = "0.1.0", path = "../../crates/push-receiver" }
 rustplus-client = { version = "0.1.0", path = "../../crates/rustplus-client" }
 tracing.workspace = true
 bot-domain = { version = "0.1.0", path = "../../crates/domain" }
+zeroize = { workspace = true, optional = true }
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

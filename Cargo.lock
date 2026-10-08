@@ -181,9 +181,11 @@ dependencies = [
  "push-receiver",
  "rustplus-adapter",
  "rustplus-client",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
