@@ -287,6 +287,9 @@ fn validate_string_content(
         )));
     }
     if path.contains("app_data[") && path.ends_with(".value") {
+        let _ = serde_json::from_str::<Value>(s).map_err(|_| {
+            EvidenceError::Malformed("app_data value must be valid JSON".to_owned())
+        })?;
         return Ok(());
     }
 
@@ -305,6 +308,11 @@ fn validate_string_content(
         return Err(EvidenceError::Secret(format!(
             "PEM header detected at {path}"
         )));
+    }
+    if lower.starts_with("synthetic-") && !ALLOWED_SYNTHETIC_STRINGS.contains(&s) {
+        return Err(EvidenceError::Secret(
+            "unapproved synthetic identifier".to_owned(),
+        ));
     }
 
     if lower.contains("bearer ") {

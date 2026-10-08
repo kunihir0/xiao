@@ -426,9 +426,15 @@ fn validate_enrollment_route(
         actual_assertions.insert(AssertionId::EnrollmentRegister3EndpointMatch);
     }
 
-    // Expo endpoints
+    let cur_fcm = &route.current.steps[2];
     let cur_expo = &route.current.steps[3];
     let mod_expo = &route.modern.steps[3];
+    if cur_fcm.method != "POST" || cur_expo.method != "POST" || mod_expo.method != "POST" {
+        return Err(EvidenceError::Malformed(
+            "enrollment HTTP methods must be POST".to_owned(),
+        ));
+    }
+    // Expo endpoints
     if cur_expo.endpoint == "https://exp.host/--/api/v2/push/getExpoPushToken"
         && mod_expo.endpoint == "https://exp.host/--/api/v2/push/getExpoPushToken"
         && cur_expo.payload["projectId"] == "49451aca-a822-41e6-ad59-955718d0ff9c"
@@ -446,6 +452,8 @@ fn validate_enrollment_route(
         Url::parse(&mod_fp.endpoint).map_err(|e| EvidenceError::Malformed(e.to_string()))?;
     if cur_url.host_str() == Some("companion-rust.facepunch.com")
         && mod_url.host_str() == Some("companion-rust.facepunch.com")
+        && cur_fp.method == "POST"
+        && mod_fp.method == "POST"
     {
         actual_assertions.insert(AssertionId::EnrollmentFacepunchHostIsCompanionRust);
         if cur_url.path() == "/api/push/register" && mod_url.path() == "/api/push/register" {
@@ -715,37 +723,27 @@ fn validate_pairing_route(
         ));
     }
 
-    let allowed_keys = [
-        "ip",
-        "port",
-        "playerId",
-        "playerToken",
-        "type",
-        "entityId",
-        "entityType",
-        "entityName",
-    ];
+    let allowed_keys = ["ip", "port", "playerId", "playerToken", "type"];
 
     for (side_name, side) in [("current", cur), ("modern", md)] {
-        let pairing_item = side
-            .app_data
-            .iter()
-            .find(|item| item.key == "pairing")
-            .ok_or_else(|| {
-                EvidenceError::Malformed(format!("missing 'pairing' in {side_name} app_data"))
-            })?;
-
-        let raw: serde_json::Value = serde_json::from_str(&pairing_item.value)
-            .map_err(|e| EvidenceError::Json(e.to_string()))?;
-
-        if let Value::Object(obj) = &raw {
-            for k in obj.keys() {
-                if !allowed_keys.contains(&k.as_str()) {
-                    return Err(EvidenceError::Malformed(format!(
-                        "unexpected key in {side_name} pairing app_data JSON"
-                    )));
-                }
-            }
+        if side.app_data.len() != 1 || side.app_data[0].key != "pairing" {
+            return Err(EvidenceError::Malformed(
+                "pairing app_data must contain exactly one pairing item".to_owned(),
+            ));
+        }
+        let pairing_item = &side.app_data[0];
+        let raw: serde_json::Value = serde_json::from_str(&pairing_item.value).map_err(|_| {
+            EvidenceError::Malformed("pairing app_data value must be JSON".to_owned())
+        })?;
+        let obj = raw.as_object().ok_or_else(|| {
+            EvidenceError::Malformed("pairing app_data must be an object".to_owned())
+        })?;
+        if obj.len() != allowed_keys.len()
+            || obj.keys().any(|k| !allowed_keys.contains(&k.as_str()))
+        {
+            return Err(EvidenceError::Malformed(
+                "pairing app_data has unexpected or missing fields".to_owned(),
+            ));
         }
 
         let player_id = raw["playerId"].as_u64().ok_or_else(|| {

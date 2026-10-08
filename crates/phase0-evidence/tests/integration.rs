@@ -87,6 +87,29 @@ fn cli_rejects_unapproved_register_device() {
 }
 
 #[test]
+fn cli_rejects_pairing_app_data_mutations() {
+    for mutation in 0..3 {
+        let mut bad: serde_json::Value = serde_json::from_str(EMBEDDED_FIXTURE).expect("fixture");
+        let items = bad["routes"][2]["current"]["app_data"]
+            .as_array_mut()
+            .expect("app data");
+        match mutation {
+            0 => items.push(serde_json::json!({"key":"extra","value":"secret123"})),
+            1 => items.push(items[0].clone()),
+            _ => {
+                let raw = items[0]["value"].as_str().expect("pairing JSON");
+                items[0]["value"] = serde_json::Value::String(raw.replace(
+                    "\"type\":\"server\"",
+                    "\"type\":\"server\",\"entityName\":\"secret123\"",
+                ));
+            }
+        }
+        let output = run_stdin(&bad.to_string());
+        assert_eq!(output.status.code(), Some(1));
+    }
+}
+
+#[test]
 fn cli_oversized_stdin_rejected() {
     let output = run_stdin(&" ".repeat(65537));
     assert_eq!(output.status.code(), Some(1));
