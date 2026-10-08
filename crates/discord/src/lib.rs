@@ -8,6 +8,7 @@ use std::{fmt, future::Future, pin::Pin, time::Duration};
 use poise::serenity_prelude as serenity;
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
+pub mod acceptance;
 
 const REDACTED_TOKEN: &str = "[REDACTED]";
 
@@ -83,6 +84,8 @@ pub enum DiscordError {
     ShutdownTimeout(Duration),
     #[error("Discord command response failed: {0}")]
     Command(String),
+    #[error("Discord API error: {0}")]
+    Api(String),
 }
 
 /// The future owned by [`DiscordHandle`] and registered by application composition.
@@ -151,12 +154,19 @@ impl DiscordHandle {
                 on_error: on_framework_error,
                 ..Default::default()
             })
-            .setup(move |ctx, _ready, framework| {
+            .setup(move |ctx, ready_event, framework| {
                 Box::pin(async move {
+                    tracing::info!(
+                        bot_user = %ready_event.user.name,
+                        bot_id = %ready_event.user.id.get(),
+                        guild_count = ready_event.guilds.len(),
+                        "Discord gateway READY received"
+                    );
                     match poise::builtins::register_globally(ctx, &framework.options().commands)
                         .await
                     {
                         Ok(()) => {
+                            tracing::info!("Discord global slash command registration succeeded");
                             let _ = setup_sender.send(SetupStatus::Ready);
                             Ok(())
                         }
@@ -347,6 +357,12 @@ type CommandContext<'a> = poise::Context<'a, (), DiscordError>;
 /// Responds with pong.
 #[poise::command(slash_command)]
 async fn ping(ctx: CommandContext<'_>) -> Result<(), DiscordError> {
+    tracing::info!(
+        user = %ctx.author().name,
+        user_id = %ctx.author().id.get(),
+        guild_id = ?ctx.guild_id().map(|id| id.get()),
+        "Received /ping command, responding with pong"
+    );
     ctx.say(PING_RESPONSE)
         .await
         .map(|_| ())

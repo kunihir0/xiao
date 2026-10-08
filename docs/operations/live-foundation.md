@@ -84,23 +84,19 @@ scripts/live-foundation-smoke.sh --postgres \
 
 The PostgreSQL mode performs and records:
 
-1. distinct runtime/migrator identities and runtime DDL denial;
-2. migrator DDL availability and runtime migration-metadata read access;
-For a locally built reviewed image, use `--local-image IMAGE --source-sha
-$(git rev-parse HEAD)` instead of requiring a registry digest. The harness
-rejects a local image unless the source SHA exactly matches the checked-out
-commit. `--discord-env-file /Users/bao/Apps/sources/xiao/.env` is accepted only
-with explicit approval, validates owner-only permissions, and keeps the token
-in the original file; it is never copied into a temporary file or command
-argument. Add `--command-observed` only after a human has recorded the global
-and guild `/ping` and approved error-path outcomes; otherwise the harness
-blocks before shutdown/restart.
-3. from-zero embedded Diesel migration and schema-current metadata;
-4. runtime `SELECT 1` readiness;
-5. repeat migration/upgrade idempotency and migration count preservation;
-6. verify-full success with the trusted CA; wrong-CA, hostname-mismatch, and
-   plaintext-server failures (all expected negatives).
+1. distinct runtime/migrator identities (`xiao_runtime != xiao_migrator`);
+2. fresh from-zero database confirmation (0 public tables before migration);
+3. migrator DDL availability and from-zero embedded Diesel migration;
+4. schema-current metadata verification;
+5. runtime DDL denial testing (attempted `CREATE`, `ALTER`, `DROP`, and `GRANT` denied with authorization errors);
+6. runtime application DML positive testing (insert and read back);
+7. runtime `SELECT 1` readiness and new-session reconnect;
+8. repeat migration/upgrade idempotency and runtime data preservation;
+9. verify-full success with the trusted CA; wrong-CA, hostname-mismatch, and
+   plaintext-server failures (all expected negatives with verified error classes).
 
+For macOS environments, the host libpq keg at `/opt/homebrew/opt/libpq` is automatically
+detected and utilized for `psql` and compilation.
 A failed authorization or TLS negative is a failed acceptance if the connection
 succeeds. Error text is kept out of the manifest. The operator MUST inspect the
 private failure evidence before cleanup without copying secret-bearing output.
@@ -129,13 +125,16 @@ for database schema-current/readiness evidence, then checks the global command
 list and performs an idempotent guild command registration. Both lists MUST
 contain exactly one `/ping`. The harness checks this again after restart to
 catch duplicate registration.
+The operator invokes `/ping` in the test guild and confirms the expected public
+`pong` response. In this foundation phase (Issue #22), only `/ping` exists; management
+commands, authorization policies, and ephemeral error responses are non-goals
+introduced in later issues (#25, #31).
 
-The operator MUST manually invoke both global and guild `/ping`, record the
-expected `pong` response, invoke the permitted management/error-path probe from
-an unauthorized account, and confirm the response is ephemeral and contains no
-secret or message content. Manual probes are intentionally not automated with a
-bot token because a bot cannot impersonate the invoking user safely. Record
-only `pass`, `fail`, or `not-run` outcomes in the manifest.
+Safe error paths verified by the foundation harness are:
+1. pre-connect fail-closed gate without human approval (blocked status 78);
+2. unknown command registration / query validation error handling;
+3. PostgreSQL runtime DDL authorization denials;
+4. PostgreSQL verify-full TLS negative error classes.
 
 The harness sends SIGTERM with a 30-second grace period, requires exit status
 zero, starts the exact image again, and verifies readiness plus one global

@@ -1,5 +1,6 @@
 //! Process composition root for the Discord bot.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bot::{BoxError, Composition, CtrlCSignal};
@@ -12,6 +13,7 @@ use bot_db::{
     Db, DbConfig, FileKeyring, KeyProvider, PostgresPairingStore, PostgresPushCredentialStore,
     rewrap_secrets,
 };
+use bot_discord::acceptance::DiscordAcceptanceClient;
 use bot_discord::{DiscordConfig, DiscordHandle};
 use bot_domain::SteamId;
 use bot_telemetry::init_from_config;
@@ -23,6 +25,7 @@ use rustplus_adapter::{
 use rustplus_client::ReconnectPolicy;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use zeroize::Zeroizing;
 
 #[tokio::main]
 async fn main() {
@@ -108,15 +111,112 @@ async fn run_rustplus(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscordAcceptanceAction {
+    ListGuilds,
+    Inspect,
+    EnsureGuildPing,
+    CleanupGuildPing { command_id: u64 },
+    VerifyAll,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscordAcceptanceArgs {
+    pub guild_id: Option<u64>,
+    pub application_id: Option<u64>,
+    pub action: DiscordAcceptanceAction,
+    pub env_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BotMode {
     Run { migrate_on_startup: bool },
     MigrateOnly,
+    DiscordAcceptance(DiscordAcceptanceArgs),
+}
+
+fn parse_discord_acceptance_args(args: &[String]) -> Result<DiscordAcceptanceArgs, String> {
+    let mut guild_id = None;
+    let mut application_id = None;
+    let mut action_kind = "verify-all";
+    let mut command_id = None;
+    let mut env_file = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--guild-id" => {
+                i += 1;
+                let val = args.get(i).ok_or("--guild-id requires a value")?;
+                guild_id = Some(
+                    val.parse::<u64>()
+                        .map_err(|e| format!("invalid guild-id: {e}"))?,
+                );
+            }
+            "--application-id" => {
+                i += 1;
+                let val = args.get(i).ok_or("--application-id requires a value")?;
+                application_id = Some(
+                    val.parse::<u64>()
+                        .map_err(|e| format!("invalid application-id: {e}"))?,
+                );
+            }
+            "--action" => {
+                i += 1;
+                let val = args.get(i).ok_or("--action requires a value")?;
+                action_kind = val.as_str();
+            }
+            "--command-id" => {
+                i += 1;
+                let val = args.get(i).ok_or("--command-id requires a value")?;
+                command_id = Some(
+                    val.parse::<u64>()
+                        .map_err(|e| format!("invalid command-id: {e}"))?,
+                );
+            }
+            "--env-file" => {
+                i += 1;
+                let val = args.get(i).ok_or("--env-file requires a value")?;
+                env_file = Some(PathBuf::from(val));
+            }
+            other => return Err(format!("unknown command line argument: {other}")),
+        }
+        i += 1;
+    }
+
+    let action = match action_kind {
+        "list-guilds" => DiscordAcceptanceAction::ListGuilds,
+        "inspect" => DiscordAcceptanceAction::Inspect,
+        "ensure-guild-ping" => DiscordAcceptanceAction::EnsureGuildPing,
+        "cleanup-guild-ping" => {
+            let cid = command_id.ok_or("--command-id is required for cleanup-guild-ping action")?;
+            DiscordAcceptanceAction::CleanupGuildPing { command_id: cid }
+        }
+        "verify-all" => DiscordAcceptanceAction::VerifyAll,
+        other => {
+            return Err(format!(
+                "unknown action: {other} (expected list-guilds, inspect, ensure-guild-ping, cleanup-guild-ping, verify-all)"
+            ));
+        }
+    };
+
+    Ok(DiscordAcceptanceArgs {
+        guild_id,
+        application_id,
+        action,
+        env_file,
+    })
 }
 
 pub fn parse_bot_mode(
     args: &[String],
     default_migrate_on_startup: bool,
 ) -> Result<BotMode, String> {
+    if let Some(first) = args.first()
+        && first == "discord-acceptance"
+    {
+        return parse_discord_acceptance_args(&args[1..]).map(BotMode::DiscordAcceptance);
+    }
+
     let mut migrate_only = false;
     let mut migrate_on_startup = default_migrate_on_startup;
 
@@ -177,6 +277,131 @@ async fn run_migrations_command() -> Result<(), BoxError> {
     Ok(())
 }
 
+fn resolve_discord_token(env_file_path: Option<&Path>) -> Result<Zeroizing<String>, BoxError> {
+    if let Ok(token) = std::env::var("DISCORD_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return Ok(Zeroizing::new(token.trim().to_owned()));
+    }
+    if let Ok(file_path) = std::env::var("DISCORD_TOKEN_FILE")
+        && !file_path.trim().is_empty()
+    {
+        let secret = bot_config::read_secret_file(file_path.trim(), "DISCORD_TOKEN_FILE")
+            .map_err(|e| Box::new(e) as BoxError)?;
+        return Ok(secret);
+    }
+    if let Some(path) = env_file_path {
+        let contents = std::fs::read_to_string(path)?;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("DISCORD_TOKEN=") {
+                let token = rest.trim().trim_matches('"').trim_matches('\'');
+                if !token.is_empty() {
+                    return Ok(Zeroizing::new(token.to_owned()));
+                }
+            }
+        }
+    }
+    Err(
+        "DISCORD_TOKEN, DISCORD_TOKEN_FILE, or --env-file containing DISCORD_TOKEN is required"
+            .into(),
+    )
+}
+
+async fn run_discord_acceptance(args: DiscordAcceptanceArgs) -> Result<(), BoxError> {
+    let token = resolve_discord_token(args.env_file.as_deref())?;
+    let client = DiscordAcceptanceClient::new(&token);
+
+    match args.action {
+        DiscordAcceptanceAction::ListGuilds => {
+            let guilds = client.list_guilds().await?;
+            let items: Vec<String> = guilds
+                .iter()
+                .map(|(id, name)| format!(r#"{{"id":{},"name":"{}"}}"#, id, name))
+                .collect();
+            println!(
+                r#"{{"status":"pass","action":"list_guilds","guilds":[{}]}}"#,
+                items.join(",")
+            );
+        }
+        _ => {
+            let guild_id = match args.guild_id {
+                Some(id) => id,
+                None => {
+                    let guilds = client.list_guilds().await?;
+                    match guilds.as_slice() {
+                        [(id, _)] => *id,
+                        [] => return Err("bot is not a member of any guilds".into()),
+                        _ => {
+                            return Err(
+                                "bot is a member of multiple guilds; please specify --guild-id"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+            };
+
+            match args.action {
+                DiscordAcceptanceAction::ListGuilds => unreachable!(),
+                DiscordAcceptanceAction::Inspect => {
+                    let identity = client
+                        .verify_identity(args.application_id, guild_id)
+                        .await?;
+                    let global_ping = client.count_global_ping().await?;
+                    let guild_ping = client.count_guild_ping(guild_id).await?;
+                    println!(
+                        r#"{{"status":"pass","action":"inspect","application_id":{},"bot_username":"{}","bot_user_id":{},"guild_id":{},"guild_name":"{}","global_ping_count":{},"guild_ping_count":{}}}"#,
+                        identity.application_id,
+                        identity.bot_username,
+                        identity.bot_user_id,
+                        identity.guild_id,
+                        identity.guild_name,
+                        global_ping,
+                        guild_ping,
+                    );
+                }
+                DiscordAcceptanceAction::EnsureGuildPing => {
+                    let (command_id, created) = client.ensure_guild_ping(guild_id).await?;
+                    println!(
+                        r#"{{"status":"pass","action":"ensure_guild_ping","guild_id":{},"command_id":{},"created":{}}}"#,
+                        guild_id, command_id, created
+                    );
+                }
+                DiscordAcceptanceAction::CleanupGuildPing { command_id } => {
+                    client.delete_guild_command(guild_id, command_id).await?;
+                    println!(
+                        r#"{{"status":"pass","action":"cleanup_guild_ping","guild_id":{},"command_id":{}}}"#,
+                        guild_id, command_id
+                    );
+                }
+                DiscordAcceptanceAction::VerifyAll => {
+                    let identity = client
+                        .verify_identity(args.application_id, guild_id)
+                        .await?;
+                    client.verify_nonexistent_command_error().await?;
+                    let global_ping = client.count_global_ping().await?;
+                    let (command_id, created) = client.ensure_guild_ping(guild_id).await?;
+                    let guild_ping = client.count_guild_ping(guild_id).await?;
+                    println!(
+                        r#"{{"status":"pass","action":"verify_all","application_id":{},"bot_username":"{}","bot_user_id":{},"guild_id":{},"guild_name":"{}","global_ping_count":{},"guild_ping_count":{},"guild_ping_id":{},"guild_ping_created":{}}}"#,
+                        identity.application_id,
+                        identity.bot_username,
+                        identity.bot_user_id,
+                        identity.guild_id,
+                        identity.guild_name,
+                        global_ping,
+                        guild_ping,
+                        command_id,
+                        created,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run() -> Result<(), BoxError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode =
@@ -184,6 +409,7 @@ async fn run() -> Result<(), BoxError> {
 
     match mode {
         BotMode::MigrateOnly => run_migrations_command().await,
+        BotMode::DiscordAcceptance(args) => run_discord_acceptance(args).await,
         BotMode::Run {
             migrate_on_startup: requested_migrate_on_startup,
         } => {
@@ -411,5 +637,72 @@ mod tests {
     fn parse_bot_mode_rejects_unknown_argument() {
         let result = parse_bot_mode(&["--invalid-arg".to_owned()], true);
         assert!(matches!(&result, Err(msg) if msg.contains("unknown command line argument")));
+    }
+
+    #[test]
+    fn parse_bot_mode_discord_acceptance_valid() -> Result<(), String> {
+        let args = vec![
+            "discord-acceptance".to_owned(),
+            "--guild-id".to_owned(),
+            "123456789012345678".to_owned(),
+            "--application-id".to_owned(),
+            "987654321098765432".to_owned(),
+            "--action".to_owned(),
+            "inspect".to_owned(),
+        ];
+        let mode = parse_bot_mode(&args, true)?;
+        assert_eq!(
+            mode,
+            BotMode::DiscordAcceptance(DiscordAcceptanceArgs {
+                guild_id: Some(123456789012345678),
+                application_id: Some(987654321098765432),
+                action: DiscordAcceptanceAction::Inspect,
+                env_file: None,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_bot_mode_discord_acceptance_optional_guild_id() -> Result<(), String> {
+        let args = vec![
+            "discord-acceptance".to_owned(),
+            "--action".to_owned(),
+            "list-guilds".to_owned(),
+        ];
+        let mode = parse_bot_mode(&args, true)?;
+        assert_eq!(
+            mode,
+            BotMode::DiscordAcceptance(DiscordAcceptanceArgs {
+                guild_id: None,
+                application_id: None,
+                action: DiscordAcceptanceAction::ListGuilds,
+                env_file: None,
+            })
+        );
+        Ok(())
+    }
+    #[test]
+    fn parse_bot_mode_discord_acceptance_cleanup_action() -> Result<(), String> {
+        let args = vec![
+            "discord-acceptance".to_owned(),
+            "--guild-id".to_owned(),
+            "100".to_owned(),
+            "--action".to_owned(),
+            "cleanup-guild-ping".to_owned(),
+            "--command-id".to_owned(),
+            "200".to_owned(),
+        ];
+        let mode = parse_bot_mode(&args, true)?;
+        assert_eq!(
+            mode,
+            BotMode::DiscordAcceptance(DiscordAcceptanceArgs {
+                guild_id: Some(100),
+                application_id: None,
+                action: DiscordAcceptanceAction::CleanupGuildPing { command_id: 200 },
+                env_file: None,
+            })
+        );
+        Ok(())
     }
 }
