@@ -54,3 +54,9 @@ All notable externally meaningful changes are documented here. Releases follow S
   `SECRET_ACTIVE_KEY_ID` are set; a partial set is a startup error. The
   in-memory pairing store was removed. See
   `docs/operations/rustplus-companion.md`.
+
+- Added the deterministic offline Phase 0 Rust+ evidence harness with pinned
+  dated route contracts, redacted enrollment/MCS/pairing/entity/Alarm fixtures,
+  fail-closed secret scanning, canonical SHA-256 manifests, retention metadata,
+  and explicit fact/inference/live-proof classification. No live provider calls
+  or credentials are used.
