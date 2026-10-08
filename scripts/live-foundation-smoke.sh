@@ -904,7 +904,7 @@ container_started=false
 docker rm "$container_name" >/dev/null
 
 # Restart bot container
-"${docker_args[@]}" "$image" --no-migrate >/dev/null
+"${docker_args[@]}" "$image" "${container_command[@]}" >/dev/null
 container_started=true
 
 for _ in {1..45}; do
