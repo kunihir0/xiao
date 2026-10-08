@@ -814,26 +814,13 @@ fn validate_entity_info_route(
     let cur = &route.current;
     let md = &route.modern;
 
-    let cur_url = Url::parse(&cur.endpoint).map_err(|e| EvidenceError::Malformed(e.to_string()))?;
-    let md_url = Url::parse(&md.endpoint).map_err(|e| EvidenceError::Malformed(e.to_string()))?;
-
-    if (cur_url.path() == "/" || cur_url.path().is_empty())
-        && (md_url.path() == "/" || md_url.path().is_empty())
-    {
-        actual_assertions.insert(AssertionId::GetEntityInfoWebsocketEndpointNoPath);
-    } else {
+    if cur.endpoint != "wss://203.0.113.10:28082/" || md.endpoint != "ws://203.0.113.10:28082/" {
         return Err(EvidenceError::Malformed(
-            "getEntityInfo endpoints must not have subpaths".to_owned(),
+            "getEntityInfo endpoints must match approved synthetic fixture".to_owned(),
         ));
     }
-
-    if cur_url.scheme() == "wss" && md_url.scheme() == "ws" {
-        actual_assertions.insert(AssertionId::GetEntityInfoCurrentIsWssAndModernIsWs);
-    } else {
-        return Err(EvidenceError::Malformed(
-            "getEntityInfo current must be wss and modern must be ws".to_owned(),
-        ));
-    }
+    actual_assertions.insert(AssertionId::GetEntityInfoWebsocketEndpointNoPath);
+    actual_assertions.insert(AssertionId::GetEntityInfoCurrentIsWssAndModernIsWs);
 
     if cur.method != "PROTOBUF_RPC" || md.method != "PROTOBUF_RPC" {
         return Err(EvidenceError::Malformed(
@@ -908,19 +895,16 @@ fn validate_alarm_route(
     let cur_url = Url::parse(&cur.endpoint).map_err(|e| EvidenceError::Malformed(e.to_string()))?;
     let md_url = Url::parse(&md.endpoint).map_err(|e| EvidenceError::Malformed(e.to_string()))?;
 
+    if cur.endpoint != "wss://203.0.113.10:28082/" || md.endpoint != "ws://203.0.113.10:28082/" {
+        return Err(EvidenceError::Malformed(
+            "Alarm endpoints must match approved synthetic fixture".to_owned(),
+        ));
+    }
     if cur_url.scheme() == "wss" && md_url.scheme() == "ws" {
         actual_assertions.insert(AssertionId::AlarmCurrentIsWssAndModernIsWs);
     } else {
         return Err(EvidenceError::Malformed(
             "Alarm current must be wss and modern must be ws".to_owned(),
-        ));
-    }
-
-    if (cur_url.path() != "/" && !cur_url.path().is_empty())
-        || (md_url.path() != "/" && !md_url.path().is_empty())
-    {
-        return Err(EvidenceError::Malformed(
-            "Alarm endpoint must be wss/ws without subpath".to_owned(),
         ));
     }
 
