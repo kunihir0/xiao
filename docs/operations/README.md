@@ -47,6 +47,8 @@ and deployment files; this workflow does not modify `deploy/`.
 - [Credential rotation](credential-rotation.md)
 - [Alert triage and incident evidence](alert-triage.md)
 - [Deployment smoke procedure](smoke.md)
+- [Live foundation acceptance](live-foundation.md)
+
 
 A backup policy is incomplete until restore is exercised. A release is
 incomplete if its database change prevents the documented application rollback
