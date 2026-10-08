@@ -243,6 +243,7 @@ done
 if [[ -z "$discord_env_file" ]]; then
   [[ -z "${DISCORD_TOKEN:-}" ]] || fail 'DISCORD_TOKEN must not be set directly; use DISCORD_TOKEN_FILE'
 fi
+[[ -z "${DATABASE_URL_CONTAINER_FILE:-}" ]] || fail 'DATABASE_URL_CONTAINER_FILE is harness-generated only'
 
 # Secret files validation for preflight
 secret_files=()
@@ -804,7 +805,6 @@ bot_env_args=(
   --env DATABASE_CA_FILE=/run/secrets/database_ca
   --env DATABASE_TLS_MODE=verify-full
   --env DATABASE_MIGRATE_ON_STARTUP=false
-  --env RUST_LOG=info
 )
 
 secret_owner_uid=$(stat -f '%u' "$DATABASE_CA_FILE" 2>/dev/null || stat -c '%u' "$DATABASE_CA_FILE")
@@ -819,6 +819,7 @@ for mounted_secret in "$DATABASE_URL_FILE" "$DATABASE_CA_FILE"; do
 done
 runtime_uid=$secret_owner_uid
 runtime_gid=$secret_owner_gid
+docker_args=(docker run -d --name "$container_name" --user "$runtime_uid:$runtime_gid" --cap-drop=ALL --security-opt=no-new-privileges --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --add-host=host.docker.internal:host-gateway "${bot_env_args[@]}")
 if [[ "$(docker image inspect --format '{{.Config.User}}' "$image")" != "10001:10001" ]]; then
   fail 'reviewed image must declare fixed non-root user 10001:10001'
 fi
