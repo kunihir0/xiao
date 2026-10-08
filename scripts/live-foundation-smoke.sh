@@ -770,19 +770,16 @@ guild_ping_created=$(printf '%s\n' "$acceptance_out" | sed -n 's/.*"guild_ping_c
 
 record discord-identity pass "app_id=$discovered_app_id bot_user=$discovered_bot_user guild_id=$guild_id guild_name=$discovered_guild_name"
 record discord-error-path pass 'invalid command query returned expected not-found error'
-record global-ping-registration pass 'global command list contains exactly one /ping'
 record guild-ping-registration pass 'guild command list contains exactly one /ping without bulk overwrite'
 
 # Run bot container
 bot_env_args=(
   --mount "type=bind,src=${DATABASE_URL_CONTAINER_FILE:-$DATABASE_URL_FILE},dst=/run/secrets/database_url,readonly"
-  --mount "type=bind,src=$DATABASE_CA_FILE,dst=/run/secrets/database_ca,readonly"
   --env DATABASE_URL_FILE=/run/secrets/database_url
   --env DATABASE_CA_FILE=/run/secrets/database_ca
   --env DATABASE_TLS_MODE=verify-full
   --env DATABASE_MIGRATE_ON_STARTUP=false
   --env RUST_LOG=info
-  --env TELEMETRY_FORMAT=json
 )
 
 docker_args=(docker run -d --name "$container_name" --user "$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --add-host=host.docker.internal:host-gateway "${bot_env_args[@]}")
@@ -862,6 +859,7 @@ printf '%s\n' "$ready_inspect" | grep -Fq '"global_ping_count":1' \
 printf '%s\n' "$ready_inspect" | grep -Fq '"guild_ping_count":1' \
   || fail 'running bot did not expose exactly one guild /ping command'
 record command-lists-ready pass 'running bot command lists contain exactly one global and guild /ping'
+record global-ping-registration pass 'running bot global command list contains exactly one /ping'
 
 # Discord cannot be invoked through the approved management APIs. Keep the
 # gateway process alive while the operator confirms both command invocations.
@@ -921,7 +919,10 @@ inspect_opts=(discord-acceptance --guild-id "$guild_id" --action inspect)
 if [[ -n "$discord_env_file" ]]; then
   inspect_opts+=(--env-file "$discord_env_file")
 fi
-restart_inspect=$("$bot_bin" "${inspect_opts[@]}")
+if ! restart_inspect=$("$bot_bin" "${inspect_opts[@]}"); then
+  record duplicate-registration fail 'restart command inspection request failed'
+  fail 'restart command inspection failed'
+fi
 printf '%s\n' "$restart_inspect" | grep -Fq '"global_ping_count":1' || fail 'restart produced duplicate global /ping commands'
 printf '%s\n' "$restart_inspect" | grep -Fq '"guild_ping_count":1' || fail 'restart changed guild /ping command count'
 record duplicate-registration pass 'restart preserved exactly one global and guild /ping command'
@@ -934,7 +935,6 @@ if [[ "$guild_ping_created" == "true" && -n "$created_guild_ping_id" && "$create
   fi
   "$bot_bin" "${clean_opts[@]}" >/dev/null 2>&1 || true
 fi
-
 # Stop restarted container and remove its credential-bearing mounts.
 docker stop --time 30 "$container_name" >/dev/null
 container_started=false
