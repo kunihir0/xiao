@@ -775,6 +775,7 @@ record guild-ping-registration pass 'guild command list contains exactly one /pi
 # Run bot container
 bot_env_args=(
   --mount "type=bind,src=${DATABASE_URL_CONTAINER_FILE:-$DATABASE_URL_FILE},dst=/run/secrets/database_url,readonly"
+  --mount "type=bind,src=$DATABASE_CA_FILE,dst=/run/secrets/database_ca,readonly"
   --env DATABASE_URL_FILE=/run/secrets/database_url
   --env DATABASE_CA_FILE=/run/secrets/database_ca
   --env DATABASE_TLS_MODE=verify-full
