@@ -238,20 +238,41 @@ fn validate_input(input: &Input) -> Result<(), EvidenceError> {
         }
     }
     for route in &input.routes {
-        if route.name.is_empty() || route.expected_assertions.is_empty() {
+        if route.name.is_empty()
+            || route.current_source.is_empty()
+            || route.modern_source.is_empty()
+            || route.expected_assertions.is_empty()
+        {
             return Err(EvidenceError::Malformed(
-                "route name and assertions are required".to_owned(),
+                "route names, provenance, and assertions are required".to_owned(),
             ));
+        }
+        scan_value(
+            &Value::String(route.current_source.clone()),
+            &format!("{}.current_source", route.name),
+        )?;
+        scan_value(
+            &Value::String(route.modern_source.clone()),
+            &format!("{}.modern_source", route.name),
+        )?;
+        for assertion in &route.expected_assertions {
+            scan_value(
+                &Value::String(assertion.clone()),
+                &format!("{}.expected_assertion", route.name),
+            )?;
         }
         validate_contract(&route.current, &route.name)?;
         validate_contract(&route.modern, &route.name)?;
+        validate_route_semantics(route)?;
     }
     Ok(())
 }
 
 fn validate_contract(contract: &Contract, route: &str) -> Result<(), EvidenceError> {
-    if !matches!(contract.method.as_str(), "GET" | "POST" | "PUT")
-        || !(contract.endpoint.starts_with("https://") || contract.endpoint.starts_with("wss://"))
+    if !matches!(
+        contract.method.as_str(),
+        "GET" | "POST" | "PUT" | "TCP+TLS" | "APP_DATA" | "PROTOBUF"
+    ) || !valid_endpoint(&contract.endpoint)
     {
         return Err(EvidenceError::Malformed(format!(
             "invalid endpoint or method for {route}"
@@ -270,6 +291,91 @@ fn validate_contract(contract: &Contract, route: &str) -> Result<(), EvidenceErr
     scan_value(&Value::Object(contract.headers.clone()), route)?;
     scan_value(&contract.payload, route)?;
     scan_value(&contract.response, route)?;
+    Ok(())
+}
+
+fn valid_endpoint(endpoint: &str) -> bool {
+    !endpoint.is_empty()
+        && endpoint.chars().all(|character| !character.is_control())
+        && !endpoint.contains(['?', '#', '@', ' '])
+        && (endpoint.starts_with("https://")
+            || endpoint.starts_with("wss://")
+            || endpoint.starts_with("tcp+tls://")
+            || endpoint.starts_with("fcm://"))
+        && endpoint
+            .split_once("://")
+            .is_some_and(|(_, authority)| !authority.is_empty())
+}
+
+fn validate_route_semantics(route: &Route) -> Result<(), EvidenceError> {
+    let current = &route.current;
+    let modern = &route.modern;
+    match route.name.as_str() {
+        "enrollment" => {
+            if !current.endpoint.ends_with("/c2dm/register3")
+                || current.method != "POST"
+                || !modern
+                    .endpoint
+                    .contains("firebaseinstallations.googleapis.com")
+            {
+                return Err(EvidenceError::Malformed(
+                    "enrollment route shape is not source-grounded".to_owned(),
+                ));
+            }
+        }
+        "mcs_readiness" => {
+            for contract in [current, modern] {
+                if contract.endpoint != "tcp+tls://mtalk.google.com:5228"
+                    || contract.method != "TCP+TLS"
+                    || contract.payload["protocol_version"] != 41
+                    || contract.response["ready"] != true
+                {
+                    return Err(EvidenceError::Malformed(
+                        "MCS readiness contract invariant failed".to_owned(),
+                    ));
+                }
+            }
+        }
+        "pairing" => {
+            for contract in [current, modern] {
+                if contract.endpoint != "fcm://notification/app-data"
+                    || contract.method != "APP_DATA"
+                    || contract.payload["key"] != "pairing"
+                    || contract.response["paired"] != true
+                {
+                    return Err(EvidenceError::Malformed(
+                        "pairing notification contract invariant failed".to_owned(),
+                    ));
+                }
+            }
+        }
+        "getEntityInfo" => {
+            for contract in [current, modern] {
+                if contract.payload["getEntityInfo"] != Value::Object(Map::new())
+                    || contract.response["entityInfo"]["type"] != 2
+                    || contract.response["entityInfo"]["payload"]["value"] != false
+                {
+                    return Err(EvidenceError::Malformed(
+                        "getEntityInfo Alarm baseline invariant failed".to_owned(),
+                    ));
+                }
+            }
+        }
+        "alarm_2_false" | "alarm_2_true" => {
+            let expected = route.name == "alarm_2_true";
+            for contract in [current, modern] {
+                if contract.payload["setEntityValue"]["value"] != expected
+                    || contract.response["broadcast"]["entityChanged"]["payload"]["value"]
+                        != expected
+                {
+                    return Err(EvidenceError::Malformed(
+                        "Alarm=2 transition invariant failed".to_owned(),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -321,6 +427,9 @@ fn scan_value(value: &Value, path: &str) -> Result<(), EvidenceError> {
                 || lower.contains("authorization:")
             {
                 return Err(EvidenceError::Secret(path.to_owned()));
+            }
+            if let Ok(nested) = serde_json::from_str::<Value>(text) {
+                scan_value(&nested, &format!("{path}.json"))?;
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -383,6 +492,20 @@ mod tests {
         value["routes"][0]["current"]["headers"]["authorization"] =
             Value::String("Bearer synthetic-secret".to_owned());
         let error = render(&value.to_string()).expect_err("authorization must be redacted");
+        assert!(matches!(error, EvidenceError::Secret(_)));
+    }
+
+    #[test]
+    fn provenance_and_assertions_are_scanned_for_secrets() {
+        let mut value: Value = serde_json::from_str(FIXTURE).expect("fixture JSON");
+        value["routes"][0]["current_source"] = Value::String("Bearer synthetic-secret".to_owned());
+        let error = render(&value.to_string()).expect_err("provenance must be scanned");
+        assert!(matches!(error, EvidenceError::Secret(_)));
+
+        value["routes"][0]["current_source"] = Value::String("current@synthetic".to_owned());
+        value["routes"][0]["expected_assertions"][0] =
+            Value::String("password=synthetic-secret".to_owned());
+        let error = render(&value.to_string()).expect_err("assertions must be scanned");
         assert!(matches!(error, EvidenceError::Secret(_)));
     }
 
