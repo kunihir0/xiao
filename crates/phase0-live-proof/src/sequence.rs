@@ -116,7 +116,9 @@ pub fn is_blocking_failure(stage: Stage, status: Status) -> bool {
 /// at the first blocking failure with a `no-go` row. The verdict is GO only
 /// if every required stage passed: a failed `session-product-route` lets the
 /// run continue for evidence but ends it with a `no-go` row and
-/// `Verdict::NoGo`.
+/// `Verdict::NoGo`. After an early stop the `no-go` row is written first,
+/// then a best-effort `teardown` row, so the NO-GO evidence never waits on
+/// cleanup or the operator.
 pub async fn run_sequence<E: StageExecutor, S: RowSink>(
     executor: &mut E,
     sink: &mut S,
@@ -152,6 +154,11 @@ async fn drive<E: StageExecutor, S: RowSink>(
         }
         if is_blocking_failure(stage, outcome.status) {
             write_no_go(sink, stage, index, run_start)?;
+            if stage != Stage::Teardown {
+                // The NO-GO row is already durable; teardown is best effort
+                // and its status never changes the verdict.
+                record_teardown(executor, sink, run_start).await?;
+            }
             return Ok(Verdict::NoGo { failed: stage });
         }
     }
@@ -160,6 +167,27 @@ async fn drive<E: StageExecutor, S: RowSink>(
         return Ok(Verdict::NoGo { failed: stage });
     }
     Ok(Verdict::Go)
+}
+
+/// Runs the teardown stage after an early stop so every outcome, GO or
+/// NO-GO, ends with exactly one `teardown` row.
+async fn record_teardown<E: StageExecutor, S: RowSink>(
+    executor: &mut E,
+    sink: &mut S,
+    run_start: Instant,
+) -> Result<(), ManifestError> {
+    let started_at = SystemTime::now();
+    tracing::debug!(stage = Stage::Teardown.as_str(), "stage start");
+    let outcome = executor.execute(Stage::Teardown).await;
+    let ended_at = SystemTime::now();
+    tracing::debug!(stage = Stage::Teardown.as_str(), status = ?outcome.status, "stage end");
+    sink.append(&row_for(
+        Stage::Teardown,
+        &outcome,
+        started_at,
+        ended_at,
+        run_start,
+    ))
 }
 
 fn write_no_go<S: RowSink>(
@@ -315,11 +343,22 @@ mod tests {
                 Stage::EnrollCompanion,
                 Stage::McsReady,
                 Stage::Pairing,
-                Stage::NoGo
+                Stage::NoGo,
+                Stage::Teardown
             ]
         );
-        assert_eq!(executor.executed.last(), Some(&Stage::Pairing));
-        let no_go = rows.last().expect("no-go row");
+        assert_eq!(
+            executor.executed,
+            [
+                Stage::EnrollFcm,
+                Stage::EnrollCompanion,
+                Stage::McsReady,
+                Stage::Pairing,
+                Stage::Teardown
+            ]
+        );
+        let no_go = &rows[4];
+        assert_eq!(no_go.stage, Stage::NoGo);
         assert_eq!(no_go.status, Status::Fail);
         assert_eq!(no_go.status_class, StatusClass::RequiredStageFailed);
         assert_eq!(
@@ -327,6 +366,151 @@ mod tests {
             correlation_hash("no-go", 0, "pairing", 3)
         );
         assert_eq!(executor.finished, 1, "cleanup runs on NO-GO");
+    }
+
+    fn teardown_rows(rows: &[ManifestRow]) -> Vec<&ManifestRow> {
+        rows.iter()
+            .filter(|row| row.stage == Stage::Teardown)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn teardown_row_is_recorded_after_go() {
+        let mut executor = Scripted::passing();
+        let mut rows = Vec::new();
+        let verdict = run_sequence(&mut executor, &mut rows).await.expect("run");
+        assert_eq!(verdict, Verdict::Go);
+        let teardown = teardown_rows(&rows);
+        assert_eq!(teardown.len(), 1);
+        assert_eq!(teardown[0].status, Status::Pass);
+        assert_eq!(rows.last().map(|row| row.stage), Some(Stage::Teardown));
+    }
+
+    #[tokio::test]
+    async fn teardown_row_is_recorded_after_no_go_at_stage_3() {
+        let mut executor = Scripted::passing().with(
+            Stage::McsReady,
+            StageOutcome::fail(Route::McsPush, StatusClass::Timeout, "mcs_ready_timeout"),
+        );
+        let mut rows = Vec::new();
+        let verdict = run_sequence(&mut executor, &mut rows).await.expect("run");
+        assert_eq!(
+            verdict,
+            Verdict::NoGo {
+                failed: Stage::McsReady
+            }
+        );
+        assert_eq!(
+            stages(&rows),
+            [
+                Stage::EnrollFcm,
+                Stage::EnrollCompanion,
+                Stage::McsReady,
+                Stage::NoGo,
+                Stage::Teardown
+            ]
+        );
+        assert_eq!(executor.executed.last(), Some(&Stage::Teardown));
+        assert_eq!(executor.finished, 1);
+    }
+
+    #[tokio::test]
+    async fn teardown_row_is_recorded_after_no_go_at_stage_6() {
+        let mut executor = Scripted::passing()
+            .with(
+                Stage::SessionProductRoute,
+                StageOutcome::fail(Route::RustplusWssProduct, StatusClass::Transport, "x"),
+            )
+            .with(
+                Stage::SessionWsCompare,
+                StageOutcome::fail(
+                    Route::RustplusWsDirectNonproduct,
+                    StatusClass::InvalidEndpoint,
+                    "y",
+                ),
+            );
+        let mut rows = Vec::new();
+        let verdict = run_sequence(&mut executor, &mut rows).await.expect("run");
+        assert_eq!(
+            verdict,
+            Verdict::NoGo {
+                failed: Stage::SessionWsCompare
+            }
+        );
+        assert_eq!(teardown_rows(&rows).len(), 1);
+        assert_eq!(
+            stages(&rows),
+            [
+                Stage::EnrollFcm,
+                Stage::EnrollCompanion,
+                Stage::McsReady,
+                Stage::Pairing,
+                Stage::SessionProductRoute,
+                Stage::SessionWsCompare,
+                Stage::NoGo,
+                Stage::Teardown
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_teardown_after_no_go_keeps_verdict_and_records_failure() {
+        let mut executor = Scripted::passing()
+            .with(
+                Stage::Pairing,
+                StageOutcome::fail(Route::McsPush, StatusClass::Timeout, "pairing_timeout"),
+            )
+            .with(
+                Stage::Teardown,
+                StageOutcome::fail(
+                    Route::Local,
+                    StatusClass::HumanResetUnconfirmed,
+                    "human_reset_unconfirmed",
+                ),
+            );
+        let mut rows = Vec::new();
+        let verdict = run_sequence(&mut executor, &mut rows).await.expect("run");
+        assert_eq!(
+            verdict,
+            Verdict::NoGo {
+                failed: Stage::Pairing
+            }
+        );
+        let teardown = teardown_rows(&rows);
+        assert_eq!(teardown.len(), 1);
+        assert_eq!(teardown[0].status, Status::Fail);
+        assert_eq!(teardown[0].status_class, StatusClass::HumanResetUnconfirmed);
+        assert_eq!(rows.iter().filter(|r| r.stage == Stage::NoGo).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_teardown_after_all_stages_passed_is_no_go_without_second_teardown() {
+        let mut executor = Scripted::passing().with(
+            Stage::Teardown,
+            StageOutcome::fail(
+                Route::Local,
+                StatusClass::HumanResetUnconfirmed,
+                "human_reset_unconfirmed",
+            ),
+        );
+        let mut rows = Vec::new();
+        let verdict = run_sequence(&mut executor, &mut rows).await.expect("run");
+        assert_eq!(
+            verdict,
+            Verdict::NoGo {
+                failed: Stage::Teardown
+            }
+        );
+        assert_eq!(teardown_rows(&rows).len(), 1);
+        assert_eq!(rows.last().map(|row| row.stage), Some(Stage::NoGo));
+        assert_eq!(
+            executor
+                .executed
+                .iter()
+                .filter(|stage| **stage == Stage::Teardown)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -390,7 +574,8 @@ mod tests {
                 failed: Stage::SessionWsCompare
             }
         );
-        assert_eq!(rows.last().map(|row| row.stage), Some(Stage::NoGo));
+        assert_eq!(rows.last().map(|row| row.stage), Some(Stage::Teardown));
+        assert_eq!(rows[rows.len() - 2].stage, Stage::NoGo);
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::ExitCode,
+    time::Duration,
 };
 
 use tokio_util::sync::CancellationToken;
@@ -79,9 +80,10 @@ async fn execute<E: StageExecutor, S: RowSink>(executor: &mut E, sink: &mut S) -
     exit_code(run_sequence(executor, sink).await)
 }
 
-/// Validates the Steam token file first, so an unusable token can never
-/// waste the irreversible FCM enrollment, then creates the evidence
-/// directory and runs the stages.
+/// Validates the Steam token file locally first (a malformed file never
+/// reaches the irreversible FCM enrollment; token acceptance is proven only
+/// by Facepunch later), then creates the evidence directory and runs the
+/// stages.
 async fn run_gated<E: StageExecutor>(
     token_file: PathBuf,
     evidence_dir: &Path,
@@ -132,7 +134,9 @@ fn run_live(config: RunConfig) -> u8 {
         interrupt.abort();
         code
     });
-    drop(runtime);
+    // A timed-out stdin read leaves a blocking thread parked on stdin;
+    // do not let it hold the process open once the run is finished.
+    runtime.shutdown_timeout(Duration::from_secs(2));
     code
 }
 
@@ -262,8 +266,16 @@ mod tests {
         };
         let mut rows: Vec<ManifestRow> = Vec::new();
         assert_eq!(execute(&mut executor, &mut rows).await, 70);
-        let last = rows.last().expect("rows");
-        assert_eq!((last.stage, last.status), (Stage::NoGo, Status::Fail));
+        let tail: Vec<_> = rows
+            .iter()
+            .rev()
+            .take(2)
+            .map(|row| (row.stage, row.status))
+            .collect();
+        assert_eq!(
+            tail,
+            [(Stage::Teardown, Status::Pass), (Stage::NoGo, Status::Fail)]
+        );
         assert!(executor.finished);
     }
 

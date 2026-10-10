@@ -27,7 +27,10 @@ use crate::{
     classify::{
         Failure, classify_client, classify_registration, classify_session, negative_auth_outcome,
     },
-    helpers::{PairingFilter, TempFileGuard, await_pairing, bounded, query_alarm, wait_for_alarm},
+    helpers::{
+        HUMAN_RESET_PROMPT, PairingFilter, ResetConfirmation, TempFileGuard, await_pairing,
+        bounded, query_alarm, read_reset_confirmation, teardown_outcome, wait_for_alarm,
+    },
     manifest::{Correlation, Route, Stage, Status, StatusClass, seconds_of_day_utc},
     receipt::{RECEIPT_WINDOW_SECONDS, parse_time_of_day, within_window},
     sequence::{StageExecutor, StageOutcome},
@@ -698,21 +701,31 @@ impl LiveExecutor {
         }
     }
 
+    /// Prints the fixed reset prompt and waits, bounded, for Enter. Timeout,
+    /// operator interrupt, end-of-input, and read errors are all
+    /// `Unconfirmed`; none of them is recorded beyond that enum.
+    async fn confirm_human_reset(&self) -> ResetConfirmation {
+        println!("{HUMAN_RESET_PROMPT}");
+        std::io::stdout().flush().ok();
+        let read = tokio::task::spawn_blocking(|| read_reset_confirmation(std::io::stdin().lock()));
+        match bounded(&self.cancel, HUMAN_INPUT_TIMEOUT, read).await {
+            Ok(Ok(confirmation)) => confirmation,
+            Ok(Err(_)) | Err(_) => ResetConfirmation::Unconfirmed,
+        }
+    }
+
     // 13
+    /// Local cleanup runs before the prompt so tokens and temp files are gone
+    /// even if the operator never answers or the process is killed while
+    /// waiting.
     async fn teardown(&mut self) -> StageOutcome {
         self.fcm = None;
         self.registrar = None;
         self.pairing = None;
         let files_clean = self.remove_temp_files();
         let session_clean = self.release_session().await;
-        if files_clean && session_clean {
-            StageOutcome::pass(
-                Route::Local,
-                "teardown_clean_facepunch_unregister_unsupported",
-            )
-        } else {
-            Failure::new(StatusClass::Internal, "teardown_incomplete").outcome(Route::Local)
-        }
+        let confirmation = self.confirm_human_reset().await;
+        teardown_outcome(files_clean && session_clean, confirmation)
     }
 }
 

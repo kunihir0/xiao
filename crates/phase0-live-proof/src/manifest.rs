@@ -138,6 +138,7 @@ pub enum StatusClass {
     NotApplicable,
     RequiredStageFailed,
     EventsLagged,
+    HumanResetUnconfirmed,
     Internal,
 }
 
