@@ -12,7 +12,8 @@ workspace = true
 [dependencies]
 bot-application = { version = "0.1.0", path = "../application" }
 push-receiver = { version = "0.1.0", path = "../push-receiver" }
-rustix = { version = "1.1.5", features = ["event", "stdio"] }
+rand.workspace = true
+rustix = { version = "1.1.5", features = ["event", "stdio", "termios"] }
 rustplus-adapter = { version = "0.1.0", path = "../rustplus-adapter" }
 rustplus-client = { version = "0.1.0", path = "../rustplus-client", features = ["live-proof-plaintext"] }
 serde.workspace = true

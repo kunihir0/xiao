@@ -1,7 +1,7 @@
 //! Live stage executor.
 //!
 //! Every function here talks to real services (FCM, Expo, Facepunch, MCS, a
-//! Rust+ server) and is reachable only from `run` after the approval gate in
+//! Rust+ server) and is reachable only from `run` after the one-time confirmation gate in
 //! `main`. No test calls into this module's network paths.
 
 use std::{

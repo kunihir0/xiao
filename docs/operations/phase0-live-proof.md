@@ -5,36 +5,55 @@ services, the FCM/MCS push → pairing → Rust+ session → entity-event chain.
 is isolated from the bot: no Discord, no database.
 
 **Running it contacts FCM, Expo, Facepunch, MCS, and a Rust+ server. Run it
-only after human approval.** CI and unit tests never run it.
+only after human approval, confirmed interactively at a terminal.** CI and
+unit tests never run it.
 
 ```sh
 cargo run -p phase0-live-proof -- run \
   --evidence-dir /secure/path/p23-evidence \
   --fcm-sender-id <ID> --steam-id <U64> \
-  --steam-token-file /secure/path/steam-token \
-  --approved-run-id phase0-23-<8 lowercase hex>
+  --steam-token-file /secure/path/steam-token
 ```
 
-## Approval gate
+## Confirmation gate
 
-The approval id is supplied by the human who approved the run. The harness
-only checks its format (`phase0-23-` plus eight lowercase hex digits); it
-cannot know whether a human really approved. **An agent or script must never
-invent or derive an approval id.**
+**Run the binary yourself, in your own interactive terminal.** Before the live
+run starts, the harness prints
+
+```
+Type this one-time code to start the live run (real FCM enrollment and Facepunch registration will follow): <CODE>
+```
+
+and reads one line from the terminal, waiting up to 5 minutes. `<CODE>` is
+eight random characters from an unambiguous uppercase alphabet (no `0`, `O`,
+`1`, or `I`), fresh for every run, shown and typed once. It must be typed back
+exactly (case-sensitive; only the final newline is ignored).
+
+Stdin and stdout must both be terminals (so the code never lands in a file
+or pipe). A pipe, redirect, script, or any agent without a
+terminal is refused, so **an agent cannot confirm a run; only a human at the
+keyboard can.** There is no flag or environment variable that approves a run.
+
+Anything other than the exact code refuses with exit 77 and a fixed message:
+not a terminal, a wrong code, end of input, an unterminated line, a timeout,
+Ctrl-C, or a read error. The program never echoes the typed text back, and the code is
+never written to the manifest, a log, or any file.
 
 Gate order (all before any network access):
 
 | Condition | Exit |
 |---|---|
 | unknown, duplicate, missing, or malformed flag | 64 |
-| `--approved-run-id` not `phase0-23-<8 hex>` | 77 |
 | `--evidence-dir` exists (including a dangling symlink) or its parent is missing | 73 |
 | Steam token file unusable (missing, symlink, not owner-only, oversized, empty) | 66 |
+| one-time confirmation refused (see above) | 77 |
 | a required stage failed (NO-GO row written) | 70 |
 | every required stage passed (GO) | 0 |
 
-The Steam token file is validated locally *before* stage 1 and before the
-evidence directory is created: owner, mode, symlink, size, and non-empty. That
+The confirmation runs after the argument, evidence-directory, and token-file
+checks and before the evidence directory is created, so a refusal creates no
+files and contacts nothing. The Steam token file is validated locally *before*
+stage 1 and before the evidence directory is created: owner, mode, symlink, size, and non-empty. That
 only screens out an unusable file. Whether Facepunch accepts the token is
 proven solely by its response in `enroll-companion`, so a rejected token still
 leaves the irreversible FCM enrollment (stage 1) in place. The evidence

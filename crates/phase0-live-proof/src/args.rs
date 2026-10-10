@@ -13,10 +13,8 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub const USAGE: &str = "usage: phase0-live-proof run --evidence-dir DIR --fcm-sender-id ID \
---steam-id U64 --steam-token-file PATH --approved-run-id phase0-23-<8 hex>";
+--steam-id U64 --steam-token-file PATH";
 
-const APPROVAL_PREFIX: &str = "phase0-23-";
-const APPROVAL_HEX_LEN: usize = 8;
 const MAX_SENDER_ID_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
@@ -40,8 +38,6 @@ pub enum UsageError {
 /// Refusals raised after parsing but before any network or file creation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
 pub enum Refusal {
-    #[error("approved run id is not of the form phase0-23-<8 lowercase hex>")]
-    ApprovalFormat,
     #[error("evidence directory already exists")]
     EvidenceDirExists,
     #[error("evidence directory parent is not an existing directory")]
@@ -53,7 +49,6 @@ pub struct RunConfig {
     pub fcm_sender_id: Zeroizing<String>,
     pub steam_id: u64,
     pub steam_token_file: PathBuf,
-    approved_run_id: Zeroizing<String>,
 }
 
 /// Debug prints no values: every field is operator-supplied and some are
@@ -66,7 +61,6 @@ impl fmt::Debug for RunConfig {
             .field("fcm_sender_id", &"<redacted>")
             .field("steam_id", &"<redacted>")
             .field("steam_token_file", &"<redacted>")
-            .field("approved_run_id", &"<redacted>")
             .finish()
     }
 }
@@ -82,7 +76,6 @@ struct Collected {
     fcm_sender_id: Option<String>,
     steam_id: Option<u64>,
     steam_token_file: Option<PathBuf>,
-    approved_run_id: Option<String>,
 }
 
 fn set<T>(slot: &mut Option<T>, flag: &'static str, value: T) -> Result<(), UsageError> {
@@ -152,16 +145,6 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, U
                     PathBuf::from(value),
                 )?;
             }
-            "--approved-run-id" => {
-                let value = args
-                    .next()
-                    .ok_or(UsageError::MissingValue("approved-run-id"))?;
-                set(
-                    &mut collected.approved_run_id,
-                    "approved-run-id",
-                    utf8(value, "approved-run-id")?,
-                )?;
-            }
             _ => return Err(UsageError::UnknownFlag),
         }
     }
@@ -180,33 +163,13 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, U
         steam_token_file: collected
             .steam_token_file
             .ok_or(UsageError::MissingFlag("steam-token-file"))?,
-        approved_run_id: Zeroizing::new(
-            collected
-                .approved_run_id
-                .ok_or(UsageError::MissingFlag("approved-run-id"))?,
-        ),
     }))
 }
 
-/// `phase0-23-` followed by exactly eight lowercase hex digits.
-#[must_use]
-pub fn approval_format_is_valid(value: &str) -> bool {
-    value.strip_prefix(APPROVAL_PREFIX).is_some_and(|hex| {
-        hex.len() == APPROVAL_HEX_LEN
-            && hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    })
-}
-
 impl RunConfig {
-    /// Pre-network gate: the human approval string must be well formed and
-    /// the evidence directory must not exist yet (its parent must). Touches
-    /// nothing on disk.
+    /// Pre-network gate: the evidence directory must not exist yet (its
+    /// parent must). Touches nothing on disk.
     pub fn preflight(&self) -> Result<(), Refusal> {
-        if !approval_format_is_valid(&self.approved_run_id) {
-            return Err(Refusal::ApprovalFormat);
-        }
         preflight_evidence_dir(&self.evidence_dir)
     }
 }
@@ -236,7 +199,7 @@ mod tests {
         parts.iter().map(OsString::from).collect()
     }
 
-    const FULL: [&str; 11] = [
+    const FULL: [&str; 9] = [
         "run",
         "--evidence-dir",
         "/tmp/p23-unit-never-created",
@@ -246,8 +209,6 @@ mod tests {
         "76561198000000000",
         "--steam-token-file",
         "/nonexistent/token",
-        "--approved-run-id",
-        "phase0-23-0123abcd",
     ];
 
     fn parse(parts: &[&str]) -> Result<RunConfig, UsageError> {
@@ -287,7 +248,6 @@ mod tests {
             (3, "fcm-sender-id"),
             (5, "steam-id"),
             (7, "steam-token-file"),
-            (9, "approved-run-id"),
         ] {
             let mut parts = FULL.to_vec();
             parts.drain(index..=index + 1);
@@ -302,7 +262,6 @@ mod tests {
             (3, "fcm-sender-id"),
             (5, "steam-id"),
             (7, "steam-token-file"),
-            (9, "approved-run-id"),
         ] {
             let mut parts = FULL.to_vec();
             parts.extend_from_slice(&FULL[index..=index + 1]);
@@ -323,10 +282,10 @@ mod tests {
     #[test]
     fn flag_without_value_and_invalid_values_are_rejected() {
         let mut parts = FULL.to_vec();
-        parts.truncate(10);
+        parts.truncate(8);
         assert_eq!(
             parse(&parts).err(),
-            Some(UsageError::MissingValue("approved-run-id"))
+            Some(UsageError::MissingValue("steam-token-file"))
         );
         for (index, bad, name) in [
             (4, "", "fcm-sender-id"),
@@ -355,31 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn approval_format_is_strict() {
-        assert!(approval_format_is_valid("phase0-23-0123abcd"));
-        for bad in [
-            "",
-            "wrong",
-            "phase0-23-",
-            "phase0-23-0123abc",
-            "phase0-23-0123abcde",
-            "phase0-23-0123ABCD",
-            "phase0-23-0123abcg",
-            "phase0-22-0123abcd",
-            " phase0-23-0123abcd",
-            "phase0-23-0123abcd\n",
-        ] {
-            assert!(!approval_format_is_valid(bad), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn approval_mismatch_is_refused_before_touching_the_filesystem() {
+    fn approved_run_id_flag_is_gone() {
         let mut parts = FULL.to_vec();
-        parts[10] = "wrong";
-        let config = parse(&parts).expect("parse");
-        assert_eq!(config.preflight(), Err(Refusal::ApprovalFormat));
-        assert!(!Path::new("/tmp/p23-unit-never-created").exists());
+        parts.extend(["--approved-run-id", "phase0-23-0123abcd"]);
+        assert_eq!(parse(&parts).err(), Some(UsageError::UnknownFlag));
+        assert!(!USAGE.contains("approved"));
     }
 
     #[test]
@@ -431,7 +370,6 @@ mod tests {
             "123456",
             "76561198000000000",
             "/nonexistent/token",
-            "phase0-23-0123abcd",
         ] {
             assert!(!debug.contains(secret), "{secret}");
         }
