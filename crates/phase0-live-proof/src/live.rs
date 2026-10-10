@@ -29,7 +29,8 @@ use crate::{
     },
     helpers::{
         HUMAN_RESET_PROMPT, PairingFilter, ResetConfirmation, TempFileGuard, await_pairing,
-        bounded, query_alarm, read_reset_confirmation, teardown_outcome, wait_for_alarm,
+        bounded, discard_pending_input, query_alarm, read_reset_confirmation, teardown_outcome,
+        wait_for_alarm,
     },
     manifest::{Correlation, Route, Stage, Status, StatusClass, seconds_of_day_utc},
     receipt::{RECEIPT_WINDOW_SECONDS, parse_time_of_day, within_window},
@@ -701,13 +702,24 @@ impl LiveExecutor {
         }
     }
 
-    /// Prints the fixed reset prompt and waits, bounded, for Enter. Timeout,
-    /// operator interrupt, end-of-input, and read errors are all
-    /// `Unconfirmed`; none of them is recorded beyond that enum.
+    /// Discards waiting input, prints the fixed reset prompt, and waits,
+    /// bounded, for a newline-terminated line. Timeout, operator interrupt,
+    /// end-of-input, truncation, and read errors are all `Unconfirmed`; none
+    /// of them is recorded beyond that enum.
+    ///
+    /// Reads go through a duplicate of the stdin descriptor, never std's
+    /// shared buffered `Stdin`, so bytes buffered by an earlier prompt cannot
+    /// pre-confirm.
     async fn confirm_human_reset(&self) -> ResetConfirmation {
+        let Ok(duplicate) = rustix::io::dup(rustix::stdio::stdin()) else {
+            println!("{HUMAN_RESET_PROMPT}");
+            return ResetConfirmation::Unconfirmed;
+        };
+        let mut input = std::fs::File::from(duplicate);
+        discard_pending_input(&mut input);
         println!("{HUMAN_RESET_PROMPT}");
         std::io::stdout().flush().ok();
-        let read = tokio::task::spawn_blocking(|| read_reset_confirmation(std::io::stdin().lock()));
+        let read = tokio::task::spawn_blocking(move || read_reset_confirmation(input));
         match bounded(&self.cancel, HUMAN_INPUT_TIMEOUT, read).await {
             Ok(Ok(confirmation)) => confirmation,
             Ok(Err(_)) | Err(_) => ResetConfirmation::Unconfirmed,

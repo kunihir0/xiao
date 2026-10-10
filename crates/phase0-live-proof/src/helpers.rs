@@ -5,7 +5,8 @@
 use std::{
     fs::{File, OpenOptions},
     future::Future,
-    io::{self, BufRead},
+    io::{self, Read},
+    os::fd::AsFd,
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
     time::{Duration, SystemTime},
@@ -13,6 +14,7 @@ use std::{
 
 use bot_application::SteamAuthTokenSource;
 use push_receiver::ReceiverHandle;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustplus_adapter::{FileSteamAuthToken, Pairing, ParseConfig, parse_pairing_notification};
 use rustplus_client::{
     Event, EventReceiveError, EventReceiver, Request, Response, ResponsePayload, RustPlusClient,
@@ -26,7 +28,9 @@ use crate::{
     sequence::StageOutcome,
 };
 
-const MAX_CONFIRMATION_BYTES: u64 = 64;
+const MAX_CONFIRMATION_BYTES: usize = 64;
+const DRAIN_CHUNK_BYTES: usize = 256;
+const MAX_DRAIN_READS: usize = 64;
 
 pub const ALARM_ENTITY_TYPE: i32 = 2;
 
@@ -268,13 +272,46 @@ pub enum ResetConfirmation {
     Unconfirmed,
 }
 
-/// Reads at most one bounded line. Any line terminated by Enter (even an
-/// empty one) confirms; end-of-input or a read error does not.
-pub fn read_reset_confirmation(reader: impl BufRead) -> ResetConfirmation {
-    let mut line = Zeroizing::new(String::new());
-    match reader.take(MAX_CONFIRMATION_BYTES).read_line(&mut line) {
-        Ok(read) if read > 0 => ResetConfirmation::Confirmed,
-        _ => ResetConfirmation::Unconfirmed,
+/// Reads at most [`MAX_CONFIRMATION_BYTES`] and confirms only when Enter
+/// (a newline) arrives within them. End-of-input, a read error, an
+/// unterminated read, and a line longer than the cap are all unconfirmed.
+/// Call with an unbuffered reader so bytes buffered by an earlier read can
+/// never pre-confirm.
+pub fn read_reset_confirmation(mut reader: impl Read) -> ResetConfirmation {
+    let mut buf = Zeroizing::new([0u8; MAX_CONFIRMATION_BYTES]);
+    let mut filled = 0;
+    while let Some(window) = buf.get_mut(filled..).filter(|window| !window.is_empty()) {
+        match reader.read(window) {
+            Ok(0) => return ResetConfirmation::Unconfirmed,
+            Ok(read) => {
+                if window.get(..read).is_some_and(|got| got.contains(&b'\n')) {
+                    return ResetConfirmation::Confirmed;
+                }
+                filled += read;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return ResetConfirmation::Unconfirmed,
+        }
+    }
+    ResetConfirmation::Unconfirmed
+}
+
+/// Discards input that is already waiting (type-ahead or stale lines) without
+/// ever blocking, so it cannot answer a prompt printed afterwards. Bounded:
+/// a stream that never stops producing is abandoned after a fixed number of
+/// reads.
+pub fn discard_pending_input(input: &mut (impl Read + AsFd)) {
+    let mut scratch = Zeroizing::new([0u8; DRAIN_CHUNK_BYTES]);
+    for _ in 0..MAX_DRAIN_READS {
+        let mut fds = [PollFd::new(&*input, PollFlags::IN)];
+        let ready = poll(&mut fds, Some(&Timespec::default())).is_ok_and(|count| count > 0);
+        if !ready {
+            return;
+        }
+        match input.read(scratch.as_mut_slice()) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
     }
 }
 
@@ -721,7 +758,7 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod reset_tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
 
     use super::*;
     use crate::manifest::Status;
@@ -735,7 +772,7 @@ mod reset_tests {
     }
 
     #[test]
-    fn enter_confirms_even_with_empty_line() {
+    fn only_a_newline_terminated_line_confirms() {
         assert_eq!(
             read_reset_confirmation(Cursor::new(b"\n")),
             ResetConfirmation::Confirmed
@@ -751,6 +788,46 @@ mod reset_tests {
         assert_eq!(
             read_reset_confirmation(Cursor::new(b"")),
             ResetConfirmation::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn unterminated_read_does_not_confirm() {
+        assert_eq!(
+            read_reset_confirmation(Cursor::new(b"done")),
+            ResetConfirmation::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn truncated_over_long_line_does_not_confirm() {
+        let mut line = vec![b'a'; 100];
+        line.push(b'\n');
+        assert_eq!(
+            read_reset_confirmation(Cursor::new(line)),
+            ResetConfirmation::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn stale_pending_input_is_discarded_before_the_prompt() {
+        let (mut reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"stale\n").expect("write");
+        discard_pending_input(&mut reader);
+        // Nothing left to read but the writer is still open: draining must
+        // not have blocked, and a fresh Enter confirms.
+        writer.write_all(b"\n").expect("write");
+        assert_eq!(
+            read_reset_confirmation(&mut reader),
+            ResetConfirmation::Confirmed
+        );
+        writer.write_all(b"stale\n").expect("write");
+        discard_pending_input(&mut reader);
+        drop(writer);
+        assert_eq!(
+            read_reset_confirmation(&mut reader),
+            ResetConfirmation::Unconfirmed,
+            "a stale line must not pre-confirm"
         );
     }
 

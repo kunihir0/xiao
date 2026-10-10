@@ -56,13 +56,17 @@ route passes, `session-ws-compare` is `not_run`.
 
 `teardown` is recorded after every outcome. After an early stop the `no-go`
 row is written first, then a best-effort `teardown` row that never changes the
-verdict or exit code. Teardown removes local token and temp files, then prints
+verdict or exit code. Teardown removes only the synthetic `negative-auth` temp
+file and drops the in-memory credentials and sessions; **the harness never
+deletes the operator's Steam token file, which the operator must remove
+themselves.** It then discards any input already waiting on stdin, prints
 `HUMAN: reset the Smart Alarm and remove the test server pairing in game, then
-press Enter` (on one line) and waits up to 10 minutes for Enter. It passes only
-when cleanup succeeded and Enter was received; otherwise it fails, with status
-class `human_reset_unconfirmed` when there was no confirmation (timeout,
-interrupt, or end of input). Facepunch offers no unregister call, so the
-operator reset is the only way to clear the pairing.
+press Enter` (on one line), and waits up to 10 minutes for a line ended by
+Enter. It passes only when cleanup succeeded and that Enter was received.
+Otherwise it fails, with status class `human_reset_unconfirmed` when there was
+no confirmation: timeout, interrupt, end of input, an unterminated or
+over-long (truncated) read, or a read error. Facepunch offers no unregister
+call, so the operator reset is the only way to clear the pairing.
 
 ### Plaintext `ws://` downgrade (harness only)
 
