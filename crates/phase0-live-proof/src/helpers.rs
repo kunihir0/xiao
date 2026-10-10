@@ -8,13 +8,15 @@ use std::{
     io,
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use bot_application::SteamAuthTokenSource;
 use push_receiver::ReceiverHandle;
 use rustplus_adapter::{FileSteamAuthToken, Pairing, ParseConfig, parse_pairing_notification};
-use rustplus_client::{Request, Response, ResponsePayload, RustPlusClient};
+use rustplus_client::{
+    Event, EventReceiveError, EventReceiver, Request, Response, ResponsePayload, RustPlusClient,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -164,6 +166,59 @@ impl EntityProbe for RustPlusClient {
     async fn request(&self, request: Request) -> Result<Response, rustplus_client::Error> {
         self.send_request(request).await
     }
+}
+
+/// Source of Rust+ events; implemented by the real receiver and test fakes.
+pub trait AlarmEvents {
+    async fn next_event(&mut self) -> Result<Event, EventReceiveError>;
+}
+
+impl AlarmEvents for EventReceiver {
+    async fn next_event(&mut self) -> Result<Event, EventReceiveError> {
+        self.recv().await
+    }
+}
+
+/// Waits for the next `EntityChanged` of `entity_id` whose value is `value`;
+/// returns the number of entity events seen and the observation time.
+///
+/// Any lag fails the wait: a dropped event may be the one being proven, so a
+/// lagged stream cannot support the alarm proof (`events_lagged`).
+pub async fn wait_for_alarm<E: AlarmEvents>(
+    events: &mut E,
+    cancel: &CancellationToken,
+    limit: Duration,
+    entity_id: u32,
+    value: bool,
+) -> Result<(u64, SystemTime), Failure> {
+    let mut observed = 0_u64;
+    bounded(cancel, limit, async {
+        loop {
+            match events.next_event().await {
+                Ok(Event::EntityChanged {
+                    entity_id: changed,
+                    payload,
+                }) if changed == entity_id => {
+                    observed += 1;
+                    if payload.value == Some(value) {
+                        return Ok((observed, SystemTime::now()));
+                    }
+                }
+                Ok(_) => {}
+                Err(EventReceiveError::Lagged { .. }) => {
+                    return Err(Failure::new(
+                        StatusClass::EventsLagged,
+                        "alarm_events_lagged",
+                    ));
+                }
+                Err(EventReceiveError::Closed) => {
+                    return Err(Failure::new(StatusClass::Transport, "event_stream_closed"));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|interrupted| interrupted.failure("alarm_event_timeout"))?
 }
 
 /// Sends `EntityInfo(entity_id)` and requires an Alarm (`entity_type == 2`).
@@ -441,6 +496,88 @@ mod tests {
             Failure::new(StatusClass::Timeout, "pairing_timeout")
         );
         receiver.shutdown().await.expect("shutdown");
+    }
+
+    // --- alarm events ---
+
+    struct ScriptedEvents(std::collections::VecDeque<Result<Event, EventReceiveError>>);
+
+    impl AlarmEvents for ScriptedEvents {
+        async fn next_event(&mut self) -> Result<Event, EventReceiveError> {
+            match self.0.pop_front() {
+                Some(item) => item,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    fn changed(entity_id: u32, value: bool) -> Result<Event, EventReceiveError> {
+        Ok(Event::EntityChanged {
+            entity_id,
+            payload: EntityPayload {
+                value: Some(value),
+                items: Vec::new(),
+                capacity: None,
+                has_protection: None,
+                protection_expiry: None,
+            },
+        })
+    }
+
+    async fn wait(
+        script: Vec<Result<Event, EventReceiveError>>,
+        value: bool,
+    ) -> Result<u64, Failure> {
+        let mut events = ScriptedEvents(script.into());
+        wait_for_alarm(
+            &mut events,
+            &CancellationToken::new(),
+            Duration::from_millis(100),
+            7,
+            value,
+        )
+        .await
+        .map(|(observed, _)| observed)
+    }
+
+    #[tokio::test]
+    async fn alarm_wait_ignores_other_entities_and_wrong_values() {
+        let script = vec![changed(8, true), changed(7, false), changed(7, true)];
+        assert_eq!(wait(script, true).await, Ok(2));
+    }
+
+    #[tokio::test]
+    async fn any_lag_fails_the_alarm_wait_even_if_the_event_follows() {
+        for script in [
+            vec![
+                Err(EventReceiveError::Lagged { skipped: 3 }),
+                changed(7, true),
+            ],
+            vec![
+                changed(7, false),
+                Err(EventReceiveError::Lagged { skipped: 1 }),
+            ],
+        ] {
+            assert_eq!(
+                wait(script, true).await,
+                Err(Failure::new(
+                    StatusClass::EventsLagged,
+                    "alarm_events_lagged"
+                ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_stream_and_silence_fail_with_typed_classes() {
+        assert_eq!(
+            wait(vec![Err(EventReceiveError::Closed)], true).await,
+            Err(Failure::new(StatusClass::Transport, "event_stream_closed"))
+        );
+        assert_eq!(
+            wait(Vec::new(), true).await,
+            Err(Failure::new(StatusClass::Timeout, "alarm_event_timeout"))
+        );
     }
 
     // --- entity query ---

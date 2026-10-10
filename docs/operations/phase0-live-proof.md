@@ -51,14 +51,37 @@ stopping: the run continues so `session-ws-compare` can gather comparison
 evidence, but the run ends with a `no-go` row and exit 70. If the product
 route passes, `session-ws-compare` is `not_run`.
 
-### Route limits: NO-GO is a possible, honest outcome
+### Plaintext `ws://` downgrade (harness only)
 
-The product route is `wss://` only. `rustplus-client` accepts `ws://` only for
-loopback hosts, even with `insecure-test-transport`. A public Rust+ server
-that speaks only `ws://` therefore fails both routes: the product route fails
-and the ws comparison records `invalid_endpoint` before any I/O, giving
-NO-GO. The harness does not weaken that endpoint validation; any change to it
-is a maintainer decision outside this harness.
+The product route is `wss://` only. Rust+ servers commonly speak plain
+`ws://`, so `session-ws-compare` deliberately downgrades: it connects with
+`ClientConfig::allow_plaintext_public_for_live_proof()`, which permits `ws://`
+to the validated public pairing address.
+
+**Warning: the player token and all Rust+ traffic travel in cleartext to that
+public IP.** Use only test accounts and test servers you control; never a
+real player account or token you care about.
+
+Guard rails:
+
+- The method exists only under the `live-proof-plaintext` Cargo feature of
+  `rustplus-client`, which only `phase0-live-proof` enables. Default builds
+  and every other crate keep the existing rules (`wss://` required; `ws://`
+  loopback-only under `insecure-test-transport`). Release builds use
+  `cargo build -p bot`, which does not enable the feature
+  (`cargo tree -p bot -e features` shows no `live-proof-plaintext`). A
+  `--workspace` build does unify the feature into the workspace's
+  `rustplus-client`; that is a dev/CI build only and never the release
+  artifact.
+- The opt-in is per config and the only call is in the stage-6 route builder;
+  later stages (and the restart reconnect) reuse that route only when stage 6
+  passed. Only `ws://` is widened: other schemes are still refused.
+- The pairing address comes from the push-notification parser, which accepts
+  only public IP literals (special-use ranges are rejected).
+- `ClientConfig` debug output redacts the player token.
+
+If the server is unreachable over plaintext too, both routes fail and the run
+is NO-GO.
 
 ### Behaviour notes
 
@@ -73,13 +96,14 @@ is a maintainer decision outside this harness.
 - `restart-reconnect` rebuilds the receiver from the snapshot, reconnects the
   client, re-sends `EntityInfo` and requires an Alarm, and only then awaits
   the alarm events again.
-- If the event stream lags, a non-blocking `event-lag` row records that
-  events were skipped (the count appears only inside the correlation hash).
+- Any receiver lag while waiting for an alarm event fails that alarm stage
+  (`events_lagged`, NO-GO): a dropped event may be the one being proven, so a
+  lagged stream cannot support the Alarm proof, and GO requires no lag.
 - `negative-auth` registers with a synthetic invalid token held in a
   self-deleting temp file. It passes only on a Facepunch 401/403
-  (`reenrollment_required`) or another explicit Facepunch 4xx rejection.
-  Expo or other-service rejections, Facepunch 5xx, success, throttling, and
-  transport errors fail with a distinct class.
+  (`reenrollment_required`) or a Facepunch 400/422 rejection. Any other
+  Facepunch status, Expo or other-service rejections, success, throttling,
+  and transport errors fail (`unrelated_rejection` for service rejections).
 
 ## Manifest
 

@@ -2417,6 +2417,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rand 0.10.3",
  "rustls",
+ "rustplus-client",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.30.0",

@@ -105,11 +105,11 @@ pub fn classify_client(error: &rustplus_client::Error) -> Failure {
 /// synthetic, invalid Steam token.
 ///
 /// Only a rejection that can be attributed to Facepunch's validation of the
-/// Steam token passes: 401/403 (`reenrollment_required`) or another explicit
-/// Facepunch 4xx rejection (400-class, excluding 429 which is mapped to
-/// `RateLimited`). Expo or any other service rejecting, Facepunch 5xx,
-/// success, throttling, and transport errors prove nothing about token
-/// validation and fail the stage.
+/// Steam token or request passes: 401/403 (`reenrollment_required`) or
+/// Facepunch 400/422. Any other Facepunch status (404, 409, other 4xx, 5xx),
+/// Expo or any other service rejecting, success, throttling, and transport
+/// errors prove nothing about token validation and fail the stage
+/// (`unrelated_rejection` where a service rejected).
 #[must_use]
 pub fn negative_auth_outcome(result: Result<(), &RegistrationError>) -> StageOutcome {
     const ROUTE: Route = Route::FacepunchRegister;
@@ -120,7 +120,7 @@ pub fn negative_auth_outcome(result: Result<(), &RegistrationError>) -> StageOut
         }
         Err(RegistrationError::Rejected {
             service: "facepunch",
-            status: 400..=499,
+            status: 400 | 422,
         }) => StageOutcome::pass(ROUTE, "invalid_token_typed_rejection_expiry_not_run")
             .with_status_class(StatusClass::Rejected),
         Err(RegistrationError::Rejected { .. }) => StageOutcome::fail(
@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(reenroll.status, Status::Pass);
         assert_eq!(reenroll.status_class, StatusClass::ReenrollmentRequired);
 
-        for status in [400, 404, 422, 499] {
+        for status in [400, 422] {
             let outcome = negative_auth_outcome(Err(&rejected("facepunch", status)));
             assert_eq!(outcome.status, Status::Pass, "{status}");
             assert_eq!(outcome.status_class, StatusClass::Rejected);
@@ -195,6 +195,10 @@ mod tests {
             rejected("facepunch", 500),
             rejected("facepunch", 503),
             rejected("facepunch", 399),
+            rejected("facepunch", 404),
+            rejected("facepunch", 405),
+            rejected("facepunch", 409),
+            rejected("facepunch", 499),
             rejected("other", 400),
         ] {
             let outcome = negative_auth_outcome(Err(&error));

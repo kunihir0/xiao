@@ -18,11 +18,13 @@ Credentials are transmitted only after endpoint validation accepts `wss://`.
 The crate enables rustls with the bundled WebPKI roots and normal certificate
 verification. Plain `ws://` is rejected in production. The
 `insecure-test-transport` Cargo feature is off by default and is enabled only
-by local transport tests and by the isolated `phase0-live-proof` harness (which
-uses it solely for its non-product `session-ws-compare` stage). Its
-`ClientConfig::allow_insecure_for_tests` method is unavailable to production
-builds of the bot and accepts only loopback endpoints, so even the harness
-cannot reach a public `ws://` server: that stage records `invalid_endpoint`.
+by local transport tests; its `ClientConfig::allow_insecure_for_tests` method is
+unavailable to production builds and accepts only loopback endpoints. The
+separate `live-proof-plaintext` feature, enabled only by the isolated
+`phase0-live-proof` harness, adds `allow_plaintext_public_for_live_proof`,
+which permits plain `ws://` to public hosts (cleartext player token; test
+accounts and servers only). The bot's release build (`-p bot`) does not enable
+it, and other schemes stay refused.
 `ClientConfig` debug output redacts `player_token`.
 
 Rate policy uses bounded integer token capacity and a bounded `Duration` refill

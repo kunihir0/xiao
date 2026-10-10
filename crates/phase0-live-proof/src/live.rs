@@ -17,7 +17,7 @@ use rustplus_adapter::{
     SessionConnector, snapshot_from_fcm_secrets,
 };
 use rustplus_client::{
-    ClientConfig, Event, EventReceiveError, EventReceiver, ReconnectPolicy, RustPlusClient,
+    ClientConfig, EventReceiveError, EventReceiver, ReconnectPolicy, RustPlusClient,
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use zeroize::Zeroizing;
@@ -27,7 +27,7 @@ use crate::{
     classify::{
         Failure, classify_client, classify_registration, classify_session, negative_auth_outcome,
     },
-    helpers::{PairingFilter, TempFileGuard, await_pairing, bounded, query_alarm},
+    helpers::{PairingFilter, TempFileGuard, await_pairing, bounded, query_alarm, wait_for_alarm},
     manifest::{Correlation, Route, Stage, Status, StatusClass, seconds_of_day_utc},
     receipt::{RECEIPT_WINDOW_SECONDS, parse_time_of_day, within_window},
     sequence::{StageExecutor, StageOutcome},
@@ -103,7 +103,7 @@ impl Target {
         };
         match route {
             ClientRoute::ProductWss => config,
-            ClientRoute::WsDirectNonproduct => config.allow_insecure_for_tests(),
+            ClientRoute::WsDirectNonproduct => config.allow_plaintext_public_for_live_proof(),
         }
     }
 }
@@ -190,7 +190,6 @@ pub struct LiveExecutor {
     first_true: Option<EventStamp>,
     first_false: Option<EventStamp>,
     negative_auth_file: Option<TempFileGuard>,
-    lagged: u64,
 }
 
 impl LiveExecutor {
@@ -211,7 +210,6 @@ impl LiveExecutor {
             first_true: None,
             first_false: None,
             negative_auth_file: None,
-            lagged: 0,
         }
     }
 
@@ -502,36 +500,11 @@ impl LiveExecutor {
             .as_mut()
             .ok_or(Failure::new(StatusClass::Internal, "missing_client"))?
             .events;
-        let mut observed = 0_u64;
-        let mut skipped = 0_u64;
-        let waited = bounded(&self.cancel, EVENT_TIMEOUT, async {
-            loop {
-                match events.recv().await {
-                    Ok(Event::EntityChanged {
-                        entity_id: changed,
-                        payload,
-                    }) if changed == entity_id => {
-                        observed += 1;
-                        if payload.value == Some(value) {
-                            return Ok(SystemTime::now());
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(EventReceiveError::Lagged { skipped: count }) => {
-                        skipped = skipped.saturating_add(count);
-                    }
-                    Err(EventReceiveError::Closed) => {
-                        return Err(Failure::new(StatusClass::Transport, "event_stream_closed"));
-                    }
-                }
-            }
-        })
-        .await;
-        self.lagged = self.lagged.saturating_add(skipped);
-        let stamp = waited.map_err(|interrupted| interrupted.failure("alarm_event_timeout"))??;
+        let (observed, at) =
+            wait_for_alarm(events, &self.cancel, EVENT_TIMEOUT, entity_id, value).await?;
         self.event_seq = self.event_seq.saturating_add(observed);
         Ok(EventStamp {
-            at: stamp,
+            at,
             seq: self.event_seq,
         })
     }
@@ -762,14 +735,10 @@ impl StageExecutor for LiveExecutor {
                 StageOutcome::unsupported(Route::None, "modern_fis_not_implemented")
             }
             Stage::Teardown => self.teardown().await,
-            Stage::NoGo | Stage::EventLag => {
+            Stage::NoGo => {
                 Failure::new(StatusClass::Internal, "marker_is_not_a_stage").outcome(Route::None)
             }
         }
-    }
-
-    fn take_lagged(&mut self) -> u64 {
-        std::mem::take(&mut self.lagged)
     }
 
     /// Releases everything a stopped run may still own. Idempotent with the

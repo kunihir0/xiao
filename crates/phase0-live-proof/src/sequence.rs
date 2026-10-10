@@ -94,12 +94,6 @@ impl StageOutcome {
 /// last row so secrets and owned tasks are released on both GO and NO-GO.
 pub trait StageExecutor {
     async fn execute(&mut self, stage: Stage) -> StageOutcome;
-    /// Number of Rust+ events the last stage lost to receiver lag; reading
-    /// resets it. A non-zero count is recorded as a non-blocking
-    /// `event-lag` row so dropped events are never silently swallowed.
-    fn take_lagged(&mut self) -> u64 {
-        0
-    }
     async fn finish(&mut self);
 }
 
@@ -150,21 +144,6 @@ async fn drive<E: StageExecutor, S: RowSink>(
         let ended_at = SystemTime::now();
         tracing::debug!(stage = stage.as_str(), status = ?outcome.status, "stage end");
         sink.append(&row_for(stage, &outcome, started_at, ended_at, run_start))?;
-        let lagged = executor.take_lagged();
-        if lagged > 0 {
-            let now = SystemTime::now();
-            let marker = StageOutcome::fail(
-                Route::None,
-                StatusClass::EventsLagged,
-                "receiver_lagged_events_skipped",
-            )
-            .with_correlation(Correlation {
-                entity_id: 0,
-                value: stage.as_str(),
-                event_seq: lagged,
-            });
-            sink.append(&row_for(Stage::EventLag, &marker, now, now, run_start))?;
-        }
         if stage == Stage::SessionProductRoute {
             product_route_passed = outcome.status == Status::Pass;
             if !product_route_passed {
@@ -462,56 +441,6 @@ mod tests {
         assert_eq!(
             alarm.correlation_hash,
             correlation_hash("alarm-true", 9, "true", 1)
-        );
-    }
-
-    struct Lagging {
-        inner: Scripted,
-        pending: u64,
-    }
-
-    impl StageExecutor for Lagging {
-        async fn execute(&mut self, stage: Stage) -> StageOutcome {
-            if stage == Stage::AlarmTrue {
-                self.pending = 7;
-            }
-            self.inner.execute(stage).await
-        }
-
-        fn take_lagged(&mut self) -> u64 {
-            std::mem::take(&mut self.pending)
-        }
-
-        async fn finish(&mut self) {
-            self.inner.finish().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn lagged_events_get_a_non_blocking_event_lag_row() {
-        let mut executor = Lagging {
-            inner: Scripted::passing(),
-            pending: 0,
-        };
-        let mut rows = Vec::new();
-        let verdict = run_sequence(&mut executor, &mut rows).await.expect("run");
-        assert_eq!(verdict, Verdict::Go);
-        let at = rows
-            .iter()
-            .position(|row| row.stage == Stage::EventLag)
-            .expect("event-lag row");
-        assert_eq!(rows[at - 1].stage, Stage::AlarmTrue);
-        assert_eq!(rows[at + 1].stage, Stage::AlarmFalse);
-        assert_eq!(rows[at].status_class, StatusClass::EventsLagged);
-        assert_eq!(
-            rows[at].correlation_hash,
-            correlation_hash("event-lag", 0, "alarm-true", 7)
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.stage == Stage::EventLag)
-                .count(),
-            1
         );
     }
 

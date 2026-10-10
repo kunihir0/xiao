@@ -49,8 +49,6 @@ pub enum Stage {
     ModernFisCompare,
     Teardown,
     NoGo,
-    /// Non-blocking marker: the Rust+ event stream dropped events.
-    EventLag,
 }
 
 impl Stage {
@@ -90,7 +88,6 @@ impl Stage {
             Self::ModernFisCompare => "modern-fis-compare",
             Self::Teardown => "teardown",
             Self::NoGo => "no-go",
-            Self::EventLag => "event-lag",
         }
     }
 }
@@ -371,10 +368,7 @@ mod tests {
 
     #[test]
     fn stage_names_match_serialized_names_and_sequence_is_ordered() {
-        for stage in Stage::SEQUENCE
-            .into_iter()
-            .chain([Stage::NoGo, Stage::EventLag])
-        {
+        for stage in Stage::SEQUENCE.into_iter().chain([Stage::NoGo]) {
             assert_eq!(
                 serde_json::to_string(&stage).expect("stage"),
                 format!("\"{}\"", stage.as_str())
