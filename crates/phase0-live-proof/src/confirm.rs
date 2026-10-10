@@ -130,10 +130,11 @@ where
     }
 }
 
-/// The real terminal: a duplicate of the stdin descriptor, so std's shared
-/// buffered `Stdin` can never supply or swallow bytes.
+/// The real terminal: duplicates of the stdin and stdout descriptors, so
+/// std's shared buffered handles can never supply, swallow, or hold bytes.
 pub struct StdTerminal {
     input: Option<File>,
+    output: Option<File>,
 }
 
 impl StdTerminal {
@@ -141,13 +142,26 @@ impl StdTerminal {
     pub fn new() -> Self {
         Self {
             input: rustix::io::dup(rustix::stdio::stdin()).ok().map(File::from),
+            output: rustix::io::dup(rustix::stdio::stdout())
+                .ok()
+                .map(File::from),
         }
     }
 }
 
+/// The confirmation is interactive only when the code is shown on a terminal
+/// and typed from a terminal: a redirected stdout would write the code into a
+/// file or pipe.
+#[must_use]
+fn both_are_terminals(input: Option<&File>, output: Option<&File>) -> bool {
+    input.zip(output).is_some_and(|(input, output)| {
+        rustix::termios::isatty(input) && rustix::termios::isatty(output)
+    })
+}
+
 impl ConfirmationIo for StdTerminal {
     fn is_interactive_terminal(&self) -> bool {
-        self.input.as_ref().is_some_and(rustix::termios::isatty)
+        both_are_terminals(self.input.as_ref(), self.output.as_ref())
     }
 
     fn new_code(&mut self) -> Zeroizing<String> {
@@ -158,7 +172,10 @@ impl ConfirmationIo for StdTerminal {
         if let Some(input) = self.input.as_mut() {
             discard_pending_input(input);
         }
-        let mut out = io::stdout().lock();
+        let out = self
+            .output
+            .as_mut()
+            .ok_or_else(|| io::Error::other("stdout unavailable"))?;
         writeln!(out, "{text}")?;
         out.flush()
     }
@@ -370,7 +387,11 @@ Facepunch registration will follow): ABCD2345"
         }
         let (release, gate) = std::sync::mpsc::channel();
         let cancel = CancellationToken::new();
-        cancel.cancel();
+        let interrupter = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            interrupter.cancel();
+        });
         assert_eq!(
             confirm_interruptible(Blocked(gate), &cancel).await,
             Err(ConfirmRefusal::Interrupted)
@@ -494,14 +515,82 @@ Facepunch registration will follow): ABCD2345"
         );
     }
 
+    fn socket_file() -> (File, UnixStream) {
+        let (ours, theirs) = pair();
+        (File::from(std::os::fd::OwnedFd::from(ours)), theirs)
+    }
+
+    /// A real terminal descriptor: the master side of a fresh pseudo-terminal.
+    fn tty_file() -> File {
+        let master =
+            rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+                .expect("openpt");
+        File::from(master)
+    }
+
     #[test]
-    fn a_socket_is_not_a_terminal() {
-        let (reader, _writer) = pair();
-        let terminal = StdTerminal {
-            input: Some(File::from(std::os::fd::OwnedFd::from(reader))),
+    fn only_a_terminal_on_both_ends_is_interactive() {
+        let (socket_a, _keep_a) = socket_file();
+        let (socket_b, _keep_b) = socket_file();
+        let (tty_in, tty_out) = (tty_file(), tty_file());
+        assert!(
+            rustix::termios::isatty(&tty_in),
+            "pty master must report as a terminal"
+        );
+        assert!(both_are_terminals(Some(&tty_in), Some(&tty_out)));
+        // stdin is a terminal but stdout is redirected: the code would leak
+        // into a file or pipe.
+        assert!(!both_are_terminals(Some(&tty_in), Some(&socket_a)));
+        // stdout is a terminal but stdin is not.
+        assert!(!both_are_terminals(Some(&socket_a), Some(&tty_out)));
+        assert!(!both_are_terminals(Some(&socket_a), Some(&socket_b)));
+        assert!(!both_are_terminals(Some(&tty_in), None));
+        assert!(!both_are_terminals(None, Some(&tty_out)));
+        assert!(!both_are_terminals(None, None));
+    }
+
+    #[test]
+    fn std_terminal_refuses_a_redirected_stdout_or_stdin() {
+        let (socket, _keep) = socket_file();
+        let redirected_out = StdTerminal {
+            input: Some(tty_file()),
+            output: Some(socket),
         };
-        assert!(!terminal.is_interactive_terminal());
-        let closed = StdTerminal { input: None };
+        assert!(!redirected_out.is_interactive_terminal());
+        let (socket, _keep) = socket_file();
+        let redirected_in = StdTerminal {
+            input: Some(socket),
+            output: Some(tty_file()),
+        };
+        assert!(!redirected_in.is_interactive_terminal());
+        let both = StdTerminal {
+            input: Some(tty_file()),
+            output: Some(tty_file()),
+        };
+        assert!(both.is_interactive_terminal());
+        let closed = StdTerminal {
+            input: None,
+            output: None,
+        };
         assert!(!closed.is_interactive_terminal());
+    }
+
+    #[test]
+    fn prompt_is_written_only_to_the_checked_output_descriptor() {
+        let (output, mut peer) = socket_file();
+        let mut terminal = StdTerminal {
+            input: None,
+            output: Some(output),
+        };
+        terminal.show_prompt("hello CODE").expect("write");
+        drop(terminal);
+        let mut shown = String::new();
+        peer.read_to_string(&mut shown).expect("read");
+        assert_eq!(shown, "hello CODE\n");
+        let mut no_output = StdTerminal {
+            input: None,
+            output: None,
+        };
+        assert!(no_output.show_prompt("x").is_err());
     }
 }

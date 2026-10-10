@@ -30,9 +30,11 @@ eight random characters from an unambiguous uppercase alphabet (no `0`, `O`,
 exactly (case-sensitive; only the final newline is ignored).
 
 Stdin and stdout must both be terminals (so the code never lands in a file
-or pipe). A pipe, redirect, script, or any agent without a
-terminal is refused, so **an agent cannot confirm a run; only a human at the
-keyboard can.** There is no flag or environment variable that approves a run.
+or pipe). A pipe, redirect, or script without an interactive terminal on both
+is refused. This proves a terminal is attached, **not that a human is at it**:
+a process that allocates a pseudo-terminal can still answer the prompt.
+**Agents and scripts must never allocate a pty to answer the prompt.** There is
+no flag or environment variable that approves a run.
 
 Anything other than the exact code refuses with exit 77 and a fixed message:
 not a terminal, a wrong code, end of input, an unterminated line, a timeout,
