@@ -75,6 +75,8 @@ pub struct ClientConfig {
     pub reconnect: ReconnectPolicy,
     #[cfg(feature = "insecure-test-transport")]
     insecure_test_transport: bool,
+    #[cfg(feature = "live-proof-plaintext")]
+    plaintext_public_for_live_proof: bool,
 }
 impl std::fmt::Debug for ClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -106,6 +108,8 @@ impl ClientConfig {
             reconnect: ReconnectPolicy::default(),
             #[cfg(feature = "insecure-test-transport")]
             insecure_test_transport: false,
+            #[cfg(feature = "live-proof-plaintext")]
+            plaintext_public_for_live_proof: false,
         }
     }
     #[cfg(feature = "insecure-test-transport")]
@@ -114,26 +118,41 @@ impl ClientConfig {
         self.insecure_test_transport = true;
         self
     }
+    /// Permits plaintext `ws://` to any host, including public servers.
+    ///
+    /// This is a deliberate, documented downgrade (credentials and traffic
+    /// are unencrypted) reachable only when the `live-proof-plaintext` Cargo
+    /// feature is enabled, which only the isolated `phase0-live-proof`
+    /// harness does. `wss://` is unaffected and other schemes stay refused.
+    #[cfg(feature = "live-proof-plaintext")]
+    #[must_use]
+    pub fn allow_plaintext_public_for_live_proof(mut self) -> Self {
+        self.plaintext_public_for_live_proof = true;
+        self
+    }
+    /// Whether `endpoint` may be reached without TLS under the opt-ins that
+    /// are compiled in and enabled on this config.
+    fn plaintext_allowed(&self, endpoint: &Url) -> bool {
+        if endpoint.scheme() != "ws" {
+            return false;
+        }
+        #[cfg(feature = "insecure-test-transport")]
+        if self.insecure_test_transport
+            && endpoint
+                .host_str()
+                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"))
+        {
+            return true;
+        }
+        #[cfg(feature = "live-proof-plaintext")]
+        if self.plaintext_public_for_live_proof && endpoint.host_str().is_some() {
+            return true;
+        }
+        false
+    }
     fn validate(&self) -> Result<()> {
         let endpoint = Url::parse(&self.endpoint).map_err(|_| Error::InvalidEndpoint)?;
-        let secure = endpoint.scheme() == "wss";
-        let allow_insecure = {
-            #[cfg(feature = "insecure-test-transport")]
-            {
-                self.insecure_test_transport
-            }
-            #[cfg(not(feature = "insecure-test-transport"))]
-            {
-                false
-            }
-        };
-        if !secure
-            && !(allow_insecure
-                && endpoint.scheme() == "ws"
-                && endpoint.host_str().is_some_and(|host| {
-                    host == "localhost" || host == "127.0.0.1" || host == "::1"
-                }))
-        {
+        if endpoint.scheme() != "wss" && !self.plaintext_allowed(&endpoint) {
             return Err(Error::InsecureEndpoint);
         }
         if self.request_timeout.is_zero() {
@@ -1339,6 +1358,86 @@ pub(crate) fn convert_event(raw: Option<proto::AppBroadcast>) -> Option<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn validates(
+        endpoint: &str,
+        configure: impl FnOnce(ClientConfig) -> ClientConfig,
+    ) -> Result<()> {
+        configure(ClientConfig::new(endpoint, 42, 7)).validate()
+    }
+
+    #[test]
+    fn default_config_requires_wss_and_refuses_public_ws() {
+        assert!(validates("wss://203.0.113.9:28083", |config| config).is_ok());
+        for endpoint in [
+            "ws://203.0.113.9:28083",
+            "ws://127.0.0.1:28083",
+            "ws://example.com",
+            "http://203.0.113.9",
+            "ftp://203.0.113.9",
+        ] {
+            assert!(
+                matches!(
+                    validates(endpoint, |config| config),
+                    Err(Error::InsecureEndpoint)
+                ),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[cfg(feature = "insecure-test-transport")]
+    #[test]
+    fn insecure_test_transport_stays_loopback_only() {
+        assert!(validates("ws://127.0.0.1:1", ClientConfig::allow_insecure_for_tests).is_ok());
+        assert!(matches!(
+            validates("ws://203.0.113.9:1", ClientConfig::allow_insecure_for_tests),
+            Err(Error::InsecureEndpoint)
+        ));
+    }
+
+    #[cfg(feature = "live-proof-plaintext")]
+    #[test]
+    fn live_proof_opt_in_permits_public_ws_only() {
+        let allow = ClientConfig::allow_plaintext_public_for_live_proof;
+        for endpoint in [
+            "ws://203.0.113.9:28083",
+            "ws://[2001:db8::1]:28083",
+            "ws://127.0.0.1:1",
+        ] {
+            assert!(validates(endpoint, allow).is_ok(), "{endpoint}");
+        }
+        assert!(validates("wss://203.0.113.9:28083", allow).is_ok());
+        for endpoint in [
+            "http://203.0.113.9",
+            "https://203.0.113.9",
+            "ftp://203.0.113.9",
+            "tcp://203.0.113.9:1",
+            "ws://",
+            "not a url",
+        ] {
+            assert!(validates(endpoint, allow).is_err(), "{endpoint}");
+        }
+        assert!(matches!(
+            validates("http://203.0.113.9", allow),
+            Err(Error::InsecureEndpoint)
+        ));
+    }
+
+    #[cfg(feature = "live-proof-plaintext")]
+    #[test]
+    fn opt_in_is_per_config_and_never_logs_the_player_token() {
+        let default = ClientConfig::new("ws://203.0.113.9:1", 42, 123_456_789);
+        assert!(
+            default.validate().is_err(),
+            "opt-in must not leak across configs"
+        );
+        let opted = default.clone().allow_plaintext_public_for_live_proof();
+        assert!(opted.validate().is_ok());
+        let debug = format!("{opted:?}");
+        assert!(!debug.contains("123456789"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 
     fn lock_pending(pending: &Mutex<PendingMap>) -> std::sync::MutexGuard<'_, PendingMap> {
         match pending.lock() {

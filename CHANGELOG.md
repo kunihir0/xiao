@@ -8,6 +8,12 @@ All notable externally meaningful changes are documented here. Releases follow S
 
 ## Unreleased
 
+- Added the isolated `phase0-live-proof` harness for issue #23: an
+  approval-gated, redacted-manifest live proof of the FCM/MCS → pairing → Rust+
+  entity-event chain, a public `rustplus_adapter::parse_pairing_notification`,
+  and the harness-only `live-proof-plaintext` feature of `rustplus-client` (plain
+  `ws://` to public hosts; off by default and not enabled by `-p bot`).
+
 - Hardened database persistence with strict TLS verify-full default requiring a
   CA bundle file, explicit dev/local insecure opt-in, separate DDL migration
   role execution (`MIGRATION_DATABASE_URL`), one-shot `migrate` command,

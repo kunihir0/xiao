@@ -52,6 +52,16 @@ struct RawPairing {
     #[serde(rename = "type")]
     pairing_type: Option<String>,
 }
+/// Parses one push notification into a typed pairing using the same bounded
+/// logic as [`crate::PushPairingSource`]. Returns `Ok(None)` when the
+/// notification carries no pairing payload.
+pub fn parse_pairing_notification(
+    notification: &push_receiver::Notification,
+    config: &ParseConfig,
+) -> Result<Option<Pairing>, ParseError> {
+    parse_notification(notification, config)
+}
+
 pub(crate) fn parse_notification(
     notification: &push_receiver::Notification,
     config: &ParseConfig,
@@ -304,6 +314,21 @@ mod tests {
         format!(
             r#"{{"ip":{host},"port":{port},"playerId":{player_id},"playerToken":{token},"type":"server"}}"#
         )
+    }
+
+    #[test]
+    fn public_wrapper_matches_internal_parser() -> Result<(), ParseError> {
+        let config = ParseConfig::default();
+        let valid = notification(&server_body(r#""8.8.8.8""#, "28015", "42", "7"));
+        assert!(super::parse_pairing_notification(&valid, &config)?.is_some());
+        let invalid = notification(&server_body(r#""8.8.8.8""#, "0", "42", "7"));
+        assert_eq!(
+            super::parse_pairing_notification(&invalid, &config).err(),
+            parse_notification(&invalid, &config).err()
+        );
+        let empty = push_receiver::Notification::new(Vec::new(), None);
+        assert!(super::parse_pairing_notification(&empty, &config)?.is_none());
+        Ok(())
     }
 
     #[test]

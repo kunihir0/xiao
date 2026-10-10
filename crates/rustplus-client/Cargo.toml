@@ -12,6 +12,8 @@ workspace = true
 [features]
 default = []
 insecure-test-transport = []
+# Plaintext ws:// to public hosts; enabled only by the phase0-live-proof harness.
+live-proof-plaintext = []
 
 [dependencies]
 futures-util = "0.3.34"
@@ -30,4 +32,5 @@ prost-build = "0.14.4"
 protoc-bin-vendored = "3.3.0"
 
 [dev-dependencies]
+rustplus-client = { path = ".", features = ["insecure-test-transport", "live-proof-plaintext"] }
 proptest = "1.11.0"

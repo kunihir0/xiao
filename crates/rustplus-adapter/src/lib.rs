@@ -17,9 +17,10 @@ mod registration;
 mod session;
 
 pub use bot_application::{PairingSource, SessionConnector, SessionHandle};
+pub use bot_domain::Pairing;
 pub use error::{AdapterError, ParseError};
 pub use pairing_source::PushPairingSource;
-pub use parse::ParseConfig;
+pub use parse::{ParseConfig, parse_pairing_notification};
 pub use registration::{
     CompanionEndpoints, FacepunchRegistrar, FileSteamAuthToken, fcm_secrets_from_snapshot,
     snapshot_from_fcm_secrets,
