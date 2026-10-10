@@ -4,7 +4,7 @@
 use bot_application::{RegistrationError, SessionError};
 
 use crate::{
-    manifest::{Route, Status, StatusClass},
+    manifest::{Route, StatusClass},
     sequence::StageOutcome,
 };
 
@@ -65,7 +65,9 @@ pub fn classify_session(error: &SessionError) -> Failure {
         SessionError::Transport | SessionError::Disconnected | SessionError::ShuttingDown => {
             Failure::new(StatusClass::Transport, "session_transport")
         }
-        _ => Failure::new(StatusClass::ProtocolFailure, "session_protocol"),
+        SessionError::Protocol | SessionError::EventLagged { .. } | SessionError::Failed => {
+            Failure::new(StatusClass::ProtocolFailure, "session_protocol")
+        }
     }
 }
 
@@ -85,17 +87,29 @@ pub fn classify_client(error: &rustplus_client::Error) -> Failure {
         | rustplus_client::Error::ShuttingDown => {
             Failure::new(StatusClass::Transport, "client_transport")
         }
-        _ => Failure::new(StatusClass::ProtocolFailure, "client_protocol"),
+        rustplus_client::Error::Decode
+        | rustplus_client::Error::Encode
+        | rustplus_client::Error::AlreadyConnecting
+        | rustplus_client::Error::QueueFull
+        | rustplus_client::Error::PendingFull
+        | rustplus_client::Error::SequenceExhausted
+        | rustplus_client::Error::InvalidConfig(_)
+        | rustplus_client::Error::RequestTooLarge
+        | rustplus_client::Error::InvalidCamera(_) => {
+            Failure::new(StatusClass::ProtocolFailure, "client_protocol")
+        }
     }
 }
 
 /// Negative-auth stage verdict for a registration attempted with a
 /// synthetic, invalid Steam token.
 ///
-/// A 401/403 maps to `reenrollment_required`; any other typed service
-/// rejection is recorded as its actual class. Success, throttling, and
-/// transport-level errors prove nothing about token validation and fail the
-/// stage.
+/// Only a rejection that can be attributed to Facepunch's validation of the
+/// Steam token passes: 401/403 (`reenrollment_required`) or another explicit
+/// Facepunch 4xx rejection (400-class, excluding 429 which is mapped to
+/// `RateLimited`). Expo or any other service rejecting, Facepunch 5xx,
+/// success, throttling, and transport errors prove nothing about token
+/// validation and fail the stage.
 #[must_use]
 pub fn negative_auth_outcome(result: Result<(), &RegistrationError>) -> StageOutcome {
     const ROUTE: Route = Route::FacepunchRegister;
@@ -104,30 +118,35 @@ pub fn negative_auth_outcome(result: Result<(), &RegistrationError>) -> StageOut
             StageOutcome::pass(ROUTE, "invalid_token_rejected_expiry_not_run")
                 .with_status_class(StatusClass::ReenrollmentRequired)
         }
-        Err(error @ RegistrationError::Rejected { .. }) => {
-            StageOutcome::pass(ROUTE, "invalid_token_typed_rejection_expiry_not_run")
-                .with_status_class(classify_registration(error).class)
-        }
+        Err(RegistrationError::Rejected {
+            service: "facepunch",
+            status: 400..=499,
+        }) => StageOutcome::pass(ROUTE, "invalid_token_typed_rejection_expiry_not_run")
+            .with_status_class(StatusClass::Rejected),
+        Err(RegistrationError::Rejected { .. }) => StageOutcome::fail(
+            ROUTE,
+            StatusClass::UnrelatedRejection,
+            "negative_auth_rejection_not_token_validation",
+        ),
         Ok(()) => StageOutcome::fail(
             ROUTE,
             StatusClass::UnexpectedSuccess,
             "invalid_token_accepted",
         ),
-        Err(error) => {
-            let failure = classify_registration(error);
-            StageOutcome {
-                status: Status::Fail,
-                status_class: failure.class,
-                detail: "negative_auth_inconclusive",
-                ..StageOutcome::pass(ROUTE, "")
-            }
-        }
+        Err(error) => StageOutcome::fail(
+            ROUTE,
+            classify_registration(error).class,
+            "negative_auth_inconclusive",
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::manifest::Status;
 
     #[test]
     fn registration_errors_map_to_fixed_classes() {
@@ -149,28 +168,159 @@ mod tests {
         );
     }
 
+    fn rejected(service: &'static str, status: u16) -> RegistrationError {
+        RegistrationError::Rejected { service, status }
+    }
+
     #[test]
-    fn negative_auth_requires_a_typed_rejection() {
+    fn negative_auth_passes_only_for_facepunch_token_rejections() {
         let reenroll = negative_auth_outcome(Err(&RegistrationError::ReenrollmentRequired));
         assert_eq!(reenroll.status, Status::Pass);
         assert_eq!(reenroll.status_class, StatusClass::ReenrollmentRequired);
 
-        let rejected = negative_auth_outcome(Err(&RegistrationError::Rejected {
-            service: "facepunch",
-            status: 400,
-        }));
-        assert_eq!(rejected.status, Status::Pass);
-        assert_eq!(rejected.status_class, StatusClass::Rejected);
+        for status in [400, 404, 422, 499] {
+            let outcome = negative_auth_outcome(Err(&rejected("facepunch", status)));
+            assert_eq!(outcome.status, Status::Pass, "{status}");
+            assert_eq!(outcome.status_class, StatusClass::Rejected);
+        }
+    }
 
-        assert_eq!(negative_auth_outcome(Ok(())).status, Status::Fail);
+    #[test]
+    fn negative_auth_fails_for_expo_and_other_rejections_with_distinct_class() {
+        for error in [
+            rejected("expo", 400),
+            rejected("expo", 500),
+            rejected("expo", 401),
+            rejected("expo", 403),
+            rejected("facepunch", 500),
+            rejected("facepunch", 503),
+            rejected("facepunch", 399),
+            rejected("other", 400),
+        ] {
+            let outcome = negative_auth_outcome(Err(&error));
+            assert_eq!(outcome.status, Status::Fail, "{error:?}");
+            assert_eq!(outcome.status_class, StatusClass::UnrelatedRejection);
+            assert_ne!(outcome.status_class, StatusClass::Rejected);
+        }
+    }
+
+    #[test]
+    fn negative_auth_fails_for_success_and_inconclusive_errors() {
+        let accepted = negative_auth_outcome(Ok(()));
+        assert_eq!(accepted.status, Status::Fail);
+        assert_eq!(accepted.status_class, StatusClass::UnexpectedSuccess);
         for error in [
             RegistrationError::RateLimited,
             RegistrationError::Timeout("facepunch"),
             RegistrationError::Transport("facepunch"),
+            RegistrationError::AuthTokenUnavailable("missing"),
+            RegistrationError::InvalidResponse("x"),
+            RegistrationError::Fcm("x".to_owned()),
         ] {
             let outcome = negative_auth_outcome(Err(&error));
-            assert_eq!(outcome.status, Status::Fail);
+            assert_eq!(outcome.status, Status::Fail, "{error:?}");
             assert_eq!(outcome.detail, "negative_auth_inconclusive");
+        }
+    }
+
+    // Exhaustive: the classifiers have no wildcard arm, so a new upstream
+    // variant fails compilation there; this table pins each current mapping.
+    #[test]
+    fn every_session_error_has_a_pinned_classification() {
+        let second = Duration::from_secs(1);
+        let cases = [
+            (
+                SessionError::InvalidCredentials,
+                StatusClass::InvalidCredentials,
+                "session_rejected_credentials",
+            ),
+            (
+                SessionError::ConnectTimeout(second),
+                StatusClass::Timeout,
+                "session_timeout",
+            ),
+            (
+                SessionError::ShutdownTimeout(second),
+                StatusClass::Timeout,
+                "session_timeout",
+            ),
+            (
+                SessionError::Transport,
+                StatusClass::Transport,
+                "session_transport",
+            ),
+            (
+                SessionError::Disconnected,
+                StatusClass::Transport,
+                "session_transport",
+            ),
+            (
+                SessionError::ShuttingDown,
+                StatusClass::Transport,
+                "session_transport",
+            ),
+            (
+                SessionError::Protocol,
+                StatusClass::ProtocolFailure,
+                "session_protocol",
+            ),
+            (
+                SessionError::EventLagged { skipped: 3 },
+                StatusClass::ProtocolFailure,
+                "session_protocol",
+            ),
+            (
+                SessionError::Failed,
+                StatusClass::ProtocolFailure,
+                "session_protocol",
+            ),
+        ];
+        for (error, class, detail) in cases {
+            assert_eq!(
+                classify_session(&error),
+                Failure::new(class, detail),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_client_error_has_a_pinned_classification() {
+        use rustplus_client::Error;
+        let second = Duration::from_secs(1);
+        let endpoint = (StatusClass::InvalidEndpoint, "client_endpoint_refused");
+        let timeout = (StatusClass::Timeout, "client_timeout");
+        let transport = (StatusClass::Transport, "client_transport");
+        let protocol = (StatusClass::ProtocolFailure, "client_protocol");
+        let cases = [
+            (Error::InsecureEndpoint, endpoint),
+            (Error::InvalidEndpoint, endpoint),
+            (Error::Timeout(second), timeout),
+            (Error::ShutdownTimeout(second), timeout),
+            (
+                Error::Api("server text".to_owned()),
+                (StatusClass::Rejected, "client_api_error"),
+            ),
+            (Error::Transport, transport),
+            (Error::Io, transport),
+            (Error::Disconnected, transport),
+            (Error::ShuttingDown, transport),
+            (Error::Decode, protocol),
+            (Error::Encode, protocol),
+            (Error::AlreadyConnecting, protocol),
+            (Error::QueueFull, protocol),
+            (Error::PendingFull, protocol),
+            (Error::SequenceExhausted, protocol),
+            (Error::InvalidConfig("x"), protocol),
+            (Error::RequestTooLarge, protocol),
+            (Error::InvalidCamera("x"), protocol),
+        ];
+        for (error, (class, detail)) in cases {
+            assert_eq!(
+                classify_client(&error),
+                Failure::new(class, detail),
+                "{error:?}"
+            );
         }
     }
 }

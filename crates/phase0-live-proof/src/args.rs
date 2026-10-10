@@ -408,6 +408,21 @@ mod tests {
     }
 
     #[test]
+    fn dangling_symlink_evidence_path_is_refused_as_existing() {
+        let base = std::env::temp_dir().join(format!("p23-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("base");
+        let link = base.join("evidence");
+        std::os::unix::fs::symlink(base.join("no-such-target"), &link).expect("symlink");
+        assert!(!link.exists(), "link must dangle");
+        let mut parts = FULL.to_vec();
+        let link_text = link.to_str().expect("utf8").to_owned();
+        parts[2] = &link_text;
+        let config = parse(&parts).expect("parse");
+        assert_eq!(config.preflight(), Err(Refusal::EvidenceDirExists));
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    #[test]
     fn config_debug_contains_no_values() {
         let config = parse(&FULL).expect("parse");
         let debug = format!("{config:?}");

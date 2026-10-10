@@ -94,6 +94,12 @@ impl StageOutcome {
 /// last row so secrets and owned tasks are released on both GO and NO-GO.
 pub trait StageExecutor {
     async fn execute(&mut self, stage: Stage) -> StageOutcome;
+    /// Number of Rust+ events the last stage lost to receiver lag; reading
+    /// resets it. A non-zero count is recorded as a non-blocking
+    /// `event-lag` row so dropped events are never silently swallowed.
+    fn take_lagged(&mut self) -> u64 {
+        0
+    }
     async fn finish(&mut self);
 }
 
@@ -103,16 +109,20 @@ pub enum Verdict {
     NoGo { failed: Stage },
 }
 
-/// Whether a failed stage ends the run. A failed product route only records
-/// the finding; the ws comparison stage then decides whether any route
-/// exists.
+/// Whether a failed stage ends the run immediately. A failed product route
+/// does not: the ws comparison then still gathers evidence and decides
+/// whether any route exists. It is nevertheless a required stage, so the
+/// run can no longer be GO ([`run_sequence`] records it as NO-GO at the end).
 #[must_use]
 pub fn is_blocking_failure(stage: Stage, status: Status) -> bool {
     status == Status::Fail && stage != Stage::SessionProductRoute
 }
 
 /// Runs every stage in order, writing exactly one row per stage and stopping
-/// at the first blocking failure with a `no-go` row.
+/// at the first blocking failure with a `no-go` row. The verdict is GO only
+/// if every required stage passed: a failed `session-product-route` lets the
+/// run continue for evidence but ends it with a `no-go` row and
+/// `Verdict::NoGo`.
 pub async fn run_sequence<E: StageExecutor, S: RowSink>(
     executor: &mut E,
     sink: &mut S,
@@ -128,6 +138,7 @@ async fn drive<E: StageExecutor, S: RowSink>(
 ) -> Result<Verdict, ManifestError> {
     let run_start = Instant::now();
     let mut product_route_passed = false;
+    let mut deferred: Option<(Stage, usize)> = None;
     for (index, stage) in Stage::SEQUENCE.into_iter().enumerate() {
         let started_at = SystemTime::now();
         let outcome = if stage == Stage::SessionWsCompare && product_route_passed {
@@ -139,26 +150,57 @@ async fn drive<E: StageExecutor, S: RowSink>(
         let ended_at = SystemTime::now();
         tracing::debug!(stage = stage.as_str(), status = ?outcome.status, "stage end");
         sink.append(&row_for(stage, &outcome, started_at, ended_at, run_start))?;
-        if stage == Stage::SessionProductRoute {
-            product_route_passed = outcome.status == Status::Pass;
-        }
-        if is_blocking_failure(stage, outcome.status) {
+        let lagged = executor.take_lagged();
+        if lagged > 0 {
             let now = SystemTime::now();
             let marker = StageOutcome::fail(
                 Route::None,
-                StatusClass::RequiredStageFailed,
-                "required_stage_failed",
+                StatusClass::EventsLagged,
+                "receiver_lagged_events_skipped",
             )
             .with_correlation(Correlation {
                 entity_id: 0,
                 value: stage.as_str(),
-                event_seq: index as u64,
+                event_seq: lagged,
             });
-            sink.append(&row_for(Stage::NoGo, &marker, now, now, run_start))?;
+            sink.append(&row_for(Stage::EventLag, &marker, now, now, run_start))?;
+        }
+        if stage == Stage::SessionProductRoute {
+            product_route_passed = outcome.status == Status::Pass;
+            if !product_route_passed {
+                deferred = Some((stage, index));
+            }
+        }
+        if is_blocking_failure(stage, outcome.status) {
+            write_no_go(sink, stage, index, run_start)?;
             return Ok(Verdict::NoGo { failed: stage });
         }
     }
+    if let Some((stage, index)) = deferred {
+        write_no_go(sink, stage, index, run_start)?;
+        return Ok(Verdict::NoGo { failed: stage });
+    }
     Ok(Verdict::Go)
+}
+
+fn write_no_go<S: RowSink>(
+    sink: &mut S,
+    failed: Stage,
+    index: usize,
+    run_start: Instant,
+) -> Result<(), ManifestError> {
+    let now = SystemTime::now();
+    let marker = StageOutcome::fail(
+        Route::None,
+        StatusClass::RequiredStageFailed,
+        "required_stage_failed",
+    )
+    .with_correlation(Correlation {
+        entity_id: 0,
+        value: failed.as_str(),
+        event_seq: index as u64,
+    });
+    sink.append(&row_for(Stage::NoGo, &marker, now, now, run_start))
 }
 
 fn row_for(
@@ -233,6 +275,30 @@ mod tests {
         rows.iter().map(|row| row.stage).collect()
     }
 
+    #[test]
+    fn stage_ids_are_pinned_to_the_specified_order() {
+        let ids: Vec<&str> = Stage::SEQUENCE.iter().map(|stage| stage.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "enroll-fcm",
+                "enroll-companion",
+                "mcs-ready",
+                "pairing",
+                "session-product-route",
+                "session-ws-compare",
+                "entity-info",
+                "alarm-true",
+                "alarm-false",
+                "independent-receipt",
+                "restart-reconnect",
+                "negative-auth",
+                "modern-fis-compare",
+                "teardown",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn all_stages_run_in_order_with_one_row_each() {
         let mut executor = Scripted::passing();
@@ -285,7 +351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_product_route_is_recorded_and_ws_comparison_runs() {
+    async fn failed_product_route_continues_for_evidence_but_is_never_go() {
         let mut executor = Scripted::passing()
             .with(
                 Stage::SessionProductRoute,
@@ -301,10 +367,25 @@ mod tests {
             );
         let mut rows = Vec::new();
         let verdict = run_sequence(&mut executor, &mut rows).await.expect("run");
-        assert_eq!(verdict, Verdict::Go);
+        // Required product route failed: evidence is still gathered, but the
+        // verdict is never GO.
+        assert_eq!(
+            verdict,
+            Verdict::NoGo {
+                failed: Stage::SessionProductRoute
+            }
+        );
         assert_eq!(rows[4].status, Status::Fail);
         assert_eq!(rows[5].status, Status::Pass);
         assert!(executor.executed.contains(&Stage::SessionWsCompare));
+        assert_eq!(rows.len(), Stage::SEQUENCE.len() + 1);
+        let no_go = rows.last().expect("no-go row");
+        assert_eq!(no_go.stage, Stage::NoGo);
+        assert_eq!(
+            no_go.correlation_hash,
+            correlation_hash("no-go", 0, "session-product-route", 4)
+        );
+        assert_eq!(executor.finished, 1);
     }
 
     #[tokio::test]
@@ -382,6 +463,64 @@ mod tests {
             alarm.correlation_hash,
             correlation_hash("alarm-true", 9, "true", 1)
         );
+    }
+
+    struct Lagging {
+        inner: Scripted,
+        pending: u64,
+    }
+
+    impl StageExecutor for Lagging {
+        async fn execute(&mut self, stage: Stage) -> StageOutcome {
+            if stage == Stage::AlarmTrue {
+                self.pending = 7;
+            }
+            self.inner.execute(stage).await
+        }
+
+        fn take_lagged(&mut self) -> u64 {
+            std::mem::take(&mut self.pending)
+        }
+
+        async fn finish(&mut self) {
+            self.inner.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn lagged_events_get_a_non_blocking_event_lag_row() {
+        let mut executor = Lagging {
+            inner: Scripted::passing(),
+            pending: 0,
+        };
+        let mut rows = Vec::new();
+        let verdict = run_sequence(&mut executor, &mut rows).await.expect("run");
+        assert_eq!(verdict, Verdict::Go);
+        let at = rows
+            .iter()
+            .position(|row| row.stage == Stage::EventLag)
+            .expect("event-lag row");
+        assert_eq!(rows[at - 1].stage, Stage::AlarmTrue);
+        assert_eq!(rows[at + 1].stage, Stage::AlarmFalse);
+        assert_eq!(rows[at].status_class, StatusClass::EventsLagged);
+        assert_eq!(
+            rows[at].correlation_hash,
+            correlation_hash("event-lag", 0, "alarm-true", 7)
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.stage == Stage::EventLag)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn correlation_hash_is_deterministic_within_a_run() {
+        let a = correlation_hash("alarm-true", 9, "true", 1);
+        assert_eq!(a, correlation_hash("alarm-true", 9, "true", 1));
+        assert_ne!(a, correlation_hash("alarm-true", 9, "true", 2));
+        assert_ne!(a, correlation_hash("alarm-false", 9, "true", 1));
     }
 
     struct FailingSink;

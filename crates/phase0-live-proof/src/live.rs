@@ -5,11 +5,7 @@
 //! `main`. No test calls into this module's network paths.
 
 use std::{
-    fs::OpenOptions,
-    future::Future,
     io::{BufRead, Read, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -17,13 +13,11 @@ use std::{
 use bot_application::{CompanionRegistrar, DeviceId, FcmSecrets, SteamAuthTokenSource};
 use push_receiver::{FcmConnector, ProductionConfig, Readiness, ReceiverHandle};
 use rustplus_adapter::{
-    CompanionEndpoints, FacepunchRegistrar, FileSteamAuthToken, Pairing, ParseConfig,
-    RustPlusSessionConnector, SessionConnector, parse_pairing_notification,
-    snapshot_from_fcm_secrets,
+    CompanionEndpoints, FacepunchRegistrar, FileSteamAuthToken, Pairing, RustPlusSessionConnector,
+    SessionConnector, snapshot_from_fcm_secrets,
 };
 use rustplus_client::{
-    ClientConfig, Event, EventReceiveError, EventReceiver, ReconnectPolicy, Request,
-    ResponsePayload, RustPlusClient,
+    ClientConfig, Event, EventReceiveError, EventReceiver, ReconnectPolicy, RustPlusClient,
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use zeroize::Zeroizing;
@@ -33,6 +27,7 @@ use crate::{
     classify::{
         Failure, classify_client, classify_registration, classify_session, negative_auth_outcome,
     },
+    helpers::{PairingFilter, TempFileGuard, await_pairing, bounded, query_alarm},
     manifest::{Correlation, Route, Stage, Status, StatusClass, seconds_of_day_utc},
     receipt::{RECEIPT_WINDOW_SECONDS, parse_time_of_day, within_window},
     sequence::{StageExecutor, StageOutcome},
@@ -46,37 +41,10 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const HUMAN_INPUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-const ALARM_ENTITY_TYPE: i32 = 2;
 const MAX_INPUT_LINE_BYTES: u64 = 64;
+const MAX_STALE_DRAIN: usize = 4096;
 const NEGATIVE_AUTH_FILE: &str = "negative-auth.tmp";
 const SYNTHETIC_INVALID_TOKEN: &[u8] = b"synthetic-invalid-steam-token\n";
-
-enum Interrupted {
-    Timeout,
-    Cancelled,
-}
-
-impl Interrupted {
-    const fn failure(self, timeout_detail: &'static str) -> Failure {
-        match self {
-            Self::Timeout => Failure::new(StatusClass::Timeout, timeout_detail),
-            Self::Cancelled => Failure::new(StatusClass::Cancelled, "operator_interrupt"),
-        }
-    }
-}
-
-/// Bounds `future` by `limit` and operator cancellation.
-async fn bounded<T>(
-    cancel: &CancellationToken,
-    limit: Duration,
-    future: impl Future<Output = T>,
-) -> Result<T, Interrupted> {
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(Interrupted::Cancelled),
-        result = tokio::time::timeout(limit, future) => result.map_err(|_| Interrupted::Timeout),
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClientRoute {
@@ -221,7 +189,8 @@ pub struct LiveExecutor {
     event_seq: u64,
     first_true: Option<EventStamp>,
     first_false: Option<EventStamp>,
-    negative_auth_file: Option<PathBuf>,
+    negative_auth_file: Option<TempFileGuard>,
+    lagged: u64,
 }
 
 impl LiveExecutor {
@@ -242,6 +211,7 @@ impl LiveExecutor {
             first_true: None,
             first_false: None,
             negative_auth_file: None,
+            lagged: 0,
         }
     }
 
@@ -349,38 +319,38 @@ impl LiveExecutor {
     }
 
     /// Waits for a pairing notification for the configured Steam account.
-    /// Malformed or foreign notifications are skipped.
-    async fn next_pairing(&mut self, require_entity: bool) -> Result<Pairing, Failure> {
-        let steam_id = self.config.steam_id;
-        let parse = ParseConfig::default();
+    /// With `expected` set, only the same server and credentials qualify.
+    async fn next_pairing(
+        &mut self,
+        require_entity: bool,
+        expected: Option<Pairing>,
+    ) -> Result<Pairing, Failure> {
         let receiver = self
             .receiver
             .as_mut()
             .ok_or(Failure::new(StatusClass::Internal, "missing_receiver"))?;
-        let mut notifications = 0_u64;
-        let found = bounded(&self.cancel, PAIRING_TIMEOUT, async {
-            loop {
-                let notification = receiver.recv().await?;
-                notifications += 1;
-                if let Ok(Some(pairing)) = parse_pairing_notification(&notification, &parse)
-                    && pairing.credentials().player_id().value() == steam_id
-                    && (!require_entity || pairing.entity().is_some())
-                {
-                    return Some(pairing);
-                }
-            }
-        })
-        .await
-        .map_err(|interrupted| interrupted.failure("pairing_timeout"))?;
-        self.event_seq = self.event_seq.saturating_add(notifications);
-        found.ok_or(Failure::new(StatusClass::Transport, "receiver_closed"))
+        let filter = PairingFilter {
+            steam_id: self.config.steam_id,
+            expected: expected.as_ref(),
+            require_entity,
+        };
+        let (pairing, examined) = await_pairing(
+            receiver,
+            &self.cancel,
+            PAIRING_TIMEOUT,
+            &filter,
+            "pairing_timeout",
+        )
+        .await?;
+        self.event_seq = self.event_seq.saturating_add(examined);
+        Ok(pairing)
     }
 
     // 4
     async fn pairing(&mut self) -> StageOutcome {
         const ROUTE: Route = Route::McsPush;
         println!("HUMAN: in game press Esc > Rust+ > Pair with Server");
-        match self.next_pairing(false).await {
+        match self.next_pairing(false, None).await {
             Ok(pairing) => {
                 self.entity_id = pairing.entity().map(|entity| entity.id().value());
                 self.pairing = Some(pairing);
@@ -473,53 +443,52 @@ impl LiveExecutor {
         let route = route.manifest();
         if self.entity_id.is_none() {
             println!("HUMAN: in game pair the Smart Alarm (look at it, hold E, choose Pair)");
-            match self.next_pairing(true).await {
+            let expected = self.pairing.clone();
+            match self.next_pairing(true, expected).await {
                 Ok(pairing) => {
                     self.entity_id = pairing.entity().map(|entity| entity.id().value());
                 }
                 Err(failure) => return failure.outcome(route),
             }
         }
-        let Some(entity_id) = self.entity_id else {
-            return Failure::new(StatusClass::Internal, "missing_entity").outcome(route);
+        match self.verify_entity().await {
+            Ok(entity_id) => {
+                StageOutcome::pass(route, "entity_type_alarm").with_correlation(Correlation {
+                    entity_id,
+                    value: "entity_type_2",
+                    event_seq: 0,
+                })
+            }
+            Err(failure) => failure.outcome(route),
+        }
+    }
+
+    /// Sends `EntityInfo` for the paired alarm on the current client and
+    /// requires an Alarm. Also used after every reconnect, before alarm events
+    /// are awaited.
+    async fn verify_entity(&self) -> Result<u32, Failure> {
+        let entity_id = self
+            .entity_id
+            .ok_or(Failure::new(StatusClass::Internal, "missing_entity"))?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or(Failure::new(StatusClass::Internal, "missing_client"))?;
+        query_alarm(&client.client, &self.cancel, SESSION_TIMEOUT, entity_id).await?;
+        Ok(entity_id)
+    }
+
+    /// Discards events queued before the operator prompt so a stale value
+    /// cannot satisfy the next wait.
+    async fn drain_stale_events(&mut self) {
+        let Some(client) = self.client.as_mut() else {
+            return;
         };
-        let Some(client) = self.client.as_ref() else {
-            return Failure::new(StatusClass::Internal, "missing_client").outcome(route);
-        };
-        let response = bounded(
-            &self.cancel,
-            SESSION_TIMEOUT,
-            client.client.send_request(Request::EntityInfo(entity_id)),
-        )
-        .await;
-        let correlation = |value| Correlation {
-            entity_id,
-            value,
-            event_seq: 0,
-        };
-        match response {
-            Ok(Ok(response)) => match response.payload {
-                ResponsePayload::EntityInfoData(info) if info.entity_type == ALARM_ENTITY_TYPE => {
-                    StageOutcome::pass(route, "entity_type_alarm")
-                        .with_correlation(correlation("entity_type_2"))
-                }
-                ResponsePayload::EntityInfoData(_) => StageOutcome::fail(
-                    route,
-                    StatusClass::UnexpectedEntityType,
-                    "entity_type_not_alarm",
-                )
-                .with_correlation(correlation("entity_type_other")),
-                ResponsePayload::ApiError(_) | ResponsePayload::Error => {
-                    StageOutcome::fail(route, StatusClass::Rejected, "entity_info_rejected")
-                }
-                _ => StageOutcome::fail(
-                    route,
-                    StatusClass::InvalidResponse,
-                    "entity_info_unexpected_payload",
-                ),
-            },
-            Ok(Err(error)) => classify_client(&error).outcome(route),
-            Err(interrupted) => interrupted.failure("entity_info_timeout").outcome(route),
+        for _ in 0..MAX_STALE_DRAIN {
+            match tokio::time::timeout(Duration::ZERO, client.events.recv()).await {
+                Ok(Ok(_) | Err(EventReceiveError::Lagged { .. })) => {}
+                Ok(Err(EventReceiveError::Closed)) | Err(_) => break,
+            }
         }
     }
 
@@ -534,7 +503,8 @@ impl LiveExecutor {
             .ok_or(Failure::new(StatusClass::Internal, "missing_client"))?
             .events;
         let mut observed = 0_u64;
-        let stamp = bounded(&self.cancel, EVENT_TIMEOUT, async {
+        let mut skipped = 0_u64;
+        let waited = bounded(&self.cancel, EVENT_TIMEOUT, async {
             loop {
                 match events.recv().await {
                     Ok(Event::EntityChanged {
@@ -546,15 +516,19 @@ impl LiveExecutor {
                             return Ok(SystemTime::now());
                         }
                     }
-                    Ok(_) | Err(EventReceiveError::Lagged { .. }) => {}
+                    Ok(_) => {}
+                    Err(EventReceiveError::Lagged { skipped: count }) => {
+                        skipped = skipped.saturating_add(count);
+                    }
                     Err(EventReceiveError::Closed) => {
                         return Err(Failure::new(StatusClass::Transport, "event_stream_closed"));
                     }
                 }
             }
         })
-        .await
-        .map_err(|interrupted| interrupted.failure("alarm_event_timeout"))??;
+        .await;
+        self.lagged = self.lagged.saturating_add(skipped);
+        let stamp = waited.map_err(|interrupted| interrupted.failure("alarm_event_timeout"))??;
         self.event_seq = self.event_seq.saturating_add(observed);
         Ok(EventStamp {
             at: stamp,
@@ -564,6 +538,7 @@ impl LiveExecutor {
 
     async fn alarm(&mut self, value: bool) -> StageOutcome {
         let route = self.route.map_or(Route::None, ClientRoute::manifest);
+        self.drain_stale_events().await;
         println!(
             "HUMAN: make the paired Smart Alarm go {} now",
             if value {
@@ -690,6 +665,11 @@ impl LiveExecutor {
         if let Err(failure) = self.ensure_client().await {
             return failure.outcome(route).as_receipt();
         }
+        // The new client has no entity context until it asks: re-issue
+        // EntityInfo before waiting for any alarm event.
+        if let Err(failure) = self.verify_entity().await {
+            return failure.outcome(route).as_receipt();
+        }
         let on = self.alarm(true).await;
         if on.status != Status::Pass {
             return on;
@@ -710,16 +690,17 @@ impl LiveExecutor {
             return Failure::new(StatusClass::Internal, "missing_fcm_state").outcome(ROUTE);
         };
         let path = self.config.evidence_dir.join(NEGATIVE_AUTH_FILE);
-        let written = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut file| file.write_all(SYNTHETIC_INVALID_TOKEN));
-        if written.is_err() {
-            return Failure::new(StatusClass::Internal, "synthetic_token_file").outcome(ROUTE);
-        }
-        self.negative_auth_file = Some(path.clone());
+        // The guard owns the file from creation: a failed fill, an early
+        // return below, `finish`, or drop all remove it.
+        let guard = match TempFileGuard::create(path.clone(), |file| {
+            file.write_all(SYNTHETIC_INVALID_TOKEN)
+        }) {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Failure::new(StatusClass::Internal, "synthetic_token_file").outcome(ROUTE);
+            }
+        };
+        self.negative_auth_file = Some(guard);
         let token = match FileSteamAuthToken::new(path).load().await {
             Ok(token) => token,
             Err(error) => return classify_registration(&error).outcome(ROUTE),
@@ -739,10 +720,7 @@ impl LiveExecutor {
 
     fn remove_temp_files(&mut self) -> bool {
         match self.negative_auth_file.take() {
-            Some(path) => match std::fs::remove_file(path) {
-                Ok(()) => true,
-                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-            },
+            Some(mut guard) => guard.remove(),
             None => true,
         }
     }
@@ -784,10 +762,14 @@ impl StageExecutor for LiveExecutor {
                 StageOutcome::unsupported(Route::None, "modern_fis_not_implemented")
             }
             Stage::Teardown => self.teardown().await,
-            Stage::NoGo => {
-                Failure::new(StatusClass::Internal, "no_go_is_not_a_stage").outcome(Route::None)
+            Stage::NoGo | Stage::EventLag => {
+                Failure::new(StatusClass::Internal, "marker_is_not_a_stage").outcome(Route::None)
             }
         }
+    }
+
+    fn take_lagged(&mut self) -> u64 {
+        std::mem::take(&mut self.lagged)
     }
 
     /// Releases everything a stopped run may still own. Idempotent with the
