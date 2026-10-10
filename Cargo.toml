@@ -12,6 +12,7 @@ members = [
   "crates/telemetry",
   "crates/test-support",
   "crates/phase0-evidence",
+  "crates/phase0-live-proof",
 ]
 resolver = "3"
 

@@ -1699,6 +1699,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "phase0-live-proof"
+version = "0.1.0"
+dependencies = [
+ "bot-application",
+ "push-receiver",
+ "rustplus-adapter",
+ "rustplus-client",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
