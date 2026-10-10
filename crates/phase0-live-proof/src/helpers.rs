@@ -5,7 +5,8 @@
 use std::{
     fs::{File, OpenOptions},
     future::Future,
-    io,
+    io::{self, Read},
+    os::fd::AsFd,
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
     time::{Duration, SystemTime},
@@ -13,16 +14,23 @@ use std::{
 
 use bot_application::SteamAuthTokenSource;
 use push_receiver::ReceiverHandle;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustplus_adapter::{FileSteamAuthToken, Pairing, ParseConfig, parse_pairing_notification};
 use rustplus_client::{
     Event, EventReceiveError, EventReceiver, Request, Response, ResponsePayload, RustPlusClient,
 };
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use crate::{
     classify::{Failure, classify_client, classify_registration},
-    manifest::StatusClass,
+    manifest::{Route, StatusClass},
+    sequence::StageOutcome,
 };
+
+const MAX_CONFIRMATION_BYTES: usize = 64;
+const DRAIN_CHUNK_BYTES: usize = 256;
+const MAX_DRAIN_READS: usize = 64;
 
 pub const ALARM_ENTITY_TYPE: i32 = 2;
 
@@ -99,8 +107,9 @@ impl Drop for TempFileGuard {
     }
 }
 
-/// Validates the Steam token file (owner, mode, symlink, size, content)
-/// without keeping the token. Run before any irreversible enrollment.
+/// Validates the Steam token file locally (owner, mode, symlink, size,
+/// non-empty) without keeping the token. It cannot tell whether Facepunch
+/// will accept the token.
 pub async fn validate_token_file(path: PathBuf) -> Result<(), Failure> {
     FileSteamAuthToken::new(path)
         .load()
@@ -247,6 +256,88 @@ pub async fn query_alarm<P: EntityProbe>(
             StatusClass::InvalidResponse,
             "entity_info_unexpected_payload",
         )),
+    }
+}
+
+/// Fixed teardown prompt. Static text only: nothing about the run (server,
+/// player, address) may ever be interpolated into it.
+pub const HUMAN_RESET_PROMPT: &str =
+    "HUMAN: reset the Smart Alarm and remove the test server pairing in game, then press Enter";
+
+/// Whether the operator confirmed the in-game reset. A fixed enum so no
+/// operator input is ever recorded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResetConfirmation {
+    Confirmed,
+    Unconfirmed,
+}
+
+/// Reads at most [`MAX_CONFIRMATION_BYTES`] and confirms only when Enter
+/// (a newline) arrives within them. End-of-input, a read error, an
+/// unterminated read, and a line longer than the cap are all unconfirmed.
+/// Call with an unbuffered reader so bytes buffered by an earlier read can
+/// never pre-confirm.
+pub fn read_reset_confirmation(mut reader: impl Read) -> ResetConfirmation {
+    let mut buf = Zeroizing::new([0u8; MAX_CONFIRMATION_BYTES]);
+    let mut filled = 0;
+    while let Some(window) = buf.get_mut(filled..).filter(|window| !window.is_empty()) {
+        match reader.read(window) {
+            Ok(0) => return ResetConfirmation::Unconfirmed,
+            Ok(read) => {
+                if window.get(..read).is_some_and(|got| got.contains(&b'\n')) {
+                    return ResetConfirmation::Confirmed;
+                }
+                filled += read;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return ResetConfirmation::Unconfirmed,
+        }
+    }
+    ResetConfirmation::Unconfirmed
+}
+
+/// Discards input that is already waiting (type-ahead or stale lines) without
+/// ever blocking, so it cannot answer a prompt printed afterwards. Bounded:
+/// a stream that never stops producing is abandoned after a fixed number of
+/// reads.
+pub fn discard_pending_input(input: &mut (impl Read + AsFd)) {
+    let mut scratch = Zeroizing::new([0u8; DRAIN_CHUNK_BYTES]);
+    for _ in 0..MAX_DRAIN_READS {
+        let mut fds = [PollFd::new(&*input, PollFlags::IN)];
+        let ready = poll(&mut fds, Some(&Timespec::default())).is_ok_and(|count| count > 0);
+        if !ready {
+            return;
+        }
+        match input.read(scratch.as_mut_slice()) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Teardown outcome from local cleanup and the operator's confirmation. A
+/// missing confirmation always fails with `human_reset_unconfirmed`, even
+/// when local cleanup was clean.
+#[must_use]
+pub fn teardown_outcome(cleanup_clean: bool, confirmation: ResetConfirmation) -> StageOutcome {
+    match (cleanup_clean, confirmation) {
+        (true, ResetConfirmation::Confirmed) => StageOutcome::pass(
+            Route::Local,
+            "teardown_clean_human_reset_confirmed_facepunch_unregister_unsupported",
+        ),
+        (true, ResetConfirmation::Unconfirmed) => StageOutcome::fail(
+            Route::Local,
+            StatusClass::HumanResetUnconfirmed,
+            "human_reset_unconfirmed",
+        ),
+        (false, ResetConfirmation::Confirmed) => {
+            StageOutcome::fail(Route::Local, StatusClass::Internal, "teardown_incomplete")
+        }
+        (false, ResetConfirmation::Unconfirmed) => StageOutcome::fail(
+            Route::Local,
+            StatusClass::HumanResetUnconfirmed,
+            "teardown_incomplete_human_reset_unconfirmed",
+        ),
     }
 }
 
@@ -661,5 +752,115 @@ mod tests {
                 .class,
             StatusClass::Transport
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod reset_tests {
+    use std::io::{Cursor, Write};
+
+    use super::*;
+    use crate::manifest::Status;
+
+    #[test]
+    fn prompt_is_the_fixed_text() {
+        assert_eq!(
+            HUMAN_RESET_PROMPT,
+            "HUMAN: reset the Smart Alarm and remove the test server pairing in game, then press Enter"
+        );
+    }
+
+    #[test]
+    fn only_a_newline_terminated_line_confirms() {
+        assert_eq!(
+            read_reset_confirmation(Cursor::new(b"\n")),
+            ResetConfirmation::Confirmed
+        );
+        assert_eq!(
+            read_reset_confirmation(Cursor::new(b"done\n")),
+            ResetConfirmation::Confirmed
+        );
+    }
+
+    #[test]
+    fn end_of_input_does_not_confirm() {
+        assert_eq!(
+            read_reset_confirmation(Cursor::new(b"")),
+            ResetConfirmation::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn unterminated_read_does_not_confirm() {
+        assert_eq!(
+            read_reset_confirmation(Cursor::new(b"done")),
+            ResetConfirmation::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn truncated_over_long_line_does_not_confirm() {
+        let mut line = vec![b'a'; 100];
+        line.push(b'\n');
+        assert_eq!(
+            read_reset_confirmation(Cursor::new(line)),
+            ResetConfirmation::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn stale_pending_input_is_discarded_before_the_prompt() {
+        let (mut reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"stale\n").expect("write");
+        discard_pending_input(&mut reader);
+        // Nothing left to read but the writer is still open: draining must
+        // not have blocked, and a fresh Enter confirms.
+        writer.write_all(b"\n").expect("write");
+        assert_eq!(
+            read_reset_confirmation(&mut reader),
+            ResetConfirmation::Confirmed
+        );
+        writer.write_all(b"stale\n").expect("write");
+        discard_pending_input(&mut reader);
+        drop(writer);
+        assert_eq!(
+            read_reset_confirmation(&mut reader),
+            ResetConfirmation::Unconfirmed,
+            "a stale line must not pre-confirm"
+        );
+    }
+
+    #[test]
+    fn confirmed_and_clean_teardown_passes() {
+        let outcome = teardown_outcome(true, ResetConfirmation::Confirmed);
+        assert_eq!(outcome.status, Status::Pass);
+        assert_eq!(outcome.status_class, StatusClass::Ok);
+    }
+
+    #[test]
+    fn missing_confirmation_fails_with_human_reset_unconfirmed() {
+        for clean in [true, false] {
+            let outcome = teardown_outcome(clean, ResetConfirmation::Unconfirmed);
+            assert_eq!(outcome.status, Status::Fail);
+            assert_eq!(outcome.status_class, StatusClass::HumanResetUnconfirmed);
+        }
+        assert_eq!(
+            teardown_outcome(true, ResetConfirmation::Unconfirmed).detail,
+            "human_reset_unconfirmed"
+        );
+    }
+
+    #[test]
+    fn incomplete_cleanup_fails_even_when_confirmed() {
+        let outcome = teardown_outcome(false, ResetConfirmation::Confirmed);
+        assert_eq!(outcome.status, Status::Fail);
+        assert_eq!(outcome.status_class, StatusClass::Internal);
+    }
+
+    #[test]
+    fn human_reset_unconfirmed_serializes_as_the_fixed_class() {
+        let value = serde_json::to_value(StatusClass::HumanResetUnconfirmed).expect("json");
+        assert_eq!(value, "human_reset_unconfirmed");
     }
 }

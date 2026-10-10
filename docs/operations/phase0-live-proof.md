@@ -33,9 +33,12 @@ Gate order (all before any network access):
 | a required stage failed (NO-GO row written) | 70 |
 | every required stage passed (GO) | 0 |
 
-The token file is validated *before* stage 1 so a bad token cannot burn an
-irreversible FCM enrollment, and before the evidence directory is created.
-The evidence directory is created `0700` and `manifest.jsonl` `0600`.
+The Steam token file is validated locally *before* stage 1 and before the
+evidence directory is created: owner, mode, symlink, size, and non-empty. That
+only screens out an unusable file. Whether Facepunch accepts the token is
+proven solely by its response in `enroll-companion`, so a rejected token still
+leaves the irreversible FCM enrollment (stage 1) in place. The evidence
+directory is created `0700` and `manifest.jsonl` `0600`.
 
 ## Stages (one row each, in order)
 
@@ -50,6 +53,20 @@ The evidence directory is created `0700` and `manifest.jsonl` `0600`.
 stopping: the run continues so `session-ws-compare` can gather comparison
 evidence, but the run ends with a `no-go` row and exit 70. If the product
 route passes, `session-ws-compare` is `not_run`.
+
+`teardown` is recorded after every outcome. After an early stop the `no-go`
+row is written first, then a best-effort `teardown` row that never changes the
+verdict or exit code. Teardown removes only the synthetic `negative-auth` temp
+file and drops the in-memory credentials and sessions; **the harness never
+deletes the operator's Steam token file, which the operator must remove
+themselves.** It then discards any input already waiting on stdin, prints
+`HUMAN: reset the Smart Alarm and remove the test server pairing in game, then
+press Enter` (on one line), and waits up to 10 minutes for a line ended by
+Enter. It passes only when cleanup succeeded and that Enter was received.
+Otherwise it fails, with status class `human_reset_unconfirmed` when there was
+no confirmation: timeout, interrupt, end of input, an unterminated or
+over-long (truncated) read, or a read error. Facepunch offers no unregister
+call, so the operator reset is the only way to clear the pairing.
 
 ### Plaintext `ws://` downgrade (harness only)
 

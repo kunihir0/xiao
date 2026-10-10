@@ -27,7 +27,11 @@ use crate::{
     classify::{
         Failure, classify_client, classify_registration, classify_session, negative_auth_outcome,
     },
-    helpers::{PairingFilter, TempFileGuard, await_pairing, bounded, query_alarm, wait_for_alarm},
+    helpers::{
+        HUMAN_RESET_PROMPT, PairingFilter, ResetConfirmation, TempFileGuard, await_pairing,
+        bounded, discard_pending_input, query_alarm, read_reset_confirmation, teardown_outcome,
+        wait_for_alarm,
+    },
     manifest::{Correlation, Route, Stage, Status, StatusClass, seconds_of_day_utc},
     receipt::{RECEIPT_WINDOW_SECONDS, parse_time_of_day, within_window},
     sequence::{StageExecutor, StageOutcome},
@@ -698,21 +702,42 @@ impl LiveExecutor {
         }
     }
 
+    /// Discards waiting input, prints the fixed reset prompt, and waits,
+    /// bounded, for a newline-terminated line. Timeout, operator interrupt,
+    /// end-of-input, truncation, and read errors are all `Unconfirmed`; none
+    /// of them is recorded beyond that enum.
+    ///
+    /// Reads go through a duplicate of the stdin descriptor, never std's
+    /// shared buffered `Stdin`, so bytes buffered by an earlier prompt cannot
+    /// pre-confirm.
+    async fn confirm_human_reset(&self) -> ResetConfirmation {
+        let Ok(duplicate) = rustix::io::dup(rustix::stdio::stdin()) else {
+            println!("{HUMAN_RESET_PROMPT}");
+            return ResetConfirmation::Unconfirmed;
+        };
+        let mut input = std::fs::File::from(duplicate);
+        discard_pending_input(&mut input);
+        println!("{HUMAN_RESET_PROMPT}");
+        std::io::stdout().flush().ok();
+        let read = tokio::task::spawn_blocking(move || read_reset_confirmation(input));
+        match bounded(&self.cancel, HUMAN_INPUT_TIMEOUT, read).await {
+            Ok(Ok(confirmation)) => confirmation,
+            Ok(Err(_)) | Err(_) => ResetConfirmation::Unconfirmed,
+        }
+    }
+
     // 13
+    /// Local cleanup runs before the prompt so tokens and temp files are gone
+    /// even if the operator never answers or the process is killed while
+    /// waiting.
     async fn teardown(&mut self) -> StageOutcome {
         self.fcm = None;
         self.registrar = None;
         self.pairing = None;
         let files_clean = self.remove_temp_files();
         let session_clean = self.release_session().await;
-        if files_clean && session_clean {
-            StageOutcome::pass(
-                Route::Local,
-                "teardown_clean_facepunch_unregister_unsupported",
-            )
-        } else {
-            Failure::new(StatusClass::Internal, "teardown_incomplete").outcome(Route::Local)
-        }
+        let confirmation = self.confirm_human_reset().await;
+        teardown_outcome(files_clean && session_clean, confirmation)
     }
 }
 
