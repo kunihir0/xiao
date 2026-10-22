@@ -13,6 +13,8 @@ apps/bot
   `-- bot-telemetry
 
 test-support is test-only.
+phase0-evidence and phase0-live-proof are standalone proof harness
+binaries: they reuse protocol crates but are never linked into apps/bot.
 ```
 
 `domain` knows no Discord, Diesel, PostgreSQL, protobuf, FCM, or deployment types. `application` owns use cases and ports. Adapters translate at boundaries. The process composition root is the only place that wires concrete adapters together.
