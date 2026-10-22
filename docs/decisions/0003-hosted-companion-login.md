@@ -266,9 +266,11 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      calls the idempotent `CompanionRegistrar::register` with the new token.
      This makes `/login` the re-enrollment path for an expired or rejected
      token.
-   - **Different SteamID active, or configured:** the owner must explicitly
-     choose to replace it. Replacement is sequenced so no pairing writer
-     races the purge:
+   - **Different SteamID active, or a different legacy (Group B) SteamID
+     configured while no credential is active:** the owner must explicitly
+     choose to replace it. When any credential is active, the legacy account
+     is ignored (step 7), so it is never shown as replaced. Replacement is
+     sequenced so no pairing writer races the purge:
      1. The coordinator registers the new account (its credential becomes
         `active`; the old one is untouched).
      2. It sends the supervisor `AccountSwitch { to, replace_from }` with a

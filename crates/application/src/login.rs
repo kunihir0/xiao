@@ -3,8 +3,12 @@
 //! bot-side session and audit tables.
 //!
 //! This module defines vocabulary only. The coordinator loop that drives these
-//! ports lives with the bot wiring. Nothing here carries a secret except
+//! ports is [`crate::LoginCoordinator`]. Nothing here carries a secret except
 //! [`LoginTicket::link`], which is zeroized on drop and never printed.
+//!
+//! The owner's [`Decision`] channel does not exist until the SteamID has been
+//! shown: its sender travels inside [`LoginEvent::AwaitingConfirm`], so no
+//! decision can be sent, buffered or acted on earlier.
 //!
 //! Channels use `tokio::sync` (`mpsc`, `oneshot`); the crate already depends on
 //! tokio's `sync` feature for its watch channels.
@@ -81,17 +85,37 @@ impl Decision {
 }
 
 /// Progress reported by the coordinator to the Discord adapter.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LoginEvent {
     /// The result was opened. The adapter shows the SteamID and asks the owner
-    /// to confirm; `replaces` is the active account a confirmation would
-    /// replace.
+    /// to confirm; `replaces` is the account a confirmation would replace.
+    ///
+    /// `decide` is the only way to answer: the coordinator creates the
+    /// channel at this moment, so a decision cannot exist before the SteamID
+    /// was shown. Dropping `decide` without sending counts as Cancel. The
+    /// owner has the configured confirm timeout to answer.
     AwaitingConfirm {
         steam_id: SteamId,
         replaces: Option<SteamId>,
+        decide: oneshot::Sender<Decision>,
     },
     /// The login ended. No further events follow.
     Finished(LoginOutcome),
+}
+
+impl fmt::Debug for LoginEvent {
+    /// Shows SteamIDs and the outcome only.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AwaitingConfirm {
+                steam_id, replaces, ..
+            } => formatter
+                .debug_struct("AwaitingConfirm")
+                .field("steam_id", steam_id)
+                .field("replaces", replaces)
+                .finish_non_exhaustive(),
+            Self::Finished(outcome) => formatter.debug_tuple("Finished").field(outcome).finish(),
+        }
+    }
 }
 
 /// Stable, secret-free outcome identifier stored in the audit table and used
@@ -256,10 +280,20 @@ pub enum LoginFailure {
     /// A bot-side store failed.
     Store,
     Registration(RegistrationFailure),
-    /// The supervisor could not complete the account switch.
-    SwitchFailed,
+    /// The supervisor could not complete the account switch. The new
+    /// credential is registered and active.
+    Switch(SwitchError),
     /// The owner did not answer the confirmation in time.
     ConfirmTimeout,
+    /// The active accounts changed between the prompt and the confirmation, so
+    /// the replacement the owner saw is no longer what would happen. Nothing
+    /// was registered.
+    AccountsChanged,
+    /// The bot was shutting down while the account was being enrolled. The
+    /// new credential may already be registered or even active; the next
+    /// start reconciles from the credential store (an active credential
+    /// wins), but the owner never saw an outcome.
+    Interrupted,
 }
 
 impl LoginFailure {
@@ -294,7 +328,12 @@ impl LoginFailure {
                 "failed_registration_invalid_response"
             }
             Self::Registration(RegistrationFailure::Fcm) => "failed_registration_fcm",
-            Self::SwitchFailed => "failed_switch",
+            Self::Switch(SwitchError::RestoreFailed) => "failed_switch_restore_failed",
+            Self::Switch(SwitchError::StoreFailed) => "failed_switch_store_failed",
+            Self::Switch(SwitchError::Timeout) => "failed_switch_timeout",
+            Self::Switch(SwitchError::Unavailable) => "failed_switch_unavailable",
+            Self::AccountsChanged => "failed_accounts_changed",
+            Self::Interrupted => "failed_interrupted",
             Self::ConfirmTimeout => "failed_confirm_timeout",
         }
     }
@@ -349,22 +388,21 @@ impl std::error::Error for LoginStartError {}
 
 /// What the coordinator hands the Discord adapter after `/login start`.
 ///
-/// Dropping the ticket without answering is a cancellation: the coordinator
-/// treats a closed `decision` channel as `Decision::Cancel`.
+/// Dropping the ticket (the `events` receiver) is a cancellation: the
+/// coordinator notices on its next poll and ends the login.
 ///
 /// Contract for the coordinator:
 /// - `events` must have capacity of at least 2, so `AwaitingConfirm` and
 ///   `Finished` can both be queued without waiting on the adapter.
-/// - The adapter offers the Confirm and Cancel buttons only after
-///   `AwaitingConfirm`. A `Decision` sent before that event must be ignored,
-///   not acted on.
+/// - There is no decision channel here. The Confirm and Cancel answer is sent
+///   on the `decide` sender carried by [`LoginEvent::AwaitingConfirm`], which
+///   exists only once the SteamID is to be shown.
 pub struct LoginTicket {
     /// The full link, `https://<host>/l#<fragment>`. Secret: it authenticates
     /// the browser. Show it once, to the owner only.
     pub link: Zeroizing<String>,
     pub confirm_code: ConfirmCode,
     pub events: mpsc::Receiver<LoginEvent>,
-    pub decision: oneshot::Sender<Decision>,
 }
 
 impl fmt::Debug for LoginTicket {
@@ -400,6 +438,19 @@ pub enum SwitchError {
     RestoreFailed,
     /// Clearing the old pairings or retiring the old credentials failed.
     StoreFailed,
+    /// The supervisor did not answer within the coordinator's bound.
+    Timeout,
+    /// The supervisor is not running, so it could not take the request.
+    Unavailable,
+}
+
+impl SwitchError {
+    pub const ALL: [Self; 4] = [
+        Self::RestoreFailed,
+        Self::StoreFailed,
+        Self::Timeout,
+        Self::Unavailable,
+    ];
 }
 
 impl fmt::Display for SwitchError {
@@ -407,6 +458,8 @@ impl fmt::Display for SwitchError {
         formatter.write_str(match self {
             Self::RestoreFailed => "restoring the new companion account failed",
             Self::StoreFailed => "retiring the previous companion account failed",
+            Self::Timeout => "the companion supervisor did not answer in time",
+            Self::Unavailable => "the companion supervisor is not running",
         })
     }
 }
@@ -417,6 +470,15 @@ impl std::error::Error for SwitchError {}
 /// the old pairing task, then clears pairings, retires other accounts and
 /// restores the connector for `to`, and finally answers on `ack`. Only
 /// SteamIDs cross the channel, never credential material.
+///
+/// A switch to the account the supervisor already runs (`replace_from` is
+/// `None`, sent after a re-registration) means "ensure it is running and
+/// restore it if not": the supervisor leaves a healthy connector alone, so
+/// `/login` also recovers an idle supervisor.
+///
+/// The supervisor must check `ack.is_closed()` before acting. The coordinator
+/// drops its end when it gives up (timeout, shutdown), and a switch whose ack
+/// receiver is gone is stale: it must be ignored, not carried out.
 #[derive(Debug)]
 pub struct AccountSwitch {
     pub to: SteamId,
@@ -515,7 +577,9 @@ pub trait LoginSessions: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuditOutcome {
     pub code: OutcomeCode,
-    /// The account the login registered, when it did.
+    /// The account the login registered or was registering. Failure codes
+    /// such as `Interrupted` and `Switch` record it even when registration
+    /// did not finish.
     pub steam_id: Option<SteamId>,
     /// The account it replaced, when it replaced one.
     pub replaced: Option<SteamId>,
@@ -621,9 +685,15 @@ mod tests {
             LoginOutcome::Expired,
             LoginOutcome::Failed(LoginFailure::Decrypt),
             LoginOutcome::Failed(LoginFailure::Store),
-            LoginOutcome::Failed(LoginFailure::SwitchFailed),
             LoginOutcome::Failed(LoginFailure::ConfirmTimeout),
+            LoginOutcome::Failed(LoginFailure::AccountsChanged),
+            LoginOutcome::Failed(LoginFailure::Interrupted),
         ];
+        all.extend(
+            SwitchError::ALL
+                .into_iter()
+                .map(|error| LoginOutcome::Failed(LoginFailure::Switch(error))),
+        );
         all.extend(
             FailureCode::ALL
                 .into_iter()
@@ -665,8 +735,28 @@ mod tests {
             ),
             (LoginOutcome::Failed(LoginFailure::Store), "failed_store"),
             (
-                LoginOutcome::Failed(LoginFailure::SwitchFailed),
-                "failed_switch",
+                LoginOutcome::Failed(LoginFailure::Switch(SwitchError::RestoreFailed)),
+                "failed_switch_restore_failed",
+            ),
+            (
+                LoginOutcome::Failed(LoginFailure::Switch(SwitchError::StoreFailed)),
+                "failed_switch_store_failed",
+            ),
+            (
+                LoginOutcome::Failed(LoginFailure::Switch(SwitchError::Timeout)),
+                "failed_switch_timeout",
+            ),
+            (
+                LoginOutcome::Failed(LoginFailure::Switch(SwitchError::Unavailable)),
+                "failed_switch_unavailable",
+            ),
+            (
+                LoginOutcome::Failed(LoginFailure::AccountsChanged),
+                "failed_accounts_changed",
+            ),
+            (
+                LoginOutcome::Failed(LoginFailure::Interrupted),
+                "failed_interrupted",
             ),
             (
                 LoginOutcome::Failed(LoginFailure::ConfirmTimeout),
@@ -691,8 +781,8 @@ mod tests {
     #[test]
     fn outcome_codes_are_unique_snake_case_and_embed_their_source_code() {
         let outcomes = every_outcome();
-        // 6 plain + 4 failures + 9 browser + 8 registration.
-        assert_eq!(outcomes.len(), 27);
+        // 6 plain + 5 failures + 4 switch + 9 browser + 8 registration.
+        assert_eq!(outcomes.len(), 32);
         let codes: HashSet<&str> = outcomes
             .iter()
             .map(|outcome| outcome.code().as_str())
@@ -798,12 +888,10 @@ mod tests {
         );
         let fragment = link.rsplit('#').next().expect("fragment").to_owned();
         let (_events_tx, events) = mpsc::channel(1);
-        let (decision, _decision_rx) = oneshot::channel();
         let ticket = LoginTicket {
             link: Zeroizing::new(link.clone()),
             confirm_code: ConfirmCode::of(&secret),
             events,
-            decision,
         };
         let debug = format!("{ticket:?}");
         assert!(!debug.contains(&link));
@@ -811,6 +899,22 @@ mod tests {
         assert!(!debug.contains("login.example"));
         assert!(debug.contains("redacted"));
         assert!(debug.contains(ticket.confirm_code.as_str()));
+    }
+
+    #[test]
+    fn event_debug_shows_ids_and_outcome_only() {
+        let (decide, _rx) = oneshot::channel();
+        let event = LoginEvent::AwaitingConfirm {
+            steam_id: steam(76_561_198_000_000_002),
+            replaces: Some(steam(76_561_198_000_000_001)),
+            decide,
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("AwaitingConfirm"));
+        assert!(debug.contains("76561198000000002"));
+        assert!(!debug.to_lowercase().contains("token"));
+        let finished = format!("{:?}", LoginEvent::Finished(LoginOutcome::Cancelled));
+        assert_eq!(finished, "Finished(Cancelled)");
     }
 
     #[test]

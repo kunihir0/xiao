@@ -3,6 +3,7 @@
 mod companion;
 mod future;
 mod login;
+mod login_coordinator;
 mod ports;
 mod secret_file;
 mod session;
@@ -20,6 +21,10 @@ pub use login::{
     InvalidDiscordUserId, LoginAudit, LoginEvent, LoginFailure, LoginOutcome, LoginSessions,
     LoginStartError, LoginStatus, LoginTicket, NewLoginSession, OneShotToken, OutcomeCode,
     RegistrationFailure, SwitchError, steam_token_from_login,
+};
+pub use login_coordinator::{
+    CoordinatorPorts, CoordinatorTimings, InvalidLoginLinkBase, LoginCoordinator, LoginHandle,
+    LoginLinkBase, SWITCH_TIMEOUT,
 };
 pub use ports::*;
 pub use secret_file::{SecretFileError, load_owner_only_secret};
