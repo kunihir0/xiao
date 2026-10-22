@@ -9,100 +9,12 @@ use tokio::sync::Mutex;
 
 use bot_application::{
     BoxFuture, CompanionRegistrar, CredentialId, CredentialState, DeviceId, EnrollmentError,
-    EnrollmentKind, FcmSecrets, PushCredential, PushCredentialStore, RegistrationError,
-    SteamAuthToken, SteamAuthTokenSource, StoreError, ensure_companion_registration,
+    EnrollmentKind, FcmSecrets, OneShotToken, PushCredential, PushCredentialStore,
+    RegistrationError, SteamAuthToken, SteamAuthTokenSource, StoreError,
+    ensure_companion_registration, reregister_companion,
 };
 use bot_domain::SteamId;
-
-#[derive(Default)]
-struct StoreState {
-    rows: Vec<PushCredential>,
-    load_error: Option<StoreError>,
-}
-
-#[derive(Clone, Default)]
-struct MemoryCredentialStore(Arc<Mutex<StoreState>>);
-
-impl MemoryCredentialStore {
-    async fn rows(&self) -> Vec<PushCredential> {
-        self.0.lock().await.rows.clone()
-    }
-}
-
-impl PushCredentialStore for MemoryCredentialStore {
-    fn load_active<'a>(
-        &'a self,
-        steam_id: SteamId,
-    ) -> BoxFuture<'a, Result<Option<PushCredential>, StoreError>> {
-        Box::pin(async move {
-            let state = self.0.lock().await;
-            if let Some(error) = &state.load_error {
-                return Err(error.clone());
-            }
-            Ok(state
-                .rows
-                .iter()
-                .find(|row| row.steam_id == steam_id && row.state == CredentialState::Active)
-                .cloned())
-        })
-    }
-    fn load_pending<'a>(
-        &'a self,
-        steam_id: SteamId,
-    ) -> BoxFuture<'a, Result<Option<PushCredential>, StoreError>> {
-        Box::pin(async move {
-            Ok(self
-                .0
-                .lock()
-                .await
-                .rows
-                .iter()
-                .find(|row| row.steam_id == steam_id && row.state == CredentialState::Pending)
-                .cloned())
-        })
-    }
-    fn save_pending<'a>(
-        &'a self,
-        credential: &'a PushCredential,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            let mut state = self.0.lock().await;
-            if state.rows.iter().any(|row| {
-                row.steam_id == credential.steam_id && row.state == CredentialState::Pending
-            }) {
-                return Err(StoreError::Conflict);
-            }
-            state.rows.push(credential.clone());
-            Ok(())
-        })
-    }
-    fn promote_active<'a>(&'a self, id: CredentialId) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            let mut state = self.0.lock().await;
-            let steam_id = state
-                .rows
-                .iter()
-                .find(|row| row.id == id && row.state == CredentialState::Pending)
-                .map(|row| row.steam_id)
-                .ok_or(StoreError::NotFound)?;
-            state
-                .rows
-                .retain(|row| !(row.steam_id == steam_id && row.state == CredentialState::Active));
-            for row in &mut state.rows {
-                if row.id == id {
-                    row.state = CredentialState::Active;
-                }
-            }
-            Ok(())
-        })
-    }
-    fn retire<'a>(&'a self, id: CredentialId) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move {
-            self.0.lock().await.rows.retain(|row| row.id != id);
-            Ok(())
-        })
-    }
-}
+use bot_test_support::FakePushCredentialStore as MemoryCredentialStore;
 
 #[derive(Default)]
 struct RegistrarState {
@@ -264,7 +176,7 @@ async fn missing_auth_token_keeps_pending_and_fails_typed() {
 #[tokio::test]
 async fn undecryptable_store_fails_closed_without_registration() {
     let store = MemoryCredentialStore::default();
-    store.0.lock().await.load_error = Some(StoreError::Decryption);
+    store.fail_load_active(StoreError::Decryption).await;
     let registrar = FakeRegistrar::default();
     let tokens = FakeTokens::default();
 
@@ -299,4 +211,128 @@ fn errors_never_print_tokens() {
         FcmSecrets::new(1, 2, "secret-registration".to_owned(), [9; 32], [8; 16]).unwrap()
     );
     assert!(!credential_debug.contains("secret-registration"));
+}
+
+fn active_credential(steam_id: SteamId) -> PushCredential {
+    PushCredential {
+        id: CredentialId::generate(),
+        steam_id,
+        device_id: DeviceId::generate(),
+        state: CredentialState::Active,
+        fcm: FcmSecrets::new(77, 88, "existing-fcm-token".to_owned(), [7; 32], [8; 16]).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn reregister_reuses_device_and_fcm_identity_without_store_writes() {
+    let existing = active_credential(steam());
+    let store = MemoryCredentialStore::with_rows(vec![existing.clone()]);
+    let registrar = FakeRegistrar::default();
+    let tokens = OneShotToken::new(SteamAuthToken::new("fresh-token".to_owned()).unwrap());
+
+    let outcome = reregister_companion(&store, &registrar, &tokens, steam())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.kind, EnrollmentKind::Reregistered);
+    assert_eq!(outcome.credential, existing);
+    assert_eq!(outcome.credential.state, CredentialState::Active);
+    let registrations = registrar.registrations().await;
+    assert_eq!(
+        registrations,
+        vec![(
+            "fresh-token".to_owned(),
+            existing.device_id.clone(),
+            "existing-fcm-token".to_owned()
+        )]
+    );
+    // No new FCM material and no store writes.
+    assert_eq!(registrar.creates(), 0);
+    assert_eq!(store.writes().await, 0);
+    assert_eq!(store.rows().await, vec![existing]);
+}
+
+#[tokio::test]
+async fn reregister_without_active_credential_is_a_typed_error() {
+    let registrar = FakeRegistrar::default();
+    let tokens = FakeTokens::default();
+
+    // Nothing stored.
+    let store = MemoryCredentialStore::default();
+    let error = reregister_companion(&store, &registrar, &tokens, steam())
+        .await
+        .unwrap_err();
+    assert_eq!(error, EnrollmentError::NoActiveCredential);
+
+    // A pending generation and a different account's active one do not count.
+    let mut pending = active_credential(steam());
+    pending.state = CredentialState::Pending;
+    let other = active_credential(SteamId::new(76_561_198_000_000_009).unwrap());
+    let store = MemoryCredentialStore::with_rows(vec![pending, other]);
+    let error = reregister_companion(&store, &registrar, &tokens, steam())
+        .await
+        .unwrap_err();
+    assert_eq!(error, EnrollmentError::NoActiveCredential);
+
+    assert_eq!(tokens.loads.load(Ordering::SeqCst), 0);
+    assert!(registrar.registrations().await.is_empty());
+    assert_eq!(store.writes().await, 0);
+}
+
+#[tokio::test]
+async fn reregister_consumes_the_one_shot_token_once() {
+    let store = MemoryCredentialStore::with_rows(vec![active_credential(steam())]);
+    let registrar = FakeRegistrar::default();
+    let tokens = OneShotToken::new(SteamAuthToken::new("fresh-token".to_owned()).unwrap());
+
+    reregister_companion(&store, &registrar, &tokens, steam())
+        .await
+        .unwrap();
+    let error = reregister_companion(&store, &registrar, &tokens, steam())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        EnrollmentError::Registration(RegistrationError::AuthTokenUnavailable("consumed"))
+    );
+    assert_eq!(registrar.registrations().await.len(), 1);
+}
+
+#[tokio::test]
+async fn reregister_propagates_registrar_errors_and_leaves_the_store_alone() {
+    let existing = active_credential(steam());
+    let store = MemoryCredentialStore::with_rows(vec![existing.clone()]);
+    let registrar = FakeRegistrar::default();
+    registrar
+        .fail_next(RegistrationError::ReenrollmentRequired)
+        .await;
+    let tokens = FakeTokens::default();
+
+    let error = reregister_companion(&store, &registrar, &tokens, steam())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        EnrollmentError::Registration(RegistrationError::ReenrollmentRequired)
+    );
+    assert_eq!(store.rows().await, vec![existing]);
+    assert_eq!(store.writes().await, 0);
+}
+
+#[tokio::test]
+async fn reregister_propagates_store_errors_before_any_network_call() {
+    let store = MemoryCredentialStore::with_rows(vec![active_credential(steam())]);
+    store.fail_load_active(StoreError::Decryption).await;
+    let registrar = FakeRegistrar::default();
+    let tokens = FakeTokens::default();
+
+    let error = reregister_companion(&store, &registrar, &tokens, steam())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, EnrollmentError::Store(StoreError::Decryption));
+    assert_eq!(tokens.loads.load(Ordering::SeqCst), 0);
+    assert!(registrar.registrations().await.is_empty());
 }

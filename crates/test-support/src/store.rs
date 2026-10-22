@@ -9,6 +9,7 @@ struct State {
     rows: Vec<Pairing>,
     upserts: Vec<Pairing>,
     removals: Vec<ServerId>,
+    clears: usize,
     load_error: Option<StoreError>,
 }
 
@@ -39,6 +40,10 @@ impl FakePairingStore {
     }
     pub async fn removals(&self) -> Vec<ServerId> {
         self.state.lock().await.removals.clone()
+    }
+    /// How many times `clear` succeeded.
+    pub async fn clears(&self) -> usize {
+        self.state.lock().await.clears
     }
 }
 
@@ -73,6 +78,14 @@ impl PairingStore for FakePairingStore {
             let mut state = self.state.lock().await;
             state.removals.push(server_id.clone());
             state.rows.retain(|row| row.server_id() != server_id);
+            Ok(())
+        })
+    }
+    fn clear<'a>(&'a self) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
+            state.rows.clear();
+            state.clears += 1;
             Ok(())
         })
     }

@@ -194,6 +194,7 @@ version = "0.1.0"
 dependencies = [
  "bot-domain",
  "bot-test-support",
+ "login-session",
  "rustix",
  "tokio",
  "tokio-util",
@@ -263,6 +264,7 @@ version = "0.1.0"
 dependencies = [
  "bot-application",
  "bot-domain",
+ "login-session",
  "tokio",
 ]
 

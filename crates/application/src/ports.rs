@@ -64,6 +64,11 @@ pub trait PairingStore: Send + Sync {
     fn load<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Pairing>, StoreError>>;
     fn upsert<'a>(&'a self, pairing: &'a Pairing) -> BoxFuture<'a, Result<(), StoreError>>;
     fn remove<'a>(&'a self, server_id: &'a ServerId) -> BoxFuture<'a, Result<(), StoreError>>;
+    /// Removes every stored pairing. Used when the companion account is
+    /// replaced: the old pairings belong to the old player. The caller must
+    /// have stopped every pairing writer first. Implementations use a single
+    /// statement, so a failure leaves the previous rows intact.
+    fn clear<'a>(&'a self) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
