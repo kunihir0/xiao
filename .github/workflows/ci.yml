@@ -175,12 +175,22 @@ jobs:
             -c ssl=on \
             -c ssl_cert_file=/var/lib/postgresql/server.crt \
             -c ssl_key_file=/var/lib/postgresql/server.key
-          for _ in {1..30}; do
-            if docker exec postgres-tls pg_isready -U bot -d bot_tls >/dev/null 2>&1; then
+          # The image's first-run init server listens on the unix socket only
+          # (listen_addresses=''), before POSTGRES_DB exists. Probe over TCP so
+          # the loop waits for the real server, and fail loudly if it never comes.
+          ready=0
+          for _ in {1..60}; do
+            if docker exec postgres-tls pg_isready -h 127.0.0.1 -U bot -d bot_tls >/dev/null 2>&1; then
+              ready=1
               break
             fi
             sleep 1
           done
+          if [ "$ready" != 1 ]; then
+            docker logs postgres-tls
+            echo "postgres-tls never became ready over TCP" >&2
+            exit 1
+          fi
           # Log postgres-tls status and verify connectivity
           docker logs postgres-tls
           docker exec postgres-tls psql -U bot -d bot_tls -c 'SHOW ssl;'
