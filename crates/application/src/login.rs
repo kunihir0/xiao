@@ -438,7 +438,10 @@ pub enum SwitchError {
     RestoreFailed,
     /// Clearing the old pairings or retiring the old credentials failed.
     StoreFailed,
-    /// The supervisor did not answer within the coordinator's bound.
+    /// The supervisor did not answer within the coordinator's bound. The
+    /// outcome is unknown: the timeout bounds the coordinator's own wait, not
+    /// the supervisor's work, so the supervisor may still complete the switch
+    /// afterwards.
     Timeout,
     /// The supervisor is not running, so it could not take the request.
     Unavailable,
@@ -479,6 +482,11 @@ impl std::error::Error for SwitchError {}
 /// The supervisor must check `ack.is_closed()` before acting. The coordinator
 /// drops its end when it gives up (timeout, shutdown), and a switch whose ack
 /// receiver is gone is stale: it must be ignored, not carried out.
+///
+/// The coordinator's timeout bounds only its own wait. A switch the supervisor
+/// has already started may still complete after the coordinator reported
+/// [`SwitchError::Timeout`], so a timeout means the outcome is unknown, not
+/// that nothing happened.
 #[derive(Debug)]
 pub struct AccountSwitch {
     pub to: SteamId,

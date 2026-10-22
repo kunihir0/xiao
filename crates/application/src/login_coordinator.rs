@@ -307,7 +307,7 @@ fn after(duration: Duration) -> Instant {
 
 /// Fixed label for a store error. Store error text can carry detail from the
 /// database layer, so it is never logged.
-fn kind(error: &StoreError) -> &'static str {
+pub(crate) fn kind(error: &StoreError) -> &'static str {
     match error {
         StoreError::Unavailable => "unavailable",
         StoreError::Invalid(_) => "invalid",

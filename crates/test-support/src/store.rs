@@ -4,6 +4,8 @@ use bot_application::{BoxFuture, PairingStore, StoreError};
 use bot_domain::{Pairing, ServerId};
 use tokio::sync::Mutex;
 
+use crate::{CallEvent, EventLog};
+
 #[derive(Default)]
 struct State {
     rows: Vec<Pairing>,
@@ -11,6 +13,8 @@ struct State {
     removals: Vec<ServerId>,
     clears: usize,
     load_error: Option<StoreError>,
+    clear_error: Option<StoreError>,
+    log: Option<EventLog>,
 }
 
 #[derive(Clone, Default)]
@@ -31,6 +35,15 @@ impl FakePairingStore {
     /// Makes every subsequent `load` fail with `error`.
     pub async fn fail_load(&self, error: StoreError) {
         self.state.lock().await.load_error = Some(error);
+    }
+    /// Makes every subsequent `clear` fail with `error` before changing
+    /// anything, until cleared with `None`.
+    pub async fn fail_clear(&self, error: Option<StoreError>) {
+        self.state.lock().await.clear_error = error;
+    }
+    /// Appends `clear` calls to `log`.
+    pub async fn record_calls_into(&self, log: &EventLog) {
+        self.state.lock().await.log = Some(log.clone());
     }
     pub async fn rows(&self) -> Vec<Pairing> {
         self.state.lock().await.rows.clone()
@@ -84,6 +97,12 @@ impl PairingStore for FakePairingStore {
     fn clear<'a>(&'a self) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
             let mut state = self.state.lock().await;
+            if let Some(log) = &state.log {
+                log.push(CallEvent::Clear);
+            }
+            if let Some(error) = &state.clear_error {
+                return Err(error.clone());
+            }
             state.rows.clear();
             state.clears += 1;
             Ok(())

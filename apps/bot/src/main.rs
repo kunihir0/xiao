@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use bot::{BoxError, Composition, CtrlCSignal};
 use bot_application::{
-    CompanionRegistrar, PairingService, PushCredentialStore, SessionConfig, SteamAuthTokenSource,
-    ensure_companion_registration,
+    BoxFuture, CompanionSupervisor, LegacyAccount, PairingRuntime, PairingService, PushCredential,
+    RuntimeError, ServiceError, SessionConfig, SupervisorPorts,
 };
 use bot_config::{Config, RustPlusConfig};
 use bot_db::{
@@ -27,8 +27,9 @@ use rustplus_adapter::{
     RustPlusSessionConnector, snapshot_from_fcm_secrets,
 };
 use rustplus_client::ReconnectPolicy;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info};
 #[cfg(feature = "live-acceptance")]
 use zeroize::Zeroizing;
 
@@ -40,88 +41,142 @@ async fn main() {
     }
 }
 
-/// Restores the active companion registration (no network) or completes
-/// enrollment, then builds an FCM connector from the persisted snapshot so
-/// Google check-in/register is never repeated for a restored credential.
-async fn restore_fcm_connector(
-    credentials: &dyn PushCredentialStore,
-    registrar: &dyn CompanionRegistrar,
-    tokens: &dyn SteamAuthTokenSource,
-    steam_id: SteamId,
+/// Switch requests the supervisor can queue. Only the login coordinator sends
+/// them, one at a time.
+const SWITCH_QUEUE: usize = 4;
+
+/// Builds an FCM connector from a credential's persisted snapshot, so Google
+/// check-in/register is never repeated for a restored credential.
+fn fcm_connector(
+    credential: &PushCredential,
     fcm_sender_id: &str,
 ) -> Result<FcmConnector, BoxError> {
-    let outcome = ensure_companion_registration(credentials, registrar, tokens, steam_id).await?;
-    info!(
-        kind = ?outcome.kind,
-        credential = %outcome.credential.id,
-        "Rust+ companion credentials ready"
-    );
-    let snapshot = snapshot_from_fcm_secrets(&outcome.credential.fcm)?;
+    let snapshot = snapshot_from_fcm_secrets(&credential.fcm)?;
     Ok(FcmConnector::from_snapshot(fcm_sender_id, snapshot)?)
 }
 
-/// Owns the whole Rust+ lifecycle: secret rewrap, credential restore or
-/// enrollment, then the pairing service. Cancellation is honoured during
-/// startup as well as while running.
+/// A fixed label per [`ServiceError`] variant. The error's own text is never
+/// logged: `Session` carries the server `host:port`, and the wrapped source and
+/// store errors may carry more.
+const fn service_kind(error: &ServiceError) -> &'static str {
+    match error {
+        ServiceError::Source(_) => "source",
+        ServiceError::Session { .. } => "session",
+        ServiceError::Store(_) => "store",
+        ServiceError::SourceClosed => "source_closed",
+        ServiceError::ShutdownTimeout(_) => "shutdown_timeout",
+        ServiceError::Restore(_) => "restore",
+    }
+}
+
+/// Builds the pairing service for an active credential. This is the
+/// composition the supervisor starts and stops as accounts change.
+struct BotPairingRuntime {
+    database: Arc<Db>,
+    keys: Arc<dyn KeyProvider>,
+    fcm_sender_id: String,
+}
+
+impl PairingRuntime for BotPairingRuntime {
+    fn start(
+        &self,
+        credential: PushCredential,
+        cancel: CancellationToken,
+    ) -> Result<BoxFuture<'static, Result<(), RuntimeError>>, RuntimeError> {
+        // Build errors are not logged with their text: the FCM one comes from
+        // parsing secret material, so only a fixed message is emitted.
+        let fcm = fcm_connector(&credential, &self.fcm_sender_id).map_err(|_| {
+            error!("building the FCM connector failed");
+            RuntimeError::Connector
+        })?;
+        // The secrets live on only inside the connector from here on.
+        drop(credential);
+        let connector =
+            RustPlusSessionConnector::new(ReconnectPolicy::default()).map_err(|_| {
+                error!("building the Rust+ session connector failed");
+                RuntimeError::Connector
+            })?;
+        let store = PostgresPairingStore::new(Arc::clone(&self.database), Arc::clone(&self.keys));
+        Ok(Box::pin(async move {
+            // The receiver task starts only once the supervisor polls this.
+            let receiver_config = ProductionConfig::default();
+            let receiver = push_receiver::start_connected(
+                Arc::new(fcm),
+                receiver_config.queue_capacity,
+                receiver_config.dedupe_capacity,
+                receiver_config.retry,
+            );
+            let source = PushPairingSource::new(receiver, ParseConfig::default());
+            let (service, _service_handle) =
+                PairingService::new(source, connector, store, SessionConfig::default());
+            service.run(cancel).await.map_err(|error| {
+                error!(kind = service_kind(&error), "pairing service failed");
+                match error {
+                    ServiceError::Restore(_) => RuntimeError::Restore,
+                    _ => RuntimeError::Service,
+                }
+            })
+        }))
+    }
+}
+
+/// Owns the whole Rust+ lifecycle: secret rewrap, then the companion
+/// supervisor, which restores or enrolls the account and runs its pairing
+/// service. Cancellation is honoured during startup as well as while running.
 async fn run_rustplus(
     database: Arc<Db>,
     keys: Arc<dyn KeyProvider>,
     config: RustPlusConfig,
+    login_enabled: bool,
     cancellation: CancellationToken,
 ) -> Result<(), BoxError> {
-    let startup = async {
+    let rewrap = async {
         let rewrapped = rewrap_secrets(&database, keys.as_ref()).await?;
         info!(
             credentials = rewrapped.credentials,
             pairings = rewrapped.pairings,
             "secret data keys wrapped with the active key"
         );
-        let Some(legacy) = config.legacy_account() else {
-            return Ok(None);
-        };
-        let steam_id = SteamId::new(legacy.steam_id())?;
-        let credentials =
-            PostgresPushCredentialStore::new(Arc::clone(&database), Arc::clone(&keys));
-        let registrar = FacepunchRegistrar::new(
+        Ok::<(), BoxError>(())
+    };
+    tokio::select! {
+        () = cancellation.cancelled() => return Ok(()),
+        result = rewrap => result?,
+    }
+    let legacy = config
+        .legacy_account()
+        .map(|legacy| {
+            Ok::<_, BoxError>(LegacyAccount::new(
+                SteamId::new(legacy.steam_id())?,
+                Arc::new(FileSteamAuthToken::new(legacy.token_file().to_path_buf())),
+            ))
+        })
+        .transpose()?;
+    let ports = SupervisorPorts {
+        credentials: Arc::new(PostgresPushCredentialStore::new(
+            Arc::clone(&database),
+            Arc::clone(&keys),
+        )),
+        pairings: Arc::new(PostgresPairingStore::new(
+            Arc::clone(&database),
+            Arc::clone(&keys),
+        )),
+        registrar: Arc::new(FacepunchRegistrar::new(
             config.fcm_sender_id().to_owned(),
             CompanionEndpoints::production(),
-        )?;
-        let tokens = FileSteamAuthToken::new(legacy.token_file().to_path_buf());
-        restore_fcm_connector(
-            &credentials,
-            &registrar,
-            &tokens,
-            steam_id,
-            config.fcm_sender_id(),
-        )
-        .await
-        .map(Some)
+        )?),
+        runtime: Arc::new(BotPairingRuntime {
+            database,
+            keys,
+            fcm_sender_id: config.fcm_sender_id().to_owned(),
+        }),
     };
-    let fcm = tokio::select! {
-        () = cancellation.cancelled() => return Ok(()),
-        result = startup => match result? {
-            Some(connector) => Arc::new(connector),
-            None => {
-                info!(
-                    "Rust+ companion configured without a legacy account; awaiting /login (not yet available; it will also need LOGIN_PUBLIC_HOST)"
-                );
-                return Ok(());
-            }
-        },
-    };
-    let receiver_config = ProductionConfig::default();
-    let receiver = push_receiver::start_connected(
-        fcm,
-        receiver_config.queue_capacity,
-        receiver_config.dedupe_capacity,
-        receiver_config.retry,
-    );
-    let source = PushPairingSource::new(receiver, ParseConfig::default());
-    let connector = RustPlusSessionConnector::new(ReconnectPolicy::default())?;
-    let store = PostgresPairingStore::new(database, keys);
-    let (service, _service_handle) =
-        PairingService::new(source, connector, store, SessionConfig::default());
-    service
+    // PR 6 hands this sender to the `LoginCoordinator`. Until then nothing
+    // sends account switches, so it is dropped: the supervisor keeps running
+    // its current account when the channel closes.
+    let (switches, receiver) = mpsc::channel(SWITCH_QUEUE);
+    drop(switches);
+    CompanionSupervisor::new(ports, legacy, login_enabled, receiver)
         .run(cancellation)
         .await
         .map_err(|error| Box::new(error) as BoxError)
@@ -488,6 +543,11 @@ async fn run() -> Result<(), BoxError> {
                         Arc::clone(&database),
                         keys,
                         rustplus_config.clone(),
+                        // PR 6 switches this to `config.login_enabled()` together
+                        // with the `LoginCoordinator`. Until then nothing can
+                        // send an account switch, so the recoverable idle
+                        // states would have no recovery path: keep them fatal.
+                        false,
                         cancellation,
                     ),
                 )?;
@@ -516,102 +576,26 @@ async fn run() -> Result<(), BoxError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use bot_application::{
-        BoxFuture, CredentialId, CredentialState, DeviceId, FcmSecrets, PushCredential,
-        RegistrationError, SteamAuthToken, StoreError,
-    };
+    use bot_application::{CredentialId, CredentialState, DeviceId, FcmSecrets};
 
     use super::*;
 
-    struct ActiveOnlyStore(PushCredential);
-
-    impl PushCredentialStore for ActiveOnlyStore {
-        fn load_active<'a>(
-            &'a self,
-            _steam_id: SteamId,
-        ) -> BoxFuture<'a, Result<Option<PushCredential>, StoreError>> {
-            Box::pin(async move { Ok(Some(self.0.clone())) })
-        }
-        fn load_pending<'a>(
-            &'a self,
-            _steam_id: SteamId,
-        ) -> BoxFuture<'a, Result<Option<PushCredential>, StoreError>> {
-            Box::pin(async { Err(StoreError::Unavailable) })
-        }
-        fn save_pending<'a>(
-            &'a self,
-            _credential: &'a PushCredential,
-        ) -> BoxFuture<'a, Result<(), StoreError>> {
-            Box::pin(async { Err(StoreError::Unavailable) })
-        }
-        fn promote_active<'a>(
-            &'a self,
-            _id: CredentialId,
-        ) -> BoxFuture<'a, Result<(), StoreError>> {
-            Box::pin(async { Err(StoreError::Unavailable) })
-        }
-        fn retire<'a>(&'a self, _id: CredentialId) -> BoxFuture<'a, Result<(), StoreError>> {
-            Box::pin(async { Err(StoreError::Unavailable) })
-        }
-        fn list_active<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SteamId>, StoreError>> {
-            Box::pin(async move { Ok(vec![self.0.steam_id]) })
-        }
-        fn retire_other_accounts<'a>(
-            &'a self,
-            _keep: SteamId,
-        ) -> BoxFuture<'a, Result<u64, StoreError>> {
-            Box::pin(async { Err(StoreError::Unavailable) })
-        }
-    }
-
-    #[derive(Default)]
-    struct CountingNetwork(AtomicUsize);
-
-    impl CompanionRegistrar for CountingNetwork {
-        fn create_fcm_credentials<'a>(
-            &'a self,
-        ) -> BoxFuture<'a, Result<FcmSecrets, RegistrationError>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Err(RegistrationError::Transport("test")) })
-        }
-        fn register<'a>(
-            &'a self,
-            _auth_token: &'a SteamAuthToken,
-            _device_id: &'a DeviceId,
-            _fcm: &'a FcmSecrets,
-        ) -> BoxFuture<'a, Result<(), RegistrationError>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Err(RegistrationError::Transport("test")) })
-        }
-    }
-
-    impl SteamAuthTokenSource for CountingNetwork {
-        fn load<'a>(&'a self) -> BoxFuture<'a, Result<SteamAuthToken, RegistrationError>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Err(RegistrationError::AuthTokenUnavailable("test")) })
-        }
-    }
-
     #[tokio::test]
-    async fn active_credential_restores_connector_without_any_registration() {
+    async fn active_credential_builds_connector_from_its_persisted_snapshot() {
         let steam_id = SteamId::new(76_561_198_000_000_001).unwrap();
         let fcm = FcmSecrets::new(41, 42, "restored-token".to_owned(), [5; 32], [6; 16]).unwrap();
-        let store = ActiveOnlyStore(PushCredential {
+        let credential = PushCredential {
             id: CredentialId::generate(),
             steam_id,
             device_id: DeviceId::generate(),
             state: CredentialState::Active,
             fcm,
-        });
-        let network = CountingNetwork::default();
+        };
 
-        let connector = restore_fcm_connector(&store, &network, &network, steam_id, "976529667804")
-            .await
-            .unwrap();
+        // No store, registrar or network is involved: the connector comes
+        // from the credential alone.
+        let connector = fcm_connector(&credential, "976529667804").unwrap();
 
-        assert_eq!(network.0.load(Ordering::SeqCst), 0);
         let snapshot = connector.snapshot().await.unwrap();
         assert_eq!(snapshot.checkin.android_id(), 41);
         assert_eq!(snapshot.checkin.security_token(), 42);
