@@ -229,7 +229,8 @@ mod tests {
 
     // Known-answer inputs; expected outputs were computed with python3
     // `cryptography` (ECDH, HKDF-SHA256, AESGCMSIV) and cross-checked against a
-    // stdlib hmac/hashlib HKDF. See the report for provenance.
+    // stdlib hmac/hashlib HKDF; the confirm and lookup vectors are also in
+    // tests/fixtures/confirm_code.json.
     const KAT_EPHEMERAL_PUBLIC: &str = "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285";
     const KAT_AAD: &str = "000000117869616f2e6c6f67696e2e726573756c740000001772757374706c75735f6c6f67696e5f73657373696f6e730000002430303131323233332d343435352d363637372d383839392d616162626363646465656666000100000020703235362d686b64662d7368613235362d6165732d3235362d67636d2d736976";
     const KAT_CIPHERTEXT: &str =

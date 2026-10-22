@@ -37,3 +37,16 @@ pub const MAX_TOKEN_BYTES: usize = 8192;
 pub const MAX_BRIDGE_PAYLOAD_BYTES: usize = 16 * 1024;
 /// Number of characters in the human-checked confirm code.
 pub const CONFIRM_CODE_LEN: usize = 6;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_constants_match_adr_0003() {
+        assert_eq!(SESSION_TTL, Duration::from_secs(600));
+        assert_eq!(MAX_TOKEN_BYTES, 8192);
+        assert_eq!(MAX_BRIDGE_PAYLOAD_BYTES, 16 * 1024);
+        assert_eq!(CONFIRM_CODE_LEN, 6);
+    }
+}

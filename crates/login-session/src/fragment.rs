@@ -17,10 +17,17 @@ enum Fault {
     Key,
 }
 
-/// Opaque rejection of a malformed URL fragment.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+/// Opaque rejection of a malformed URL fragment. `Debug` is hand-written so
+/// logs cannot reveal which part was malformed.
+#[derive(Clone, Copy, Eq, Error, PartialEq)]
 #[error("invalid login link fragment")]
 pub struct FragmentError(Fault);
+
+impl fmt::Debug for FragmentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FragmentError")
+    }
+}
 
 /// The URL fragment of the login link: `<base64url(secret)>.<base64url(key)>`.
 ///
@@ -56,8 +63,15 @@ impl Fragment {
     /// `String` (or a log line) that is never wiped.
     #[must_use]
     pub fn to_zeroizing_string(&self) -> Zeroizing<String> {
-        let secret = self.secret.to_base64url();
-        let key = URL_SAFE_NO_PAD.encode(self.recipient.to_compressed());
+        Self::encode(&self.secret, &self.recipient)
+    }
+
+    /// Encodes a fragment without taking ownership, so the bot keeps the
+    /// (non-`Clone`) link secret it later needs to open the result.
+    #[must_use]
+    pub fn encode(secret: &LinkSecret, recipient: &RecipientKey) -> Zeroizing<String> {
+        let secret = secret.to_base64url();
+        let key = URL_SAFE_NO_PAD.encode(recipient.to_compressed());
         let mut out = Zeroizing::new(String::with_capacity(
             LINK_SECRET_BASE64_LEN + 1 + KEY_BASE64_LEN,
         ));
@@ -220,5 +234,21 @@ mod tests {
     #[test]
     fn debug_is_redacted() {
         assert_eq!(format!("{:?}", sample()), "Fragment(<redacted>)");
+    }
+
+    #[test]
+    fn encode_by_reference_matches_owned_encoding() {
+        let fragment = sample();
+        let by_ref = Fragment::encode(&fragment.secret, &fragment.recipient);
+        assert_eq!(by_ref, fragment.to_zeroizing_string());
+        assert_eq!(by_ref.as_str(), KAT_FRAGMENT);
+    }
+
+    #[test]
+    fn error_debug_does_not_reveal_which_part_failed() {
+        for bad in ["", "a.b", "a"] {
+            let error = Fragment::parse(bad).err().unwrap();
+            assert_eq!(format!("{error:?}"), "FragmentError");
+        }
     }
 }

@@ -52,6 +52,12 @@ impl CompanionLoginResult {
         &self.token
     }
 
+    /// Consumes the result so the token moves on without an extra copy.
+    #[must_use]
+    pub fn into_parts(self) -> (SteamId, Zeroizing<String>) {
+        (self.steam_id, self.token)
+    }
+
     /// Deterministic plaintext for sealing:
     /// `steam_id u64 BE || token_len u32 BE || token bytes`. The envelope
     /// carries the format version, so nothing is versioned in here.
@@ -286,5 +292,12 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn into_parts_moves_the_validated_values() {
+        let (steam_id, token) = result("tok-ABC123").unwrap().into_parts();
+        assert_eq!(steam_id.value(), 76_561_198_000_000_000);
+        assert_eq!(token.as_str(), "tok-ABC123");
     }
 }

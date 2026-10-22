@@ -19,8 +19,10 @@ impl ConfirmCode {
     #[must_use]
     pub fn of(secret: &LinkSecret) -> Self {
         let mut okm = [0u8; CONFIRM_CODE_LEN];
-        // Expanding 6 bytes is far below the HKDF-SHA256 output limit
-        // (255 * 32), so the error arm is unreachable.
+        // Expanding CONFIRM_CODE_LEN bytes is far below the HKDF-SHA256 output
+        // limit, enforced at compile time below, so the error arm is
+        // unreachable.
+        const _: () = assert!(CONFIRM_CODE_LEN <= 255 * 32);
         let _ = Hkdf::<Sha256>::new(None, secret.as_bytes()).expand(CONFIRM_INFO, &mut okm);
         let code = okm
             .iter()

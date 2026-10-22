@@ -15,6 +15,10 @@ pub enum BrokerError {
     Unavailable,
     #[error("login session state conflict")]
     Conflict,
+    /// A stored value (for example the recipient key) failed validation. The
+    /// adapter logs the detail; the service fails the session as `internal`.
+    #[error("login session row is corrupt")]
+    Corrupt,
 }
 
 /// What a successful claim hands the service.
@@ -33,10 +37,10 @@ pub struct ClaimedSession {
 pub trait LoginSessionBroker: Send + Sync {
     /// Atomically moves the unexpired `pending` session with this lookup hash
     /// to `claimed`. `Ok(None)` covers unknown, used and expired links alike.
-    fn claim<'a>(
-        &'a self,
-        lookup: &'a LookupHash,
-    ) -> BoxFuture<'a, Result<Option<ClaimedSession>, BrokerError>>;
+    fn claim(
+        &self,
+        lookup: LookupHash,
+    ) -> BoxFuture<'_, Result<Option<ClaimedSession>, BrokerError>>;
 
     /// Stores the sealed result and moves `claimed` to `completed`.
     fn complete<'a>(
@@ -67,10 +71,10 @@ mod tests {
     }
 
     impl LoginSessionBroker for Fake {
-        fn claim<'a>(
-            &'a self,
-            _lookup: &'a LookupHash,
-        ) -> BoxFuture<'a, Result<Option<ClaimedSession>, BrokerError>> {
+        fn claim(
+            &self,
+            _lookup: LookupHash,
+        ) -> BoxFuture<'_, Result<Option<ClaimedSession>, BrokerError>> {
             Box::pin(async { Ok(None) })
         }
 

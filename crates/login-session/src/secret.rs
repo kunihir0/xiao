@@ -53,6 +53,9 @@ impl LinkSecret {
         Self(bytes)
     }
 
+    /// Wraps known bytes, for tests and fixtures. The caller's array is a
+    /// plain copy that is not wiped; production secrets come from
+    /// [`LinkSecret::generate`] or a parse.
     #[must_use]
     pub fn from_bytes(bytes: [u8; LINK_SECRET_LEN]) -> Self {
         Self(Zeroizing::new(bytes))
