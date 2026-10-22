@@ -3,6 +3,11 @@
 //! Diesel, PostgreSQL, and pool implementation details intentionally remain
 //! private to this crate. Callers interact with the typed [`Db`] lifecycle
 //! methods and [`DbError`] only.
+//!
+//! Features: `app` (default) is the bot's persistence, including the keyring
+//! and secret envelope; `login-broker` is the `xiao-login` service's
+//! `PostgresLoginBroker`, which runs as a role that may only execute the
+//! `login_*` functions. `xiao-login` disables default features.
 
 use diesel::migration::{Migration, MigrationSource};
 use diesel::sql_query;
@@ -427,6 +432,7 @@ impl Db {
             .map_err(|_| DbError::Connection)
     }
 
+    #[cfg(any(feature = "app", feature = "login-broker"))]
     pub(crate) fn pool(&self) -> &DatabasePool {
         &self.pool
     }
@@ -467,13 +473,27 @@ async fn verify_schema_current_connection(
     }
 }
 
+#[cfg(feature = "login-broker")]
+mod login_broker;
+#[cfg(feature = "app")]
+mod login_store;
+#[cfg(feature = "app")]
 mod repositories;
+#[cfg(feature = "app")]
 mod rotation;
 pub mod schema;
+#[cfg(feature = "app")]
 pub mod secrets;
 
+#[cfg(feature = "login-broker")]
+pub use login_broker::PostgresLoginBroker;
+#[cfg(feature = "app")]
+pub use login_store::{PostgresLoginAudit, PostgresLoginSessions};
+#[cfg(feature = "app")]
 pub use repositories::{PostgresPairingStore, PostgresPushCredentialStore};
+#[cfg(feature = "app")]
 pub use rotation::{RewrapReport, rewrap_secrets, secret_key_ids_in_use};
+#[cfg(feature = "app")]
 pub use secrets::{DataKey, FileKeyring, KeyId, KeyProvider, KeyringError, SecretError};
 
 #[cfg(test)]

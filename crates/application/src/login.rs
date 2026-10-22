@@ -538,20 +538,23 @@ pub trait LoginSessions: Send + Sync {
     /// with [`Self::cancel_live`]; a live row makes this fail with
     /// `StoreError::Conflict`.
     ///
-    /// Implementations must first expire stale live rows in the same
-    /// transaction (`UPDATE ... SET state = 'expired' WHERE state IN
-    /// ('pending', 'claimed') AND expires_at <= now()`), so an expired row
-    /// never blocks the live slot.
+    /// Implementations must first expire stale rows in the same transaction
+    /// (`UPDATE ... SET state = 'expired' WHERE state IN ('pending',
+    /// 'claimed', 'completed') AND expires_at <= now()`), nulling the sealed
+    /// result columns of any `completed` row among them. An expired live row
+    /// then never blocks the slot, and an abandoned result does not outlive
+    /// its session until the next restart.
     fn create<'a>(&'a self, session: &'a NewLoginSession) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Moves every `pending` or `claimed` row to `cancelled` and returns how
-    /// many changed. Terminal and `completed` rows are untouched. Used before
-    /// [`Self::create`] and by `/login cancel`.
+    /// many changed. Terminal rows and unexpired `completed` rows are
+    /// untouched. Used before [`Self::create`] and by `/login cancel`.
     ///
-    /// Implementations first expire stale live rows in the same transaction
-    /// (as for [`Self::create`]); rows expired that way are not cancelled and
-    /// do not count, so the result is the number of genuinely live sessions
-    /// that were cancelled.
+    /// Implementations first expire stale rows in the same transaction (as
+    /// for [`Self::create`], including expired `completed` rows, whose sealed
+    /// result is nulled); rows expired that way are not cancelled and do not
+    /// count, so the result is the number of genuinely live sessions that were
+    /// cancelled.
     ///
     /// The call is not scoped by session id: it cancels whatever is live.
     /// Only the single `companion-login` coordinator may call it.
@@ -613,8 +616,15 @@ pub trait LoginAudit: Send + Sync {
         id: LoginSessionId,
         outcome: &'a AuditOutcome,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
-    /// Nulls the Discord user ID of every record older than `age` (90 days in
-    /// production) and returns how many changed. The rest of the record stays.
+    /// Nulls the Discord user ID of every audit record older than `age` (90
+    /// days in production) and returns how many records changed. The rest of
+    /// the record stays.
+    ///
+    /// In the same transaction it deletes the session rows older than `age`
+    /// that have ended (`failed`, `cancelled`, `expired`, `consumed`, or any
+    /// row past its expiry), so the session table, which carries the Discord
+    /// user ID and the link's lookup hash, cannot be joined back to a scrubbed
+    /// record by session ID. These deletions are not counted.
     fn scrub_older_than<'a>(&'a self, age: Duration) -> BoxFuture<'a, Result<u64, StoreError>>;
 }
 

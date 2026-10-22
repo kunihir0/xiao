@@ -338,9 +338,17 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
   - It may `EXECUTE` only five functions: `login_claim`, `login_complete`,
     `login_fail`, `login_state` and `login_fail_orphans`.
   - These are migrator-owned `SECURITY DEFINER` functions that act only on
-    unexpired rows in the right state.
-    - Each one sets `search_path = pg_catalog, <schema>` with `pg_temp`
-      excluded, and every object reference is schema-qualified.
+    unexpired rows in the right state. The one exception is
+    `login_fail_orphans`, which fails every `claimed` row whether or not it
+    has expired, because its job is to free the slot after a crash.
+    Expiry and audit stamps use `clock_timestamp()`, not `now()`, so a
+    caller-held transaction cannot claim an expired row. Arguments are
+    validated in each function's `WHERE`, so a malformed call returns false
+    and never reaches a table CHECK, whose error would print the whole row.
+    - Each one sets `search_path = pg_catalog, <schema>, pg_temp`.
+      PostgreSQL cannot drop `pg_temp` from the path (unlisted, it is
+      searched first), so it is pinned last, and every object reference is
+      schema-qualified.
     - The `db` test also proves `xiao_login` cannot create objects in any
       schema on that path.
   - The migration runs `REVOKE EXECUTE ... FROM PUBLIC` on them.
@@ -359,7 +367,11 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
     SteamID. The `login_*` functions write the claimed and terminal
     timestamps from `xiao-login`'s side.
   - If the audit insert fails when `/login` starts, the login is denied.
-  - Retention: 90 days, then the Discord user ID is nulled.
+  - Retention: 90 days, then the Discord user ID is nulled and, in the same
+    transaction, the session rows older than that which have ended are
+    deleted. The session table holds the Discord user ID and the link's
+    lookup hash, so keeping those rows would let the scrub be undone by
+    joining on the session ID.
 - **Restart semantics:**
   - Bot start moves every `pending`, `claimed` or `completed` row to
     `expired` and nulls its ciphertext; the in-memory keys are gone.
@@ -370,8 +382,12 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
   - `/login cancel` lets the owner free the slot early. `xiao-login` polls
     `login_state` and tears down on cancel.
 - **What the database holds:** the token reaches PostgreSQL only as
-  ciphertext sealed to a key that exists only in bot memory, for at most the
-  session lifetime. The ciphertext can persist in WAL, dead tuples and
+  ciphertext sealed to a key that exists only in bot memory. The row holds
+  the ciphertext until the bot takes it, or until the first of the next
+  `/login`, `/login cancel` or bot restart after the session has expired,
+  which expires the row and nulls the columns. An abandoned result can
+  therefore outlive its session, but it is unopenable because the key was
+  zeroized. The ciphertext can also persist in WAL, dead tuples and
   backups. An attacker with only the database, only backups, only the URL,
   or the database plus the URL can neither open nor forge it. A database
   writer cannot redirect it, because the fragment commits to the recipient
