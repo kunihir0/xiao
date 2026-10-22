@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export LC_ALL=C
 
 fail() {
   printf '%s\n' "validate-production-env: $*" >&2
@@ -113,7 +114,9 @@ if [[ -n "${LOGIN_PUBLIC_HOST:-}" ]]; then
   label='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
   [[ ${#login_host} -le 253 && "$login_host" =~ ^${label}(\.${label})+$ ]] \
     || fail "LOGIN_PUBLIC_HOST must be a lowercase DNS host name only (no scheme, port, path, or trailing dot)"
-  [[ ! "${login_host##*.}" =~ ^[0-9]+$ ]] \
+  # Last label all-digit or 0x-hex is read as IPv4 by browsers. The Rust
+  # parser (url crate round trip) has the final word on anything subtler.
+  [[ ! "${login_host##*.}" =~ ^([0-9]+|0x[0-9a-f]*)$ ]] \
     || fail "LOGIN_PUBLIC_HOST must be a DNS host name, not an IP address"
 fi
 

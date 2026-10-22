@@ -103,7 +103,7 @@ async fn run_rustplus(
             Some(connector) => Arc::new(connector),
             None => {
                 info!(
-                    "Rust+ companion configured without a legacy account; awaiting /login (not yet available)"
+                    "Rust+ companion configured without a legacy account; awaiting /login (not yet available; it will also need LOGIN_PUBLIC_HOST)"
                 );
                 return Ok(());
             }

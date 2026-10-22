@@ -384,6 +384,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn early_ok_component_does_not_stop_its_siblings() {
+        // A Rust+ component with no account to run returns Ok(()) at once;
+        // Discord (the sibling) must keep running until the shutdown signal.
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (mut trigger, signal) = channel_signal();
+        let mut composition = Composition::new(signal);
+        let token = composition.cancellation_token();
+        let sibling_cancelled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&sibling_cancelled);
+        assert!(
+            composition
+                .register("idle-rustplus", async { Ok(()) })
+                .is_ok()
+        );
+        assert!(
+            composition
+                .register("discord", async move {
+                    token.cancelled().await;
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .is_ok()
+        );
+        let run = tokio::spawn(composition.run());
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !sibling_cancelled.load(Ordering::SeqCst),
+            "an early Ok(()) must not cancel the other components"
+        );
+        assert!(trigger.trigger().is_ok());
+        let report = run.await;
+        assert!(
+            matches!(&report, Ok(Ok(report)) if report.shutdown_requested && report.joined_tasks == 2),
+            "composition did not shut down cleanly: {report:?}"
+        );
+        assert!(sibling_cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn component_errors_reach_the_owner() {
         let (_trigger, signal) = channel_signal();
         let mut composition = Composition::new(signal);

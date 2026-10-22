@@ -117,11 +117,22 @@ pub const RUSTPLUS_LEGACY_VARIABLES: [&str; 2] =
     ["RUSTPLUS_STEAM_ID", "RUSTPLUS_STEAM_AUTH_TOKEN_FILE"];
 
 /// Legacy operator-supplied Rust+ account: a SteamID64 and the owner-only file
-/// holding its companion auth token.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// holding its companion auth token. `Debug` redacts the SteamID (ADR 0003:
+/// logs never contain one).
+#[derive(Clone, Eq, PartialEq)]
 pub struct LegacyAccount {
     steam_id: u64,
     token_file: PathBuf,
+}
+
+impl fmt::Debug for LegacyAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegacyAccount")
+            .field("steam_id", &"[REDACTED]")
+            .field("token_file", &self.token_file)
+            .finish()
+    }
 }
 
 impl LegacyAccount {
@@ -464,6 +475,18 @@ impl LoginPublicHost {
         }
         if last_label.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(reason("must be a DNS name, not an IP address"));
+        }
+        // Final word: the WHATWG host parser (the `url` crate, as browsers and
+        // the login service see it) must read the value back as exactly this
+        // domain. That rejects hex/octal IPv4 forms such as `127.0.0.0x7f`
+        // and invalid punycode such as `xn--a.com`.
+        match url::Host::parse(value) {
+            Ok(url::Host::Domain(domain)) if domain == value => {}
+            _ => {
+                return Err(reason(
+                    "must be a DNS name that browsers read back unchanged",
+                ));
+            }
         }
         Ok(Self(value.to_owned()))
     }
@@ -1420,6 +1443,40 @@ mod tests {
     }
 
     #[test]
+    fn partial_groups_combined_report_the_core_group_first() {
+        // Partial legacy group with the core group wholly absent is still a
+        // partial-group error, not "legacy without core".
+        let result = with_groups(false, true, &[], &["RUSTPLUS_STEAM_AUTH_TOKEN_FILE"]);
+        assert!(matches!(
+            result.err(),
+            Some(ConfigError::PartialRustPlus {
+                missing: "RUSTPLUS_STEAM_AUTH_TOKEN_FILE"
+            })
+        ));
+        // A partial core group with a complete legacy group names the core gap.
+        let result = with_groups(true, true, &[], &["SECRET_ACTIVE_KEY_ID"]);
+        assert!(matches!(
+            result.err(),
+            Some(ConfigError::PartialRustPlus {
+                missing: "SECRET_ACTIVE_KEY_ID"
+            })
+        ));
+    }
+
+    #[test]
+    fn legacy_account_debug_redacts_the_steam_id() {
+        let config = with_groups(true, true, &[], &[]).expect("both groups parse");
+        let legacy = config
+            .rustplus()
+            .and_then(super::RustPlusConfig::legacy_account)
+            .expect("legacy account present");
+        let steam_id = legacy.steam_id().to_string();
+        for text in [format!("{legacy:?}"), format!("{:?}", config.rustplus())] {
+            assert!(!text.contains(&steam_id), "SteamID leaked: {text}");
+        }
+    }
+
+    #[test]
     fn legacy_without_core_error_names_variables_without_values() {
         let message = ConfigError::LegacyRustPlusWithoutCore.to_string();
         for name in super::RUSTPLUS_CORE_VARIABLES
@@ -1531,6 +1588,12 @@ mod tests {
             "localhost",
             "1.2.3.4",
             "0x7f.1",
+            "127.0.0.0x7f",
+            "1.0x",
+            "0x.0x1",
+            "a.0x7f",
+            "xn--a.com",
+            "xn--.com",
             "[::1]",
             "::1",
             "X.Example.com",
