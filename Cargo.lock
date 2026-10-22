@@ -1704,6 +1704,7 @@ version = "0.1.0"
 dependencies = [
  "bot-application",
  "push-receiver",
+ "rand 0.10.3",
  "rustix",
  "rustplus-adapter",
  "rustplus-client",

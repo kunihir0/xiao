@@ -1,11 +1,13 @@
 //! Isolated Rust+ live-proof harness for issue #23.
 //!
 //! `run` talks to real FCM, Expo, Facepunch, MCS, and Rust+ servers, but only
-//! after the operator supplies a well-formed approval string and an evidence
-//! directory that does not exist yet. Everything before that gate is offline.
+//! after a human at an interactive terminal types back a fresh one-time code
+//! and the evidence directory does not exist yet. Everything before that
+//! confirmation is offline and creates no files.
 
 mod args;
 mod classify;
+mod confirm;
 mod helpers;
 mod live;
 mod manifest;
@@ -24,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     args::{Command, Refusal, RunConfig, USAGE, parse_args},
+    confirm::{ConfirmationIo, StdTerminal, confirm_interruptible},
     helpers::validate_token_file,
     live::LiveExecutor,
     manifest::{ManifestError, ManifestWriter, RowSink},
@@ -35,15 +38,16 @@ const EXIT_USAGE: u8 = 64;
 const EXIT_NO_INPUT: u8 = 66;
 const EXIT_NO_GO: u8 = 70;
 const EXIT_CANT_CREATE: u8 = 73;
-const EXIT_NO_PERMISSION: u8 = 77;
+/// The interactive one-time confirmation was refused.
+const EXIT_CONFIRMATION_REFUSED: u8 = 77;
 
 fn main() -> ExitCode {
     ExitCode::from(cli(env::args_os().skip(1), run_live))
 }
 
-/// Parses arguments and applies the pre-network gate. `run` is invoked only
-/// after both pass, so a refusal can never reach a network call or create
-/// any file.
+/// Parses arguments and applies the offline evidence-directory check. `run`
+/// is invoked only after both pass; a refusal can never reach a network call
+/// or create any file.
 fn cli(args: impl IntoIterator<Item = OsString>, run: impl FnOnce(RunConfig) -> u8) -> u8 {
     let config = match parse_args(args) {
         Ok(Command::Run(config)) => config,
@@ -55,7 +59,6 @@ fn cli(args: impl IntoIterator<Item = OsString>, run: impl FnOnce(RunConfig) -> 
     if let Err(refusal) = config.preflight() {
         eprintln!("phase0-live-proof: refused: {refusal}");
         return match refusal {
-            Refusal::ApprovalFormat => EXIT_NO_PERMISSION,
             Refusal::EvidenceDirExists | Refusal::EvidenceParentMissing => EXIT_CANT_CREATE,
         };
     }
@@ -82,12 +85,15 @@ async fn execute<E: StageExecutor, S: RowSink>(executor: &mut E, sink: &mut S) -
 
 /// Validates the Steam token file locally first (a malformed file never
 /// reaches the irreversible FCM enrollment; token acceptance is proven only
-/// by Facepunch later), then creates the evidence directory and runs the
-/// stages.
-async fn run_gated<E: StageExecutor>(
+/// by Facepunch later), then requires the human's one-time confirmation, and
+/// only then creates the evidence directory and runs the stages. A refusal
+/// creates nothing and never reaches the executor.
+async fn run_gated<E: StageExecutor, C: ConfirmationIo + Send + 'static>(
     token_file: PathBuf,
     evidence_dir: &Path,
     executor: &mut E,
+    confirmation: C,
+    cancel: &CancellationToken,
 ) -> u8 {
     if let Err(failure) = validate_token_file(token_file).await {
         eprintln!(
@@ -95,6 +101,13 @@ async fn run_gated<E: StageExecutor>(
             failure.detail
         );
         return EXIT_NO_INPUT;
+    }
+    if confirm_interruptible(confirmation, cancel).await.is_err() {
+        eprintln!(
+            "phase0-live-proof: confirmation refused; nothing was started \
+(an interactive terminal and the one-time code are required)"
+        );
+        return EXIT_CONFIRMATION_REFUSED;
     }
     let mut writer = match ManifestWriter::create(evidence_dir) {
         Ok(writer) => writer,
@@ -129,8 +142,15 @@ fn run_live(config: RunConfig) -> u8 {
         };
         let token_file = config.steam_token_file.clone();
         let evidence_dir = config.evidence_dir.clone();
-        let mut executor = LiveExecutor::new(config, cancel);
-        let code = run_gated(token_file, &evidence_dir, &mut executor).await;
+        let mut executor = LiveExecutor::new(config, cancel.clone());
+        let code = run_gated(
+            token_file,
+            &evidence_dir,
+            &mut executor,
+            StdTerminal::new(),
+            &cancel,
+        )
+        .await;
         interrupt.abort();
         code
     });
@@ -143,17 +163,24 @@ fn run_live(config: RunConfig) -> u8 {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::cell::Cell;
+    use std::{
+        cell::Cell,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use zeroize::Zeroizing;
 
     use super::*;
     use crate::{
+        confirm::LineFailure,
         manifest::{ManifestRow, Route, Stage, Status, StatusClass},
         sequence::StageOutcome,
     };
 
-    const VALID_APPROVAL: &str = "phase0-23-0123abcd";
-
-    fn argv(evidence_dir: &str, approval: &str) -> Vec<OsString> {
+    fn argv(evidence_dir: &str) -> Vec<OsString> {
         [
             "run",
             "--evidence-dir",
@@ -164,8 +191,6 @@ mod tests {
             "1",
             "--steam-token-file",
             "/nonexistent",
-            "--approved-run-id",
-            approval,
         ]
         .iter()
         .map(OsString::from)
@@ -198,43 +223,35 @@ mod tests {
         ] {
             assert_eq!(cli_with_probe(args), (64, false));
         }
-        let mut duplicate = argv("/tmp/p23-main-never", VALID_APPROVAL);
+        let mut duplicate = argv("/tmp/p23-main-never");
         duplicate.extend(["--steam-id", "2"].map(OsString::from));
         assert_eq!(cli_with_probe(duplicate), (64, false));
     }
 
     #[test]
-    fn approval_refusal_exits_77_before_the_runner_and_creates_nothing() {
-        let dir = scratch("approval");
-        let evidence = dir.join("evidence");
-        let evidence_text = evidence.to_str().expect("utf8").to_owned();
-        for approval in ["wrong", "phase0-23-0123ABCD", "phase0-23-"] {
-            assert_eq!(cli_with_probe(argv(&evidence_text, approval)), (77, false));
-        }
-        assert!(!evidence.exists());
-        std::fs::remove_dir_all(dir).expect("cleanup");
+    fn retired_approval_flag_is_a_usage_error() {
+        let mut args = argv("/tmp/p23-main-never");
+        args.extend(["--approved-run-id", "phase0-23-0123abcd"].map(OsString::from));
+        assert_eq!(cli_with_probe(args), (64, false));
     }
 
     #[test]
     fn existing_or_unreachable_evidence_dir_exits_73_before_the_runner() {
         let dir = scratch("evidence");
         let existing = dir.to_str().expect("utf8").to_owned();
-        assert_eq!(cli_with_probe(argv(&existing, VALID_APPROVAL)), (73, false));
+        assert_eq!(cli_with_probe(argv(&existing)), (73, false));
         let orphan = dir.join("missing-parent").join("evidence");
         let orphan = orphan.to_str().expect("utf8").to_owned();
-        assert_eq!(cli_with_probe(argv(&orphan, VALID_APPROVAL)), (73, false));
+        assert_eq!(cli_with_probe(argv(&orphan)), (73, false));
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]
-    fn approved_fresh_run_reaches_the_runner_and_returns_its_code() {
+    fn fresh_run_reaches_the_runner_and_returns_its_code() {
         let dir = scratch("fresh");
         let fresh = dir.join("evidence");
         let fresh_text = fresh.to_str().expect("utf8").to_owned();
-        assert_eq!(
-            cli_with_probe(argv(&fresh_text, VALID_APPROVAL)),
-            (42, true)
-        );
+        assert_eq!(cli_with_probe(argv(&fresh_text)), (42, true));
         assert!(!fresh.exists(), "only the runner may create the directory");
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
@@ -290,34 +307,137 @@ mod tests {
         assert!(rows.iter().all(|row| row.stage != Stage::NoGo));
     }
 
-    #[tokio::test]
-    async fn unusable_token_file_stops_before_any_stage_or_file() {
-        let dir = scratch("gate-token");
-        let evidence = dir.join("evidence");
-        let mut executor = Fake {
+    /// Scripted terminal that records whether it was ever consulted.
+    struct Typist {
+        terminal: bool,
+        reply: Result<&'static str, LineFailure>,
+        consulted: Arc<AtomicBool>,
+    }
+
+    impl Typist {
+        fn new(
+            terminal: bool,
+            reply: Result<&'static str, LineFailure>,
+        ) -> (Self, Arc<AtomicBool>) {
+            let consulted = Arc::new(AtomicBool::new(false));
+            let typist = Self {
+                terminal,
+                reply,
+                consulted: Arc::clone(&consulted),
+            };
+            (typist, consulted)
+        }
+    }
+
+    impl ConfirmationIo for Typist {
+        fn is_interactive_terminal(&self) -> bool {
+            self.consulted.store(true, Ordering::SeqCst);
+            self.terminal
+        }
+
+        fn new_code(&mut self) -> Zeroizing<String> {
+            Zeroizing::new("ABCD2345".to_owned())
+        }
+
+        fn show_prompt(&mut self, _text: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn read_line(&mut self, _timeout: Duration) -> Result<Zeroizing<String>, LineFailure> {
+            self.reply.map(|line| Zeroizing::new(line.to_owned()))
+        }
+    }
+
+    fn write_token(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let token = dir.join("token");
+        std::fs::write(&token, "steam-token-value\n").expect("write");
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        token
+    }
+
+    fn fake() -> Fake {
+        Fake {
             failing: None,
             finished: false,
-        };
-        let code = run_gated(dir.join("absent-token"), &evidence, &mut executor).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_token_file_stops_before_confirmation_any_stage_or_file() {
+        let dir = scratch("gate-token");
+        let evidence = dir.join("evidence");
+        let mut executor = fake();
+        let (typist, consulted) = Typist::new(true, Ok("ABCD2345\n"));
+        let cancel = CancellationToken::new();
+        let code = run_gated(
+            dir.join("absent-token"),
+            &evidence,
+            &mut executor,
+            typist,
+            &cancel,
+        )
+        .await;
         assert_eq!(code, 66);
+        assert!(!consulted.load(Ordering::SeqCst), "no prompt was shown");
         assert!(!executor.finished, "no stage, and so no enrollment, ran");
         assert!(!evidence.exists(), "no evidence directory was created");
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[tokio::test]
-    async fn usable_token_file_lets_the_run_proceed() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = scratch("gate-ok");
-        let token = dir.join("token");
-        std::fs::write(&token, "steam-token-value\n").expect("write");
-        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    async fn every_confirmation_refusal_exits_77_and_creates_and_runs_nothing() {
+        let refusals = [
+            (false, Ok("ABCD2345\n")),
+            (true, Ok("WRONG234\n")),
+            (true, Ok("abcd2345\n")),
+            (true, Ok("ABCD2345")),
+            (true, Err(LineFailure::EndOfInput)),
+            (true, Err(LineFailure::Unterminated)),
+            (true, Err(LineFailure::TimedOut)),
+            (true, Err(LineFailure::Unreadable)),
+        ];
+        for (terminal, reply) in refusals {
+            let dir = scratch("gate-refused");
+            let token = write_token(&dir);
+            let evidence = dir.join("evidence");
+            let mut executor = fake();
+            let (typist, _) = Typist::new(terminal, reply);
+            let cancel = CancellationToken::new();
+            let code = run_gated(token, &evidence, &mut executor, typist, &cancel).await;
+            assert_eq!(code, 77, "{terminal} {reply:?}");
+            assert!(!executor.finished, "the executor was never reached");
+            assert!(!evidence.exists(), "no evidence directory was created");
+            std::fs::remove_dir_all(dir).expect("cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_confirmation_exits_77_and_creates_nothing() {
+        let dir = scratch("gate-interrupt");
+        let token = write_token(&dir);
         let evidence = dir.join("evidence");
-        let mut executor = Fake {
-            failing: None,
-            finished: false,
-        };
-        assert_eq!(run_gated(token, &evidence, &mut executor).await, 0);
+        let mut executor = fake();
+        let (typist, _) = Typist::new(true, Ok("ABCD2345\n"));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let code = run_gated(token, &evidence, &mut executor, typist, &cancel).await;
+        assert_eq!(code, 77);
+        assert!(!executor.finished);
+        assert!(!evidence.exists());
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn confirmed_run_proceeds() {
+        let dir = scratch("gate-ok");
+        let token = write_token(&dir);
+        let evidence = dir.join("evidence");
+        let mut executor = fake();
+        let (typist, _) = Typist::new(true, Ok("ABCD2345\n"));
+        let cancel = CancellationToken::new();
+        let code = run_gated(token, &evidence, &mut executor, typist, &cancel).await;
+        assert_eq!(code, 0);
         assert!(executor.finished);
         assert!(evidence.join("manifest.jsonl").is_file());
         std::fs::remove_dir_all(dir).expect("cleanup");

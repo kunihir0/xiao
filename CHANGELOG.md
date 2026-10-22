@@ -18,6 +18,11 @@ All notable externally meaningful changes are documented here. Releases follow S
   (`human_reset_unconfirmed` when unconfirmed). The Steam token file is checked
   locally before enrollment, but only Facepunch's response proves acceptance, so
   a rejected token still leaves the FCM enrollment in place.
+- `phase0-live-proof` now requires an interactive one-time confirmation (a fresh
+  random code typed back, with interactive terminals on both stdin and stdout)
+  before any live run, replacing the
+  format-only `--approved-run-id` flag, which is removed. A refused confirmation
+  exits 77 and creates no files and no network traffic.
 
 - Hardened database persistence with strict TLS verify-full default requiring a
   CA bundle file, explicit dev/local insecure opt-in, separate DDL migration
