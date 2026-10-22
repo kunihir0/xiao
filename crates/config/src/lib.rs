@@ -2,6 +2,7 @@
 
 use std::fmt::{self, Debug, Display, Formatter};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use url::Url;
@@ -19,10 +20,9 @@ pub struct Config {
     database_migrate_on_startup: bool,
     telemetry: TelemetryConfig,
     rustplus: Option<RustPlusConfig>,
+    login_public_host: Option<LoginPublicHost>,
 }
 
-/// Rust+ companion configuration. Opt-in: every variable in
-/// [`RUSTPLUS_VARIABLES`] must be set together, or none of them.
 /// Standalone migration settings required by `xiao-bot migrate`.
 #[derive(Clone)]
 pub struct MigrationConfig {
@@ -33,14 +33,7 @@ pub struct MigrationConfig {
 impl MigrationConfig {
     /// Loads migration configuration from the process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_lookup(|name| {
-            std::env::var(name).map(Some).or_else(|error| match error {
-                std::env::VarError::NotPresent => Ok(None),
-                std::env::VarError::NotUnicode(_) => {
-                    Err(ConfigError::InvalidUnicode { variable: name })
-                }
-            })
-        })
+        Self::from_lookup(env_lookup)
     }
 
     fn from_lookup<F>(mut lookup: F) -> Result<Self, ConfigError>
@@ -97,30 +90,52 @@ impl Debug for MigrationConfig {
     }
 }
 
-/// Optional Rust+ push receiver configuration.
+/// Optional Rust+ companion configuration.
+///
+/// The core group ([`RUSTPLUS_CORE_VARIABLES`]) is all-or-none and enables the
+/// Rust+ supervisor. The legacy group ([`RUSTPLUS_LEGACY_VARIABLES`]) is
+/// both-or-neither and requires the core group; it names an operator-supplied
+/// account that is used until an account enrolled through `/login` exists.
 #[derive(Clone)]
 pub struct RustPlusConfig {
     fcm_sender_id: String,
-    steam_id: u64,
-    steam_auth_token_file: PathBuf,
     keyring_file: PathBuf,
     active_key_id: String,
+    legacy_account: Option<LegacyAccount>,
 }
 
-/// Environment variables that together enable Rust+ pairing.
-pub const RUSTPLUS_VARIABLES: [&str; 5] = [
+/// Group A: variables that together enable the Rust+ supervisor.
+pub const RUSTPLUS_CORE_VARIABLES: [&str; 3] = [
     "RUSTPLUS_FCM_SENDER_ID",
-    "RUSTPLUS_STEAM_ID",
-    "RUSTPLUS_STEAM_AUTH_TOKEN_FILE",
     "SECRET_KEYRING_FILE",
     "SECRET_ACTIVE_KEY_ID",
 ];
 
-impl RustPlusConfig {
-    pub fn fcm_sender_id(&self) -> &str {
-        &self.fcm_sender_id
-    }
+/// Group B: variables that together name the legacy operator-supplied account.
+/// Only valid alongside [`RUSTPLUS_CORE_VARIABLES`].
+pub const RUSTPLUS_LEGACY_VARIABLES: [&str; 2] =
+    ["RUSTPLUS_STEAM_ID", "RUSTPLUS_STEAM_AUTH_TOKEN_FILE"];
 
+/// Legacy operator-supplied Rust+ account: a SteamID64 and the owner-only file
+/// holding its companion auth token. `Debug` redacts the SteamID (ADR 0003:
+/// logs never contain one).
+#[derive(Clone, Eq, PartialEq)]
+pub struct LegacyAccount {
+    steam_id: u64,
+    token_file: PathBuf,
+}
+
+impl fmt::Debug for LegacyAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegacyAccount")
+            .field("steam_id", &"[REDACTED]")
+            .field("token_file", &self.token_file)
+            .finish()
+    }
+}
+
+impl LegacyAccount {
     /// Steam account (SteamID64) that owns the companion registration.
     pub const fn steam_id(&self) -> u64 {
         self.steam_id
@@ -128,8 +143,42 @@ impl RustPlusConfig {
 
     /// Owner-only file holding the operator-supplied Rust+ companion auth
     /// token. Read only when a registration is required.
-    pub fn steam_auth_token_file(&self) -> &Path {
-        &self.steam_auth_token_file
+    pub fn token_file(&self) -> &Path {
+        &self.token_file
+    }
+
+    fn parse(steam_id: &str, token_file: String) -> Result<Self, ConfigError> {
+        let steam_id = steam_id
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(ConfigError::InvalidRustPlus {
+                variable: "RUSTPLUS_STEAM_ID",
+                reason: "expected a non-zero SteamID64",
+            })?;
+        let token_file = absolute_path("RUSTPLUS_STEAM_AUTH_TOKEN_FILE", token_file)?;
+        Ok(Self {
+            steam_id,
+            token_file,
+        })
+    }
+}
+
+/// Returns the first missing variable when a group is partially set.
+fn partial_group(values: &[Option<String>], names: &[&'static str]) -> Option<&'static str> {
+    if values.iter().all(Option::is_none) {
+        return None;
+    }
+    values
+        .iter()
+        .zip(names)
+        .find_map(|(value, name)| value.is_none().then_some(*name))
+}
+
+impl RustPlusConfig {
+    pub fn fcm_sender_id(&self) -> &str {
+        &self.fcm_sender_id
     }
 
     /// Owner-only key-encryption keyring file (`key_id:hex32` lines).
@@ -142,51 +191,47 @@ impl RustPlusConfig {
         &self.active_key_id
     }
 
+    /// Legacy operator-supplied account, when group B is configured.
+    pub fn legacy_account(&self) -> Option<&LegacyAccount> {
+        self.legacy_account.as_ref()
+    }
+
     fn from_lookup<F>(lookup: &mut F) -> Result<Option<Self>, ConfigError>
     where
         F: FnMut(&'static str) -> Result<Option<String>, ConfigError>,
     {
-        let fcm_sender_id = load_secret(
-            lookup,
-            "RUSTPLUS_FCM_SENDER_ID",
-            "RUSTPLUS_FCM_SENDER_ID_FILE",
-        )?;
-        let steam_id = optional(lookup, "RUSTPLUS_STEAM_ID")?;
-        let steam_auth_token_file = optional(lookup, "RUSTPLUS_STEAM_AUTH_TOKEN_FILE")?;
-        let keyring_file = optional(lookup, "SECRET_KEYRING_FILE")?;
-        let active_key_id = optional(lookup, "SECRET_ACTIVE_KEY_ID")?;
-        let values = [
-            fcm_sender_id,
-            steam_id,
-            steam_auth_token_file,
-            keyring_file,
-            active_key_id,
+        let core = [
+            load_secret(
+                lookup,
+                "RUSTPLUS_FCM_SENDER_ID",
+                "RUSTPLUS_FCM_SENDER_ID_FILE",
+            )?,
+            optional(lookup, "SECRET_KEYRING_FILE")?,
+            optional(lookup, "SECRET_ACTIVE_KEY_ID")?,
         ];
-        if values.iter().all(Option::is_none) {
-            return Ok(None);
+        let legacy = [
+            optional(lookup, "RUSTPLUS_STEAM_ID")?,
+            optional(lookup, "RUSTPLUS_STEAM_AUTH_TOKEN_FILE")?,
+        ];
+        if let Some(missing) = partial_group(&core, &RUSTPLUS_CORE_VARIABLES)
+            .or_else(|| partial_group(&legacy, &RUSTPLUS_LEGACY_VARIABLES))
+        {
+            return Err(ConfigError::PartialRustPlus { missing });
         }
-        if let Some(index) = values.iter().position(Option::is_none) {
-            return Err(ConfigError::PartialRustPlus {
-                missing: RUSTPLUS_VARIABLES[index],
-            });
-        }
-        let mut values = values.into_iter().flatten();
-        let mut next = || values.next().unwrap_or_default();
-        let fcm_sender_id = next();
-        let steam_id = next();
-        let steam_auth_token_file = next();
-        let keyring_file = next();
-        let active_key_id = next();
-
-        let steam_id = steam_id
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value != 0)
-            .ok_or(ConfigError::InvalidRustPlus {
-                variable: "RUSTPLUS_STEAM_ID",
-                reason: "expected a non-zero SteamID64",
-            })?;
+        let [Some(fcm_sender_id), Some(keyring_file), Some(active_key_id)] = core else {
+            // Group A is entirely absent: group B alone is a configuration error.
+            return if legacy.iter().any(Option::is_some) {
+                Err(ConfigError::LegacyRustPlusWithoutCore)
+            } else {
+                Ok(None)
+            };
+        };
+        let legacy_account = match legacy {
+            [Some(steam_id), Some(token_file)] => {
+                Some(LegacyAccount::parse(&steam_id, token_file)?)
+            }
+            _ => None,
+        };
         let active_key_id = active_key_id.trim().to_owned();
         if active_key_id.len() > 64
             || !active_key_id
@@ -198,15 +243,12 @@ impl RustPlusConfig {
                 reason: "expected 1-64 characters from [A-Za-z0-9._-]",
             });
         }
-        let steam_auth_token_file =
-            absolute_path("RUSTPLUS_STEAM_AUTH_TOKEN_FILE", steam_auth_token_file)?;
         let keyring_file = absolute_path("SECRET_KEYRING_FILE", keyring_file)?;
         Ok(Some(Self {
             fcm_sender_id,
-            steam_id,
-            steam_auth_token_file,
             keyring_file,
             active_key_id,
+            legacy_account,
         }))
     }
 }
@@ -222,20 +264,24 @@ fn absolute_path(variable: &'static str, value: String) -> Result<PathBuf, Confi
     Ok(path)
 }
 
+fn absolute_login_path(variable: &'static str, value: String) -> Result<PathBuf, ConfigError> {
+    let path = PathBuf::from(value.trim());
+    if !path.is_absolute() {
+        return Err(ConfigError::InvalidLogin {
+            variable,
+            reason: "expected an absolute file path",
+        });
+    }
+    Ok(path)
+}
+
 impl Config {
     /// Loads and validates configuration from the process environment.
     ///
     /// This intentionally does not read `.env` files or otherwise mutate the
     /// process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_lookup(|name| {
-            std::env::var(name).map(Some).or_else(|error| match error {
-                std::env::VarError::NotPresent => Ok(None),
-                std::env::VarError::NotUnicode(_) => {
-                    Err(ConfigError::InvalidUnicode { variable: name })
-                }
-            })
-        })
+        Self::from_lookup(env_lookup)
     }
 
     fn from_lookup<F>(mut lookup: F) -> Result<Self, ConfigError>
@@ -262,20 +308,12 @@ impl Config {
             .transpose()?
             .unwrap_or(true);
 
-        let filter = optional(&mut lookup, "RUST_LOG")?.unwrap_or_else(|| "info".to_owned());
-        if filter.trim().is_empty() {
-            return Err(ConfigError::Empty {
-                variable: "RUST_LOG",
-            });
-        }
-        let format = optional(&mut lookup, "TELEMETRY_FORMAT")?
-            .unwrap_or_else(|| "compact".to_owned())
-            .parse()
-            .map_err(|_| ConfigError::InvalidTelemetryFormat {
-                value: "TELEMETRY_FORMAT",
-            })?;
+        let telemetry = load_telemetry(&mut lookup)?;
 
         let rustplus = RustPlusConfig::from_lookup(&mut lookup)?;
+        let login_public_host = optional(&mut lookup, "LOGIN_PUBLIC_HOST")?
+            .map(|value| LoginPublicHost::parse(&value))
+            .transpose()?;
 
         Ok(Self {
             discord_token,
@@ -283,14 +321,27 @@ impl Config {
             migration_database_url,
             database_tls,
             database_migrate_on_startup,
-            telemetry: TelemetryConfig { filter, format },
+            telemetry,
             rustplus,
+            login_public_host,
         })
     }
 
     /// Returns the optional Rust+ push receiver settings.
     pub fn rustplus(&self) -> Option<&RustPlusConfig> {
         self.rustplus.as_ref()
+    }
+
+    /// Returns the public host `/login` links point at, when configured.
+    pub fn login_public_host(&self) -> Option<&LoginPublicHost> {
+        self.login_public_host.as_ref()
+    }
+
+    /// Returns whether the Discord `/login` command is enabled: the Rust+
+    /// core group and `LOGIN_PUBLIC_HOST` must both be set. The Rust+
+    /// supervisor itself needs only the core group.
+    pub fn login_enabled(&self) -> bool {
+        self.rustplus.is_some() && self.login_public_host.is_some()
     }
 
     /// Returns the Discord credential for the Discord adapter.
@@ -341,6 +392,7 @@ impl Debug for Config {
             )
             .field("telemetry", &self.telemetry)
             .field("rustplus", &self.rustplus.as_ref().map(|_| REDACTED))
+            .field("login_public_host", &self.login_public_host)
             .finish()
     }
 }
@@ -350,10 +402,219 @@ impl Debug for RustPlusConfig {
         formatter
             .debug_struct("RustPlusConfig")
             .field("fcm_sender_id", &REDACTED)
-            .field("steam_id", &self.steam_id)
-            .field("steam_auth_token_file", &self.steam_auth_token_file)
             .field("keyring_file", &self.keyring_file)
             .field("active_key_id", &self.active_key_id)
+            .field("legacy_account", &self.legacy_account)
+            .finish()
+    }
+}
+
+/// Public DNS host that `/login` links and the `xiao-login` service use.
+///
+/// Host-only: lowercase ASCII letters, digits and hyphens in at least two
+/// dot-separated labels (each 1-63 characters, not starting or ending with a
+/// hyphen, 253 characters in total). Schemes, ports, paths, queries,
+/// fragments, userinfo, whitespace, uppercase letters, a trailing dot, IP
+/// literals (the last label must not be all digits) and bare names such as
+/// `localhost` are rejected rather than normalized, so the value is
+/// byte-for-byte what appears in links and `Origin` checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoginPublicHost(String);
+
+impl LoginPublicHost {
+    /// Validates `value` as a [`LoginPublicHost`].
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        let reason = |reason| ConfigError::InvalidLoginPublicHost { reason };
+        if value.is_empty() {
+            return Err(reason("must not be empty"));
+        }
+        if value.chars().any(char::is_whitespace) {
+            return Err(reason("must not contain whitespace"));
+        }
+        if value.contains(['/', '?', '#']) {
+            return Err(reason(
+                "must not include a scheme, path, query, or fragment",
+            ));
+        }
+        if value.contains(':') {
+            return Err(reason("must not include a scheme, port, or IPv6 literal"));
+        }
+        if value.contains('@') {
+            return Err(reason("must not include userinfo"));
+        }
+        if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err(reason("must be lowercase"));
+        }
+        if value.len() > 253 {
+            return Err(reason("must be at most 253 characters"));
+        }
+        let mut labels = 0_usize;
+        let mut last_label = "";
+        for label in value.split('.') {
+            labels += 1;
+            last_label = label;
+            if label.is_empty() || label.len() > 63 {
+                return Err(reason(
+                    "labels must be 1-63 characters (no leading, trailing, or doubled dots)",
+                ));
+            }
+            if label.starts_with('-') || label.ends_with('-') {
+                return Err(reason("labels must not start or end with a hyphen"));
+            }
+            if !label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            {
+                return Err(reason(
+                    "labels may contain only lowercase ASCII letters, digits, and hyphens",
+                ));
+            }
+        }
+        if labels < 2 {
+            return Err(reason("must be a DNS name with at least two labels"));
+        }
+        if last_label.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(reason("must be a DNS name, not an IP address"));
+        }
+        // Final word: the WHATWG host parser (the `url` crate, as browsers and
+        // the login service see it) must read the value back as exactly this
+        // domain. That rejects hex/octal IPv4 forms such as `127.0.0.0x7f`
+        // and invalid punycode such as `xn--a.com`.
+        match url::Host::parse(value) {
+            Ok(url::Host::Domain(domain)) if domain == value => {}
+            _ => {
+                return Err(reason(
+                    "must be a DNS name that browsers read back unchanged",
+                ));
+            }
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// The bare host name, for example `login.example.com`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The HTTPS origin, for example `https://login.example.com`.
+    pub fn origin(&self) -> String {
+        format!("https://{}", self.0)
+    }
+}
+
+impl Display for LoginPublicHost {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Settings for the `xiao-login` service. Separate from [`Config`] because
+/// that binary has no Discord token and holds only a database credential
+/// confined to the `login_*` functions.
+#[derive(Clone)]
+pub struct LoginConfig {
+    public_host: LoginPublicHost,
+    database_url_file: PathBuf,
+    database_tls: DatabaseTlsConfig,
+    listen_addr: SocketAddr,
+    chromium_path: PathBuf,
+    telemetry: TelemetryConfig,
+}
+
+const DEFAULT_LOGIN_LISTEN_ADDR: &str = "0.0.0.0:8080";
+const DEFAULT_LOGIN_CHROMIUM_PATH: &str = "/usr/bin/chromium";
+
+impl LoginConfig {
+    /// Loads login service configuration from the process environment.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(env_lookup)
+    }
+
+    fn from_lookup<F>(mut lookup: F) -> Result<Self, ConfigError>
+    where
+        F: FnMut(&'static str) -> Result<Option<String>, ConfigError>,
+    {
+        let public_host = LoginPublicHost::parse(&required(&mut lookup, "LOGIN_PUBLIC_HOST")?)?;
+        let database_url_file = absolute_login_path(
+            "LOGIN_DATABASE_URL_FILE",
+            required(&mut lookup, "LOGIN_DATABASE_URL_FILE")?,
+        )?;
+        let database_tls = load_database_tls(&mut lookup)?;
+        let listen_addr = optional(&mut lookup, "LOGIN_LISTEN_ADDR")?
+            .unwrap_or_else(|| DEFAULT_LOGIN_LISTEN_ADDR.to_owned())
+            .trim()
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::InvalidLogin {
+                variable: "LOGIN_LISTEN_ADDR",
+                reason: "expected an IP socket address such as 0.0.0.0:8080",
+            })?;
+        let chromium_path = absolute_login_path(
+            "LOGIN_CHROMIUM_PATH",
+            optional(&mut lookup, "LOGIN_CHROMIUM_PATH")?
+                .unwrap_or_else(|| DEFAULT_LOGIN_CHROMIUM_PATH.to_owned()),
+        )?;
+        let telemetry = load_telemetry(&mut lookup)?;
+        Ok(Self {
+            public_host,
+            database_url_file,
+            database_tls,
+            listen_addr,
+            chromium_path,
+            telemetry,
+        })
+    }
+
+    /// Public host `Origin` and `Host` headers are checked against.
+    pub fn public_host(&self) -> &LoginPublicHost {
+        &self.public_host
+    }
+
+    /// Path of the owner-only file holding the `xiao_login` role's URL.
+    pub fn database_url_file(&self) -> &Path {
+        &self.database_url_file
+    }
+
+    /// Reads the database URL from [`Self::database_url_file`], failing closed
+    /// unless the file is an owner-only regular file, and validates the URL
+    /// against the configured TLS mode. The URL is zeroized on drop.
+    pub fn read_database_url(&self) -> Result<Zeroizing<String>, ConfigError> {
+        let url = read_secret_file(&self.database_url_file, "LOGIN_DATABASE_URL_FILE")?;
+        validate_database_url(&url, &self.database_tls)?;
+        Ok(url)
+    }
+
+    /// Returns the PostgreSQL TLS configuration.
+    pub fn database_tls(&self) -> &DatabaseTlsConfig {
+        &self.database_tls
+    }
+
+    /// Address the plain-HTTP listener binds to (behind the TLS proxy).
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
+
+    /// Absolute path of the Chromium binary.
+    pub fn chromium_path(&self) -> &Path {
+        &self.chromium_path
+    }
+
+    /// Returns telemetry settings.
+    pub fn telemetry(&self) -> &TelemetryConfig {
+        &self.telemetry
+    }
+}
+
+impl Debug for LoginConfig {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        // Only the credential's file path is held; the URL is read on demand.
+        formatter
+            .debug_struct("LoginConfig")
+            .field("public_host", &self.public_host)
+            .field("database_url_file", &self.database_url_file)
+            .field("database_tls", &self.database_tls)
+            .field("listen_addr", &self.listen_addr)
+            .field("chromium_path", &self.chromium_path)
+            .field("telemetry", &self.telemetry)
             .finish()
     }
 }
@@ -417,8 +678,17 @@ pub enum ConfigError {
     InvalidBoolean { variable: &'static str },
     /// The telemetry output format is not supported.
     InvalidTelemetryFormat { value: &'static str },
-    /// Only some of the Rust+ variables were set; the group is all-or-nothing.
+    /// Only some of a Rust+ variable group was set; each group is all-or-nothing.
     PartialRustPlus { missing: &'static str },
+    /// The legacy Rust+ account variables were set without the core group.
+    LegacyRustPlusWithoutCore,
+    /// `LOGIN_PUBLIC_HOST` is not a valid host-only DNS name.
+    InvalidLoginPublicHost { reason: &'static str },
+    /// A `xiao-login` variable was set to an unusable value.
+    InvalidLogin {
+        variable: &'static str,
+        reason: &'static str,
+    },
     /// A Rust+ variable was set to an unusable value.
     InvalidRustPlus {
         variable: &'static str,
@@ -476,8 +746,17 @@ impl Display for ConfigError {
             }
             Self::PartialRustPlus { missing } => write!(
                 formatter,
-                "incomplete Rust+ configuration: {missing} is required when any Rust+ variable is set"
+                "incomplete Rust+ configuration: {missing} is required when any variable in its group is set"
             ),
+            Self::LegacyRustPlusWithoutCore => formatter.write_str(
+                "RUSTPLUS_STEAM_ID and RUSTPLUS_STEAM_AUTH_TOKEN_FILE require RUSTPLUS_FCM_SENDER_ID, SECRET_KEYRING_FILE, and SECRET_ACTIVE_KEY_ID to be set",
+            ),
+            Self::InvalidLoginPublicHost { reason } => {
+                write!(formatter, "invalid LOGIN_PUBLIC_HOST: {reason}")
+            }
+            Self::InvalidLogin { variable, reason } => {
+                write!(formatter, "invalid {variable}: {reason}")
+            }
             Self::InvalidRustPlus { variable, reason } => {
                 write!(formatter, "invalid {variable}: {reason}")
             }
@@ -516,6 +795,32 @@ impl Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+fn env_lookup(name: &'static str) -> Result<Option<String>, ConfigError> {
+    std::env::var(name).map(Some).or_else(|error| match error {
+        std::env::VarError::NotPresent => Ok(None),
+        std::env::VarError::NotUnicode(_) => Err(ConfigError::InvalidUnicode { variable: name }),
+    })
+}
+
+fn load_telemetry<F>(lookup: &mut F) -> Result<TelemetryConfig, ConfigError>
+where
+    F: FnMut(&'static str) -> Result<Option<String>, ConfigError>,
+{
+    let filter = optional(lookup, "RUST_LOG")?.unwrap_or_else(|| "info".to_owned());
+    if filter.trim().is_empty() {
+        return Err(ConfigError::Empty {
+            variable: "RUST_LOG",
+        });
+    }
+    let format = optional(lookup, "TELEMETRY_FORMAT")?
+        .unwrap_or_else(|| "compact".to_owned())
+        .parse()
+        .map_err(|_| ConfigError::InvalidTelemetryFormat {
+            value: "TELEMETRY_FORMAT",
+        })?;
+    Ok(TelemetryConfig { filter, format })
+}
 
 fn load_database_tls<F>(lookup: &mut F) -> Result<DatabaseTlsConfig, ConfigError>
 where
@@ -730,8 +1035,12 @@ fn parse_bool(value: &str, variable: &'static str) -> Result<bool, ConfigError> 
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
-    use super::{Config, ConfigError, MigrationConfig, read_secret_file};
+    use super::{
+        Config, ConfigError, DatabaseTlsConfig, LegacyAccount, LoginConfig, LoginPublicHost,
+        MigrationConfig, TelemetryFormat, read_secret_file,
+    };
     use std::collections::HashMap;
     use std::fs;
 
@@ -1012,37 +1321,56 @@ mod tests {
         }
     }
 
-    const RUSTPLUS: [(&str, &str); 5] = [
+    const CORE: [(&str, &str); 3] = [
         ("RUSTPLUS_FCM_SENDER_ID", "sender-secret"),
+        ("SECRET_KEYRING_FILE", "/run/secrets/keyring"),
+        ("SECRET_ACTIVE_KEY_ID", "key-2026-10"),
+    ];
+    const LEGACY: [(&str, &str); 2] = [
         ("RUSTPLUS_STEAM_ID", "76561198000000001"),
         (
             "RUSTPLUS_STEAM_AUTH_TOKEN_FILE",
             "/run/secrets/rustplus_token",
         ),
-        ("SECRET_KEYRING_FILE", "/run/secrets/keyring"),
-        ("SECRET_ACTIVE_KEY_ID", "key-2026-10"),
     ];
 
-    fn with_rustplus(
+    /// Builds a bot config from the base settings, the listed groups,
+    /// `overrides` (which replace or add variables), minus `omit`.
+    fn with_groups(
+        core: bool,
+        legacy: bool,
         overrides: &[(&'static str, &'static str)],
-        omit: Option<&str>,
+        omit: &[&str],
     ) -> Result<Config, ConfigError> {
         let mut values = vec![
             ("DISCORD_TOKEN", "token"),
             ("DATABASE_URL", "postgres://localhost/bot"),
             ("DATABASE_TLS_MODE", "insecure"),
         ];
-        for (name, value) in RUSTPLUS {
-            if Some(name) == omit {
+        let groups = [(core, CORE.as_slice()), (legacy, LEGACY.as_slice())];
+        for (name, value) in groups
+            .into_iter()
+            .filter_map(|(enabled, group)| enabled.then_some(group))
+            .flatten()
+        {
+            if omit.contains(name) {
                 continue;
             }
-            let value = overrides
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map_or(value, |(_, value)| *value);
+            values.push((name, value));
+        }
+        for (name, value) in overrides {
+            values.retain(|(existing, _)| existing != name);
             values.push((name, value));
         }
         config(&values)
+    }
+
+    fn with_rustplus(
+        overrides: &[(&'static str, &'static str)],
+        omit: Option<&str>,
+    ) -> Result<Config, ConfigError> {
+        let omit: Vec<&str> = omit.into_iter().collect();
+        with_groups(true, true, overrides, &omit)
     }
 
     #[test]
@@ -1053,11 +1381,20 @@ mod tests {
             let rustplus = config.rustplus();
             assert!(rustplus.is_some());
             if let Some(rustplus) = rustplus {
-                assert_eq!(rustplus.steam_id(), 76_561_198_000_000_001);
+                assert_eq!(rustplus.fcm_sender_id(), "sender-secret");
                 assert_eq!(rustplus.active_key_id(), "key-2026-10");
                 assert_eq!(
                     rustplus.keyring_file(),
                     std::path::Path::new("/run/secrets/keyring")
+                );
+                let legacy = rustplus.legacy_account();
+                assert_eq!(
+                    legacy.map(LegacyAccount::steam_id),
+                    Some(76_561_198_000_000_001)
+                );
+                assert_eq!(
+                    legacy.map(LegacyAccount::token_file),
+                    Some(std::path::Path::new("/run/secrets/rustplus_token"))
                 );
             }
             let debug = format!("{config:?}");
@@ -1067,11 +1404,110 @@ mod tests {
     }
 
     #[test]
-    fn partial_rustplus_configuration_is_a_typed_error() {
-        for (missing, _) in RUSTPLUS {
+    fn rustplus_group_matrix() {
+        // (core, legacy, expected)
+        enum Expect {
+            Disabled,
+            CoreOnly,
+            CoreAndLegacy,
+            LegacyWithoutCore,
+        }
+        let cases = [
+            (false, false, Expect::Disabled),
+            (true, false, Expect::CoreOnly),
+            (true, true, Expect::CoreAndLegacy),
+            (false, true, Expect::LegacyWithoutCore),
+        ];
+        for (core, legacy, expect) in cases {
+            let result = with_groups(core, legacy, &[], &[]);
+            match expect {
+                Expect::Disabled => {
+                    assert!(result.is_ok_and(|config| config.rustplus().is_none()));
+                }
+                Expect::CoreOnly => {
+                    let config = result.expect("core-only configuration parses");
+                    let rustplus = config.rustplus().expect("core group enables rustplus");
+                    assert!(rustplus.legacy_account().is_none());
+                    assert_eq!(rustplus.active_key_id(), "key-2026-10");
+                }
+                Expect::CoreAndLegacy => {
+                    let config = result.expect("both groups parse");
+                    let rustplus = config.rustplus().expect("core group enables rustplus");
+                    assert!(rustplus.legacy_account().is_some());
+                }
+                Expect::LegacyWithoutCore => {
+                    assert_eq!(result.err(), Some(ConfigError::LegacyRustPlusWithoutCore));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_groups_combined_report_the_core_group_first() {
+        // Partial legacy group with the core group wholly absent is still a
+        // partial-group error, not "legacy without core".
+        let result = with_groups(false, true, &[], &["RUSTPLUS_STEAM_AUTH_TOKEN_FILE"]);
+        assert!(matches!(
+            result.err(),
+            Some(ConfigError::PartialRustPlus {
+                missing: "RUSTPLUS_STEAM_AUTH_TOKEN_FILE"
+            })
+        ));
+        // A partial core group with a complete legacy group names the core gap.
+        let result = with_groups(true, true, &[], &["SECRET_ACTIVE_KEY_ID"]);
+        assert!(matches!(
+            result.err(),
+            Some(ConfigError::PartialRustPlus {
+                missing: "SECRET_ACTIVE_KEY_ID"
+            })
+        ));
+    }
+
+    #[test]
+    fn legacy_account_debug_redacts_the_steam_id() {
+        let config = with_groups(true, true, &[], &[]).expect("both groups parse");
+        let legacy = config
+            .rustplus()
+            .and_then(super::RustPlusConfig::legacy_account)
+            .expect("legacy account present");
+        let steam_id = legacy.steam_id().to_string();
+        for text in [format!("{legacy:?}"), format!("{:?}", config.rustplus())] {
+            assert!(!text.contains(&steam_id), "SteamID leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn legacy_without_core_error_names_variables_without_values() {
+        let message = ConfigError::LegacyRustPlusWithoutCore.to_string();
+        for name in super::RUSTPLUS_CORE_VARIABLES
+            .iter()
+            .chain(&super::RUSTPLUS_LEGACY_VARIABLES)
+        {
+            assert!(message.contains(name), "{message} should name {name}");
+        }
+        assert!(!message.contains("76561198000000001"));
+    }
+
+    #[test]
+    fn partial_core_group_reports_each_missing_variable() {
+        for (missing, _) in CORE {
+            for legacy in [false, true] {
+                assert_eq!(
+                    with_groups(true, legacy, &[], &[missing]).err(),
+                    Some(ConfigError::PartialRustPlus { missing }),
+                    "core variable {missing} missing, legacy={legacy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_legacy_group_reports_each_missing_variable() {
+        for (missing, _) in LEGACY {
             assert_eq!(
-                with_rustplus(&[], Some(missing)).err(),
+                with_groups(true, true, &[], &[missing]).err(),
                 Some(ConfigError::PartialRustPlus { missing }),
+                "legacy variable {missing} missing"
             );
         }
     }
@@ -1101,6 +1537,153 @@ mod tests {
     }
 
     #[test]
+    fn login_public_host_accepts_valid_hosts() {
+        for host in [
+            "login.example.com",
+            "a-b.c.example",
+            "xn--bcher-kva.example",
+            "a1.b2",
+            "x.example",
+        ] {
+            let parsed = LoginPublicHost::parse(host);
+            assert!(parsed.is_ok(), "{host} should be accepted");
+            if let Ok(parsed) = parsed {
+                assert_eq!(parsed.as_str(), host);
+                assert_eq!(parsed.origin(), format!("https://{host}"));
+            }
+        }
+        let max_label = "a".repeat(63);
+        assert!(LoginPublicHost::parse(&format!("{max_label}.example")).is_ok());
+        // 253 characters in total: 3 * 63 + 3 dots (192) + a 61 character label.
+        let longest = format!("{max_label}.{max_label}.{max_label}.{}", "b".repeat(61));
+        assert_eq!(longest.len(), 253);
+        assert!(LoginPublicHost::parse(&longest).is_ok());
+    }
+
+    #[test]
+    fn login_public_host_rejects_invalid_hosts() {
+        let too_long_label = format!("{}.example", "a".repeat(64));
+        let too_long_total = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "a".repeat(63),
+            "a".repeat(63),
+            "b".repeat(62)
+        );
+        assert_eq!(too_long_total.len(), 254);
+        let invalid = [
+            "",
+            " ",
+            "login.example.com ",
+            " login.example.com",
+            "login .example.com",
+            "login.example.com\n",
+            "https://x.example",
+            "http://x.example",
+            "x.example/path",
+            "x.example?query=1",
+            "x.example#fragment",
+            "x.example:443",
+            "user@x.example",
+            "localhost",
+            "1.2.3.4",
+            "0x7f.1",
+            "127.0.0.0x7f",
+            "1.0x",
+            "0x.0x1",
+            "a.0x7f",
+            "xn--a.com",
+            "xn--.com",
+            "[::1]",
+            "::1",
+            "X.Example.com",
+            "x.example.",
+            ".x.example",
+            "x..example",
+            "-x.example",
+            "x-.example",
+            "x.-example",
+            "x.example-",
+            "x_y.example",
+            "b\u{fc}cher.example",
+            too_long_label.as_str(),
+            too_long_total.as_str(),
+        ];
+        for host in invalid {
+            assert!(
+                matches!(
+                    LoginPublicHost::parse(host),
+                    Err(ConfigError::InvalidLoginPublicHost { .. })
+                ),
+                "{host:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn login_public_host_error_does_not_echo_the_value() {
+        let error = LoginPublicHost::parse("https://secret-host.example/path").err();
+        assert!(error.is_some_and(|error| !error.to_string().contains("secret-host")));
+    }
+
+    #[test]
+    fn bot_config_parses_optional_login_public_host() {
+        let absent = with_groups(true, false, &[], &[]).expect("parses");
+        assert!(absent.login_public_host().is_none());
+
+        let present = with_groups(
+            true,
+            false,
+            &[("LOGIN_PUBLIC_HOST", "login.example.com")],
+            &[],
+        )
+        .expect("parses");
+        assert_eq!(
+            present.login_public_host().map(LoginPublicHost::as_str),
+            Some("login.example.com")
+        );
+
+        assert!(matches!(
+            with_groups(
+                true,
+                false,
+                &[("LOGIN_PUBLIC_HOST", "https://x.example")],
+                &[]
+            ),
+            Err(ConfigError::InvalidLoginPublicHost { .. })
+        ));
+        assert_eq!(
+            with_groups(true, false, &[("LOGIN_PUBLIC_HOST", "  ")], &[]).err(),
+            Some(ConfigError::Empty {
+                variable: "LOGIN_PUBLIC_HOST"
+            })
+        );
+    }
+
+    #[test]
+    fn login_enabled_requires_core_group_and_public_host() {
+        let host = [("LOGIN_PUBLIC_HOST", "login.example.com")];
+        // (core group, legacy group, host, login_enabled)
+        let cases = [
+            (false, false, false, false),
+            (false, false, true, false),
+            (true, false, false, false),
+            (true, false, true, true),
+            (true, true, false, false),
+            (true, true, true, true),
+        ];
+        for (core, legacy, with_host, enabled) in cases {
+            let overrides: &[(&'static str, &'static str)] = if with_host { &host } else { &[] };
+            let config = with_groups(core, legacy, overrides, &[]).expect("parses");
+            assert_eq!(
+                config.login_enabled(),
+                enabled,
+                "core={core} legacy={legacy} host={with_host}"
+            );
+        }
+    }
+
+    #[test]
     fn rustplus_sender_id_can_be_loaded_from_owner_only_file()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
@@ -1123,14 +1706,6 @@ mod tests {
                 sender_path.to_string_lossy().into_owned(),
             ),
             (
-                "RUSTPLUS_STEAM_ID".to_owned(),
-                "76561198000000001".to_owned(),
-            ),
-            (
-                "RUSTPLUS_STEAM_AUTH_TOKEN_FILE".to_owned(),
-                "/run/secrets/rustplus_token".to_owned(),
-            ),
-            (
                 "SECRET_KEYRING_FILE".to_owned(),
                 "/run/secrets/keyring".to_owned(),
             ),
@@ -1141,6 +1716,234 @@ mod tests {
             config.rustplus().map(super::RustPlusConfig::fcm_sender_id),
             Some("sender-from-file"),
         );
+        Ok(())
+    }
+
+    fn login_config(values: &[(&str, &str)]) -> Result<LoginConfig, ConfigError> {
+        let values: HashMap<String, String> = values
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        LoginConfig::from_lookup(|name| Ok(values.get(name).cloned()))
+    }
+
+    const LOGIN_BASE: [(&str, &str); 3] = [
+        ("LOGIN_PUBLIC_HOST", "login.example.com"),
+        ("LOGIN_DATABASE_URL_FILE", "/run/secrets/login_database_url"),
+        ("DATABASE_TLS_MODE", "insecure"),
+    ];
+
+    #[test]
+    fn login_config_applies_defaults() {
+        let config = login_config(&LOGIN_BASE).expect("parses");
+        assert_eq!(config.public_host().as_str(), "login.example.com");
+        assert_eq!(
+            config.database_url_file(),
+            std::path::Path::new("/run/secrets/login_database_url")
+        );
+        assert_eq!(config.listen_addr(), "0.0.0.0:8080".parse().expect("addr"));
+        assert_eq!(
+            config.chromium_path(),
+            std::path::Path::new("/usr/bin/chromium")
+        );
+        assert_eq!(config.telemetry().filter, "info");
+        assert_eq!(config.telemetry().format, TelemetryFormat::Compact);
+        assert_eq!(config.database_tls(), &DatabaseTlsConfig::Insecure);
+    }
+
+    #[test]
+    fn login_config_honours_overrides() {
+        let mut values = LOGIN_BASE.to_vec();
+        values.extend([
+            ("LOGIN_LISTEN_ADDR", "127.0.0.1:9000"),
+            ("LOGIN_CHROMIUM_PATH", "/opt/chromium/chrome"),
+            ("RUST_LOG", "debug"),
+            ("TELEMETRY_FORMAT", "json"),
+        ]);
+        let config = login_config(&values).expect("parses");
+        assert_eq!(
+            config.listen_addr(),
+            "127.0.0.1:9000".parse().expect("addr")
+        );
+        assert_eq!(
+            config.chromium_path(),
+            std::path::Path::new("/opt/chromium/chrome")
+        );
+        assert_eq!(config.telemetry().filter, "debug");
+        assert_eq!(config.telemetry().format, TelemetryFormat::Json);
+    }
+
+    #[test]
+    fn login_config_reports_missing_required_variables() {
+        for missing in ["LOGIN_PUBLIC_HOST", "LOGIN_DATABASE_URL_FILE"] {
+            let values: Vec<_> = LOGIN_BASE
+                .iter()
+                .copied()
+                .filter(|(name, _)| *name != missing)
+                .collect();
+            assert_eq!(
+                login_config(&values).err(),
+                Some(ConfigError::Missing { variable: missing })
+            );
+        }
+        let values: Vec<_> = LOGIN_BASE
+            .iter()
+            .copied()
+            .filter(|(name, _)| *name != "DATABASE_TLS_MODE")
+            .collect();
+        assert_eq!(
+            login_config(&values).err(),
+            Some(ConfigError::Missing {
+                variable: "DATABASE_CA_FILE"
+            })
+        );
+    }
+
+    #[test]
+    fn login_config_rejects_invalid_values() {
+        let with = |name: &'static str, value: &'static str| {
+            let mut values: Vec<_> = LOGIN_BASE
+                .iter()
+                .copied()
+                .filter(|(existing, _)| *existing != name)
+                .collect();
+            values.push((name, value));
+            login_config(&values)
+        };
+        assert!(matches!(
+            with("LOGIN_PUBLIC_HOST", "https://login.example.com"),
+            Err(ConfigError::InvalidLoginPublicHost { .. })
+        ));
+        for (variable, value) in [
+            ("LOGIN_DATABASE_URL_FILE", "relative/url"),
+            ("LOGIN_CHROMIUM_PATH", "chromium"),
+            ("LOGIN_LISTEN_ADDR", "not-an-address"),
+            ("LOGIN_LISTEN_ADDR", "localhost:8080"),
+        ] {
+            assert!(
+                matches!(
+                    with(variable, value),
+                    Err(ConfigError::InvalidLogin { variable: v, .. }) if v == variable
+                ),
+                "{variable}={value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn login_config_shares_database_tls_parsing_with_the_bot() {
+        let with_tls = |extra: &[(&str, &str)]| {
+            let mut values: Vec<_> = LOGIN_BASE
+                .iter()
+                .copied()
+                .filter(|(name, _)| *name != "DATABASE_TLS_MODE")
+                .collect();
+            values.extend_from_slice(extra);
+            login_config(&values)
+        };
+        let verify_full = with_tls(&[
+            ("DATABASE_TLS_MODE", "verify-full"),
+            ("DATABASE_CA_FILE", "/run/secrets/ca.pem"),
+        ])
+        .expect("parses");
+        assert_eq!(
+            verify_full.database_tls(),
+            &DatabaseTlsConfig::VerifyFull {
+                ca_file: "/run/secrets/ca.pem".into()
+            }
+        );
+        let insecure = with_tls(&[("DATABASE_TLS_MODE", "insecure")]).expect("parses");
+        assert_eq!(insecure.database_tls(), &DatabaseTlsConfig::Insecure);
+        assert_eq!(
+            with_tls(&[("DATABASE_TLS_MODE", "verify-full")]).err(),
+            Some(ConfigError::Missing {
+                variable: "DATABASE_CA_FILE"
+            })
+        );
+        assert_eq!(
+            with_tls(&[("DATABASE_TLS_MODE", "bogus")]).err(),
+            Some(ConfigError::InvalidDatabaseTlsMode {
+                value: "DATABASE_TLS_MODE"
+            })
+        );
+    }
+
+    #[test]
+    fn login_config_debug_does_not_expose_the_database_url()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let url_path = dir.path().join("login_database_url");
+        fs::write(&url_path, "postgres://xiao_login:hunter2@db.internal/bot\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&url_path, fs::Permissions::from_mode(0o400))?;
+        }
+        let url_path_str = url_path.to_str().ok_or("non-utf8 path")?;
+        let config = login_config(&[
+            ("LOGIN_PUBLIC_HOST", "login.example.com"),
+            ("LOGIN_DATABASE_URL_FILE", url_path_str),
+            ("DATABASE_TLS_MODE", "insecure"),
+        ])?;
+        let url = config.read_database_url()?;
+        assert_eq!(&*url, "postgres://xiao_login:hunter2@db.internal/bot");
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("hunter2"));
+        assert!(!debug.contains("postgres://"));
+        assert!(debug.contains("login.example.com"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_database_url_file_must_be_owner_only() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let url_path = dir.path().join("login_database_url");
+        fs::write(&url_path, "postgres://xiao_login@db.internal/bot")?;
+        fs::set_permissions(&url_path, fs::Permissions::from_mode(0o644))?;
+        let url_path_str = url_path.to_str().ok_or("non-utf8 path")?;
+        let config = login_config(&[
+            ("LOGIN_PUBLIC_HOST", "login.example.com"),
+            ("LOGIN_DATABASE_URL_FILE", url_path_str),
+            ("DATABASE_TLS_MODE", "insecure"),
+        ])?;
+        assert!(matches!(
+            config.read_database_url(),
+            Err(ConfigError::InvalidSecretFile {
+                file_variable: "LOGIN_DATABASE_URL_FILE",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn login_database_url_is_validated_against_tls_mode() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let url_path = dir.path().join("login_database_url");
+        fs::write(
+            &url_path,
+            "postgres://xiao_login@db.internal/bot?sslmode=disable",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&url_path, fs::Permissions::from_mode(0o400))?;
+        }
+        let url_path_str = url_path.to_str().ok_or("non-utf8 path")?;
+        let config = login_config(&[
+            ("LOGIN_PUBLIC_HOST", "login.example.com"),
+            ("LOGIN_DATABASE_URL_FILE", url_path_str),
+            ("DATABASE_TLS_MODE", "verify-full"),
+            ("DATABASE_CA_FILE", "/run/secrets/ca.pem"),
+        ])?;
+        assert!(matches!(
+            config.read_database_url(),
+            Err(ConfigError::InvalidDatabaseUrl { .. })
+        ));
         Ok(())
     }
 

@@ -421,7 +421,7 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 - **`xiao-login`:** has its own `LoginConfig`:
   - `LOGIN_PUBLIC_HOST` (same validation; `Origin` and `Host` are checked
     against it);
-  - `LOGIN_DATABASE_URL_FILE`, owner-only (0400), failing closed otherwise;
+  - `LOGIN_DATABASE_URL_FILE`, owner-only (no group or other permission bits, e.g. 0400 or 0600), failing closed otherwise;
   - the same `DATABASE_TLS` policy as the bot;
   - the listen address and the Chromium path.
 

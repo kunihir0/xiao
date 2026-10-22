@@ -1,16 +1,33 @@
 # Rust+ companion credentials
 
 Rust+ pairing is opt-in. With none of the variables below set, the bot runs
-without Rust+ and nothing is read or written. Setting only some of them is a
-typed startup error (`incomplete Rust+ configuration: <VAR> is required ...`).
+without Rust+ and nothing is read or written. The variables form two groups
+(see [ADR 0003](../decisions/0003-hosted-companion-login.md)); a group that is
+only partly set is a typed startup error
+(`incomplete Rust+ configuration: <VAR> is required ...`).
+
+**Group A** (all or none) enables the Rust+ supervisor:
 
 | Variable | Secret? | Meaning |
 | --- | --- | --- |
 | `RUSTPLUS_FCM_SENDER_ID` | no | FCM sender ID used for the legacy `register3` FCM registration. |
-| `RUSTPLUS_STEAM_ID` | no | SteamID64 of the account that owns the companion registration. |
-| `RUSTPLUS_STEAM_AUTH_TOKEN_FILE` | path to secret | Absolute path to an owner-only file containing the Rust+ companion auth token. |
 | `SECRET_KEYRING_FILE` | path to secret | Absolute path to an owner-only keyring of key-encryption keys. |
 | `SECRET_ACTIVE_KEY_ID` | no | Keyring entry used to wrap newly written data keys. |
+
+**Group B** (legacy operator-supplied account; both or neither; requires group
+A; setting it without group A is a startup error):
+
+| Variable | Secret? | Meaning |
+| --- | --- | --- |
+| `RUSTPLUS_STEAM_ID` | no | SteamID64 of the account that owns the companion registration. |
+| `RUSTPLUS_STEAM_AUTH_TOKEN_FILE` | path to secret | Absolute path to an owner-only file containing the Rust+ companion auth token. |
+
+With group A and no group B, the bot starts Discord and logs that the Rust+
+companion is awaiting `/login` (not yet available); pairing does not start.
+
+`LOGIN_PUBLIC_HOST` (optional, host name only: lowercase, no scheme, port or
+path) is the public host of the `xiao-login` service. The Discord `/login`
+command is enabled only when group A and `LOGIN_PUBLIC_HOST` are both set.
 
 Never put token or key *values* in environment variables, command arguments,
 Discord messages, or the database; mount them as files (Compose/Kubernetes

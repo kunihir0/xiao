@@ -76,14 +76,17 @@ async fn run_rustplus(
             pairings = rewrapped.pairings,
             "secret data keys wrapped with the active key"
         );
-        let steam_id = SteamId::new(config.steam_id())?;
+        let Some(legacy) = config.legacy_account() else {
+            return Ok(None);
+        };
+        let steam_id = SteamId::new(legacy.steam_id())?;
         let credentials =
             PostgresPushCredentialStore::new(Arc::clone(&database), Arc::clone(&keys));
         let registrar = FacepunchRegistrar::new(
             config.fcm_sender_id().to_owned(),
             CompanionEndpoints::production(),
         )?;
-        let tokens = FileSteamAuthToken::new(config.steam_auth_token_file().to_path_buf());
+        let tokens = FileSteamAuthToken::new(legacy.token_file().to_path_buf());
         restore_fcm_connector(
             &credentials,
             &registrar,
@@ -92,10 +95,19 @@ async fn run_rustplus(
             config.fcm_sender_id(),
         )
         .await
+        .map(Some)
     };
     let fcm = tokio::select! {
         () = cancellation.cancelled() => return Ok(()),
-        result = startup => Arc::new(result?),
+        result = startup => match result? {
+            Some(connector) => Arc::new(connector),
+            None => {
+                info!(
+                    "Rust+ companion configured without a legacy account; awaiting /login (not yet available; it will also need LOGIN_PUBLIC_HOST)"
+                );
+                return Ok(());
+            }
+        },
     };
     let receiver_config = ProductionConfig::default();
     let receiver = push_receiver::start_connected(
