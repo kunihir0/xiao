@@ -555,6 +555,15 @@ mod tests {
         fn retire<'a>(&'a self, _id: CredentialId) -> BoxFuture<'a, Result<(), StoreError>> {
             Box::pin(async { Err(StoreError::Unavailable) })
         }
+        fn list_active<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SteamId>, StoreError>> {
+            Box::pin(async move { Ok(vec![self.0.steam_id]) })
+        }
+        fn retire_other_accounts<'a>(
+            &'a self,
+            _keep: SteamId,
+        ) -> BoxFuture<'a, Result<u64, StoreError>> {
+            Box::pin(async { Err(StoreError::Unavailable) })
+        }
     }
 
     #[derive(Default)]

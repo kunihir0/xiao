@@ -48,6 +48,14 @@ struct CredentialRow {
 }
 
 #[derive(diesel::QueryableByName)]
+struct RetireOutcome {
+    #[diesel(sql_type = Int8)]
+    keep_active: i64,
+    #[diesel(sql_type = Int8)]
+    deleted: i64,
+}
+
+#[derive(diesel::QueryableByName)]
 struct PendingSteam {
     #[diesel(sql_type = Int8)]
     steam_id: i64,
@@ -173,6 +181,59 @@ impl PushCredentialStore for PostgresPushCredentialStore {
                 .map_err(map_write_error)
         })
     }
+    fn list_active<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SteamId>, StoreError>> {
+        Box::pin(async move {
+            let rows: Vec<PendingSteam> = sql_query("SELECT DISTINCT steam_id FROM rustplus_push_credentials WHERE state='active' ORDER BY steam_id")
+                .load(&mut *self.db.pool().get().await.map_err(|_| StoreError::Unavailable)?)
+                .await
+                .map_err(|_| StoreError::Unavailable)?;
+            rows.into_iter()
+                .map(|row| {
+                    u64::try_from(row.steam_id)
+                        .ok()
+                        .and_then(|value| SteamId::new(value).ok())
+                        .ok_or_else(|| StoreError::Invalid("steam_id".into()))
+                })
+                .collect()
+        })
+    }
+    fn retire_other_accounts<'a>(
+        &'a self,
+        keep: SteamId,
+    ) -> BoxFuture<'a, Result<u64, StoreError>> {
+        Box::pin(async move {
+            let keep =
+                i64::try_from(keep.value()).map_err(|_| StoreError::Invalid("steam_id".into()))?;
+            // One statement, so the guard and the delete are atomic: the
+            // DELETE only runs when `keep` has an active row.
+            let outcome: RetireOutcome = sql_query(
+                "WITH keep_active AS (\
+                     SELECT 1 FROM rustplus_push_credentials \
+                     WHERE steam_id = $1 AND state = 'active' LIMIT 1 FOR SHARE\
+                 ), deleted AS (\
+                     DELETE FROM rustplus_push_credentials \
+                     WHERE steam_id <> $1 AND EXISTS (SELECT 1 FROM keep_active) \
+                     RETURNING 1\
+                 ) SELECT (SELECT count(*) FROM keep_active)::bigint AS keep_active, \
+                          (SELECT count(*) FROM deleted)::bigint AS deleted",
+            )
+            .bind::<Int8, _>(keep)
+            .get_result(
+                &mut *self
+                    .db
+                    .pool()
+                    .get()
+                    .await
+                    .map_err(|_| StoreError::Unavailable)?,
+            )
+            .await
+            .map_err(map_write_error)?;
+            if outcome.keep_active == 0 {
+                return Err(StoreError::NotFound);
+            }
+            u64::try_from(outcome.deleted).map_err(|_| StoreError::Unavailable)
+        })
+    }
 }
 impl PostgresPushCredentialStore {
     fn load_state<'a>(
@@ -268,6 +329,22 @@ impl PairingStore for PostgresPairingStore {
         Box::pin(async move {
             sql_query("DELETE FROM rustplus_pairings WHERE server_id=$1")
                 .bind::<Text, _>(server_id.as_str())
+                .execute(
+                    &mut *self
+                        .db
+                        .pool()
+                        .get()
+                        .await
+                        .map_err(|_| StoreError::Unavailable)?,
+                )
+                .await
+                .map(|_| ())
+                .map_err(map_write_error)
+        })
+    }
+    fn clear<'a>(&'a self) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            sql_query("DELETE FROM rustplus_pairings")
                 .execute(
                     &mut *self
                         .db

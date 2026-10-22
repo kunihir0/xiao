@@ -12,4 +12,8 @@ workspace = true
 [dependencies]
 bot-application = { version = "0.1.0", path = "../application" }
 bot-domain = { version = "0.1.0", path = "../domain" }
+login-session = { version = "0.1.0", path = "../login-session" }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

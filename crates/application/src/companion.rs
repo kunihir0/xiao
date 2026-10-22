@@ -252,6 +252,24 @@ pub trait PushCredentialStore: Send + Sync {
     /// Deletes a generation's local ciphertext. Remote unregistration is not
     /// available from Facepunch; see the operations runbook.
     fn retire<'a>(&'a self, id: CredentialId) -> BoxFuture<'a, Result<(), StoreError>>;
+    /// Steam accounts that currently have an `active` generation, in
+    /// ascending SteamID order. Returns identifiers only: no secret is read or
+    /// decrypted, so an undecryptable row still lists.
+    fn list_active<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SteamId>, StoreError>>;
+    /// Deletes the local ciphertext of every `active` and `pending` generation
+    /// whose Steam account is not `keep`, and returns how many were deleted.
+    ///
+    /// Safety guard: `keep` must have an `active` generation. Otherwise
+    /// nothing is deleted and this returns `StoreError::NotFound`, so a wrong
+    /// or not-yet-promoted `keep` can never wipe every credential. Deleting
+    /// zero rows because no other account exists is `Ok(0)`, not an error.
+    ///
+    /// Implementations must do the check and the delete atomically (one
+    /// statement or one transaction): after a failure either every other
+    /// account is still present or none is. Idempotent; `keep`'s own
+    /// generations are never touched.
+    fn retire_other_accounts<'a>(&'a self, keep: SteamId)
+    -> BoxFuture<'a, Result<u64, StoreError>>;
 }
 
 /// Typed outbound-registration failures. Variants never carry URLs, headers,
@@ -332,6 +350,9 @@ pub enum EnrollmentKind {
     Resumed,
     /// Fresh FCM credentials were created and registered.
     Registered,
+    /// The active credential's device and FCM identity were registered again
+    /// with a fresh Steam auth token. The store was not changed.
+    Reregistered,
 }
 
 #[derive(Debug)]
@@ -344,6 +365,9 @@ pub struct EnrollmentOutcome {
 pub enum EnrollmentError {
     Store(StoreError),
     Registration(RegistrationError),
+    /// Re-registration was requested for a Steam account that has no active
+    /// credential.
+    NoActiveCredential,
 }
 
 impl fmt::Display for EnrollmentError {
@@ -351,6 +375,9 @@ impl fmt::Display for EnrollmentError {
         match self {
             Self::Store(error) => write!(formatter, "credential store failure: {error}"),
             Self::Registration(error) => write!(formatter, "{error}"),
+            Self::NoActiveCredential => {
+                formatter.write_str("no active credential for this Steam account")
+            }
         }
     }
 }
@@ -407,6 +434,36 @@ pub async fn ensure_companion_registration(
     store.promote_active(credential.id).await?;
     credential.state = CredentialState::Active;
     Ok(EnrollmentOutcome { kind, credential })
+}
+
+/// Registers an already-enrolled account again with a fresh Steam auth token.
+///
+/// This is the re-enrollment path for an expired or rejected token: it reuses
+/// the active credential's device ID and FCM material and calls the
+/// idempotent [`CompanionRegistrar::register`]. It mints no new FCM identity
+/// and never changes the store. Fails with
+/// [`EnrollmentError::NoActiveCredential`] when `steam_id` has no active
+/// credential; the token is not loaded in that case.
+///
+/// Callers must serialize invocations per Steam account.
+pub async fn reregister_companion(
+    store: &dyn PushCredentialStore,
+    registrar: &dyn CompanionRegistrar,
+    tokens: &dyn SteamAuthTokenSource,
+    steam_id: SteamId,
+) -> Result<EnrollmentOutcome, EnrollmentError> {
+    let credential = store
+        .load_active(steam_id)
+        .await?
+        .ok_or(EnrollmentError::NoActiveCredential)?;
+    let auth_token = tokens.load().await?;
+    registrar
+        .register(&auth_token, &credential.device_id, &credential.fcm)
+        .await?;
+    Ok(EnrollmentOutcome {
+        kind: EnrollmentKind::Reregistered,
+        credential,
+    })
 }
 
 #[cfg(test)]

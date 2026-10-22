@@ -229,3 +229,100 @@ async fn ciphertext_tampering_fails_closed() -> Result<(), Box<dyn std::error::E
     cleanup(&base, &schema).await?;
     Ok(())
 }
+
+/// Seeds an active credential (and optionally a second pending generation).
+async fn seed_account(
+    store: &PostgresPushCredentialStore,
+    steam: u64,
+    active: bool,
+    pending: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if active {
+        let id = CredentialId::generate();
+        store.save_pending(&credential(id, steam)).await?;
+        store.promote_active(id).await?;
+    }
+    if pending {
+        store
+            .save_pending(&credential(CredentialId::generate(), steam))
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DATABASE_URL and a real PostgreSQL service"]
+async fn list_active_is_distinct_sorted_and_active_only()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (base, schema, db) = setup().await?;
+    let store = PostgresPushCredentialStore::new(db, keyring("a", 3));
+    // Seeded out of order; 20 has only a pending row.
+    seed_account(&store, 30, true, true).await?;
+    seed_account(&store, 20, false, true).await?;
+    seed_account(&store, 10, true, true).await?;
+    let active = store.list_active().await?;
+    assert_eq!(active, vec![SteamId::new(10)?, SteamId::new(30)?]);
+    cleanup(&base, &schema).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DATABASE_URL and a real PostgreSQL service"]
+async fn retire_other_accounts_keeps_only_the_given_account()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (base, schema, db) = setup().await?;
+    let store = PostgresPushCredentialStore::new(db, keyring("a", 4));
+    let keep = SteamId::new(100)?;
+    let other = SteamId::new(200)?;
+    seed_account(&store, 100, true, true).await?;
+    seed_account(&store, 200, true, true).await?;
+
+    assert_eq!(store.retire_other_accounts(keep).await?, 2);
+    assert!(store.load_active(keep).await?.is_some());
+    assert!(store.load_pending(keep).await?.is_some());
+    assert!(store.load_active(other).await?.is_none());
+    assert!(store.load_pending(other).await?.is_none());
+    assert_eq!(store.list_active().await?, vec![keep]);
+    // Idempotent once the other account is gone.
+    assert_eq!(store.retire_other_accounts(keep).await?, 0);
+
+    // A keep without an active credential is refused and deletes nothing.
+    seed_account(&store, 400, false, true).await?;
+    let pending_only = SteamId::new(400)?;
+    for unsafe_keep in [pending_only, SteamId::new(300)?] {
+        assert_eq!(
+            store.retire_other_accounts(unsafe_keep).await,
+            Err(StoreError::NotFound)
+        );
+    }
+    assert_eq!(store.list_active().await?, vec![keep]);
+    assert!(store.load_active(keep).await?.is_some());
+    assert!(store.load_pending(keep).await?.is_some());
+    assert!(store.load_pending(pending_only).await?.is_some());
+    cleanup(&base, &schema).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires DATABASE_URL and a real PostgreSQL service"]
+async fn pairing_clear_removes_every_pairing()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (base, schema, db) = setup().await?;
+    let store = PostgresPairingStore::new(db, keyring("a", 5));
+    for (port, player) in [(28082, 5), (28083, 6)] {
+        let pairing = Pairing::new(
+            ServerAddress::new("127.0.0.1", port)?,
+            PlayerCredentials::new(PlayerId::new(player)?, PlayerToken::new(123)),
+            None,
+            None,
+        );
+        store.upsert(&pairing).await?;
+    }
+    assert_eq!(PairingStore::load(&store).await?.len(), 2);
+    store.clear().await?;
+    assert!(PairingStore::load(&store).await?.is_empty());
+    // Clearing an empty table is still fine.
+    store.clear().await?;
+    cleanup(&base, &schema).await?;
+    Ok(())
+}
