@@ -80,6 +80,10 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 
      No Admin or Developer team member qualifies. Changing the owner needs a
      restart.
+   - The owner is fetched with `get_current_application_info` before Poise's
+     `FrameworkOptions` are built, under the cancellation token and a
+     timeout. Poise reads `owners` as a fixed set, so it must be known by
+     then.
    - If the owner lookup fails at startup, the owner set is empty and `/login`
      denies everyone (fail closed).
    - Non-owners get an ephemeral denial from `on_framework_error`
@@ -127,8 +131,9 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
        canonical unpadded base64url, 43 characters for the 32-byte secret,
        and 44 for the 33-byte compressed key. The key is decoded with
        `from_sec1_bytes`, and the identity point is rejected.
-     - after the claim, compares the decompressed key in constant time with
-       the 65-byte key the claim returned. Any malformed part gets the
+     - after the claim, compares the parsed fragment key with the parsed
+       65-byte key the claim returned, as equal `p256::PublicKey` values
+       rather than as bytes. Any malformed part gets the
        byte-identical refusal page.
      - acquires the single browser slot **before** claiming (busy means try
        again, and the link stays unused);
@@ -158,9 +163,13 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      enabled.
    - **Process hygiene:**
      - Chromium runs under the container's minimal init (tini).
-     - Teardown kills the whole Chromium process group, not just the child.
-     - Before each launch, the service asserts that no stray processes exist
-       in the container, and fails closed if any do. The unauthenticated
+     - Teardown kills Chromium and all its descendants, not just the child.
+       chromiumoxide has no process-group hook, so the service walks `/proc`
+       for descendants and kills them through `rustix`, or launches Chromium
+       via a `setsid` wrapper.
+     - Before each launch, the service asserts (by `/proc` scan) that no
+       stray processes exist in the container, and fails closed if any do.
+       The container has a `pids` limit. The unauthenticated
        loopback DevTools port is reachable by any process in the container,
        so a leftover process could otherwise attach to the next session.
      - The container runs with a read-only rootfs, the profile tmpfs mounted
@@ -215,8 +224,9 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      after checking that it equals the database's key:
      - ephemeral-static P-256 ECDH;
      - then HKDF-SHA256 with ikm = ECDH shared secret || link secret,
-       salt = session ID, and info = `xiao.login.result.v1` plus both
-       public keys;
+       salt = session ID, and info = `xiao.login.result.v1` followed by
+       both public keys, each in uncompressed 65-byte SEC1 form (ephemeral
+       first);
      - then AES-256-GCM-SIV.
 
      Reading the result needs the bot's private key. Forging a result needs
@@ -283,10 +293,20 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
        reverse an owner's `/login` replacement.
      - None: use the legacy account if Group B is configured, otherwise idle
        ("awaiting /login") with Discord up.
-     - More than one: fail closed.
+     - More than one: no account is started.
 
      After a replacement, the Discord outcome tells the operator to remove
      Group B.
+   - **Recoverable states never stop the bot when `/login` is enabled.** In
+     each of these cases the supervisor logs an error, idles ("awaiting
+     /login"), and Discord stays up, so the owner can recover with
+     `/login`:
+     - more than one active credential (a `/login` replacement resolves it
+       through `retire_other_accounts`);
+     - a legacy token that is stale or unreadable
+       (`ReenrollmentRequired` / `AuthTokenUnavailable`).
+
+     Without `/login` these cases stay fatal, as today.
    - It handles `AccountSwitch` as sequenced in step 6. Only SteamIDs cross
      the channel, never credential material.
    - Restore failures at startup (decryption, an unreadable store) stay
@@ -399,6 +419,8 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
   and https-only. `/login` is enabled only when group A and the host are both
   set. The supervisor needs only group A.
 - **`xiao-login`:** has its own `LoginConfig`:
+  - `LOGIN_PUBLIC_HOST` (same validation; `Origin` and `Host` are checked
+    against it);
   - `LOGIN_DATABASE_URL_FILE`, owner-only (0400), failing closed otherwise;
   - the same `DATABASE_TLS` policy as the bot;
   - the listen address and the Chromium path.
