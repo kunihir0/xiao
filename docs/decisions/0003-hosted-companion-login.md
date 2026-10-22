@@ -123,8 +123,13 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      - requires `Origin` to equal exactly `https://<LOGIN_PUBLIC_HOST>` and
        `Sec-Fetch-Site: same-origin`, and rejects the request if either is
        absent or different;
-     - strictly decodes the secret (exactly 43 base64url characters,
-       canonical);
+     - strictly decodes both fragment parts: exactly one `.` separator,
+       canonical unpadded base64url, 43 characters for the 32-byte secret,
+       and 44 for the 33-byte compressed key. The key is decoded with
+       `from_sec1_bytes`, and the identity point is rejected.
+     - after the claim, compares the decompressed key in constant time with
+       the 65-byte key the claim returned. Any malformed part gets the
+       byte-identical refusal page.
      - acquires the single browser slot **before** claiming (busy means try
        again, and the link stays unused);
      - calls `login_claim(lookup_hash)`.
@@ -187,7 +192,11 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      - the payload is at most 16 KiB.
 
      Anything else fails the session. The payload is parsed into required,
-     strictly typed `SteamId` and `Token` fields. Unknown keys are ignored
+     strictly typed `SteamId` and `Token` fields.
+     - `SteamId` accepts only the JSON representation observed in the live
+       acceptance run.
+     - Duplicate known keys are rejected.
+     - Unknown keys' values are never logged. Unknown keys are ignored
      rather than rejected: Facepunch's payload schema is undocumented, and
      the payload's authenticity comes from the context checks above, not
      from its shape.
@@ -306,8 +315,12 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 - **`xiao_login` role:** a third role, with no default privileges.
   - It may `EXECUTE` only five functions: `login_claim`, `login_complete`,
     `login_fail`, `login_state` and `login_fail_orphans`.
-  - These are migrator-owned `SECURITY DEFINER` functions with a fixed
-    `search_path` that act only on unexpired rows in the right state.
+  - These are migrator-owned `SECURITY DEFINER` functions that act only on
+    unexpired rows in the right state.
+    - Each one sets `search_path = pg_catalog, <schema>` with `pg_temp`
+      excluded, and every object reference is schema-qualified.
+    - The `db` test also proves `xiao_login` cannot create objects in any
+      schema on that path.
   - The migration runs `REVOKE EXECUTE ... FROM PUBLIC` on them.
   - The role cannot enumerate rows, read the Discord user ID, `INSERT`,
     `DELETE`, or touch any other table.
@@ -340,8 +353,9 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
   backups. An attacker with only the database, only backups, only the URL,
   or the database plus the URL can neither open nor forge it. A database
   writer cannot redirect it, because the fragment commits to the recipient
-  key. ADR 0002's "never persisted" now reads: never persisted in plaintext
-  or in any form the database can decrypt.
+  key. ADR 0002's "never persisted" now reads: never stored in plaintext,
+  and never stored in any form that the database, its backups or the
+  one-time URL can decrypt or forge.
 
 ### HTTP surface
 
@@ -444,6 +458,12 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
   that credential only allows the five functions, and result forging needs
   the link secret. Moving Chromium into its own container is the next
   isolation step if needed.
+- **Chromium's sandbox depends on the host.** Unprivileged user namespaces
+  (or the shipped seccomp profile) must be available. Hosts that restrict
+  them through AppArmor may refuse. Chromium then aborts with "No usable
+  sandbox!", which fails closed. No code path ever falls back to
+  `--no-sandbox`. The deployment docs list the host prerequisites, and the
+  live check confirms the sandbox was active.
 - **Fragile external behavior.** The flow depends on unofficial Facepunch and
   Steam behavior: the bridge, the QR image, the OpenID page, and tolerance
   of headless browsers. A change makes `/login` fail closed with a visible
