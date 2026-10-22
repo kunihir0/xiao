@@ -7,7 +7,8 @@ The two imports above are the binding project contract. This file adds how Claud
 
 ## Hard rules (never delegate, never relax)
 
-- Never modify, stage, commit, revert, restore, clean, delete, or rename anything under `.omp/` or `.omp.bak/`. They are user-owned harness files. Read them only.
+- `.omp/` is the user's OMP harness, and the user wants it kept accurate when the code, CI, or contract changes. `.claude/settings.json` denies every edit under `.omp/` and `.omp.bak/`. Don't work around that with shell writes. When an `.omp/` file goes stale, report the exact stale text and the proposed replacement to the user. Even if the deny rule is later narrowed, never touch `.omp/config.yml`, `.omp/config.yml.lock`, `.omp/mcp.json` (the user keeps local edits to these), or `.omp.bak/`.
+- The OMP roster (`.omp/agents/`) and the Claude Code roster (`.claude/agents/`) mirror each other (mapping in `AGENTS.md`). A change to review policy, a role's scope, or the contract updates both in the same PR.
 - Never read `.env`, `.env.*` (except `.env.example`), token files, keyrings, or `/run/secrets/*`. Never print, echo, or paste a token, key, player token, or cookie value, even in a tool call.
 - Never answer the `phase0-live-proof` confirmation prompt, and never allocate a pty or script to do so. Live runs are started by the human in their own terminal.
 - Before any push, PR body, issue/PR comment, or evidence publication, run `redaction-auditor` on exactly what will be published.
