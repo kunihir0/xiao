@@ -1,0 +1,29 @@
+{
+  "description": "Confirm-code known-answer vectors: HKDF-SHA256(ikm=secret, salt=empty, info='xiao.login.confirm.v1'), first 6 bytes, each masked with 31 and indexed into 23456789ABCDEFGHJKLMNPQRSTUVWXYZ. lookup_hash_hex is SHA-256('xiao.login.lookup.v1\\0' || secret). Computed with python3 stdlib hmac/hashlib and cross-checked with the cryptography package.",
+  "vectors": [
+    {
+      "name": "zeros",
+      "secret_b64url": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "code": "9KF9ZB",
+      "lookup_hash_hex": "14a1484f7a744a1a3dc020ad03e9c826ef5f39743c38cbf1352aa0273617b38e"
+    },
+    {
+      "name": "ascending_00_1f",
+      "secret_b64url": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "code": "GEJFWB",
+      "lookup_hash_hex": "24874b724d3fabb7448fed0b2618091c200146a3e3a0dcc48736b92a5ac6612f"
+    },
+    {
+      "name": "ones_ff",
+      "secret_b64url": "__________________________________________8",
+      "code": "RZRAA3",
+      "lookup_hash_hex": "d44f7ebc323ffc7204719ff18d26e1c23eb652fdffa5a52f9df8c7a58e11f5b7"
+    },
+    {
+      "name": "ascending_20_3f",
+      "secret_b64url": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+      "code": "4PA3R8",
+      "lookup_hash_hex": "4ea518ede5b223034c86f5eb6b0944b5b98ad79cad29508a5ed8a00ac35092e4"
+    }
+  ]
+}

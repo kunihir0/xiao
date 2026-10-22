@@ -1430,6 +1430,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "login-session"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm-siv",
+ "base64 0.23.1",
+ "bot-domain",
+ "hkdf",
+ "p256",
+ "proptest",
+ "rand 0.10.3",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
