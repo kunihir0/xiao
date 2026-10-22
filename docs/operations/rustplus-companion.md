@@ -56,8 +56,10 @@ keyring through the `KeyProvider` seam without a schema change.
 
 ## Obtaining the companion auth token (out of band)
 
-The bot hosts no web callback. The operator obtains the token once, outside
-the bot, with the Steam login of the Rust+ companion:
+[ADR 0003](../decisions/0003-hosted-companion-login.md) replaces this
+procedure with the Discord `/login` command and the `xiao-login` service,
+which is being implemented. Until `/login` ships, the operator obtains the
+token once, outside the bot, with the Steam login of the Rust+ companion:
 
 1. On a trusted workstation with Google Chrome, run the community tool
    `npx @liamcottle/rustplus.js fcm-register` (see the
