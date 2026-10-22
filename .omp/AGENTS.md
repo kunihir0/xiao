@@ -8,7 +8,7 @@ This repository is an agent-first Rust service. GitHub is the durable control pl
 - Discord is slash/application-command first. Use Poise and its Serenity re-export; do not add a direct Serenity dependency unless a concrete feature cannot be enabled otherwise.
 - PostgreSQL only. Never substitute SQLite in tests.
 - Diesel + diesel-async. Use one pool backend only: `deadpool` unless an ADR changes it.
-- No web application, dashboard, REST API, GraphQL API, or HTTP health server. Outbound protocol clients required by Discord, Rust+, FCM, dependency tooling, or telemetry are not "web features".
+- No web application, dashboard, REST API, GraphQL API, or HTTP health server. Outbound protocol clients required by Discord, Rust+, FCM, dependency tooling, or telemetry are not "web features". Sole exception: `apps/login` (`xiao-login`, ADR 0003) serves only the one-time `/login` page and route table defined in that ADR.
 - No Redis until a measured multi-instance/shared-state requirement exists.
 - Domain and application code MUST NOT import Poise, Serenity, Diesel, PostgreSQL client types, Rust+ protocol types, FCM protocol types, or deployment code.
 - `apps/bot` is the composition root. It wires adapters; it does not own business rules.
@@ -22,6 +22,7 @@ Allowed direction:
 `domain <- application <- {discord, db, rustplus-adapter} <- apps/bot`
 
 `config` and `telemetry` are support crates consumed from the composition edge. `test-support` is test-only. Protocol clients (`rustplus-client`, `push-receiver`) live behind `rustplus-adapter`; raw protocol structs do not escape into application/domain APIs.
+`login-session` is a leaf crate (`domain <- login-session <- {application, db, apps/login}`). `apps/login` is a second composition root: it may depend on `login-session`, `bot-db` (feature `login-broker` only), `config`, and `telemetry`, and must not depend on `discord`, `push-receiver`, `rustplus-client`, or `rustplus-adapter`.
 
 Do not introduce a crate merely to move files around. A crate must enforce a real dependency boundary, runtime boundary, or reusable protocol boundary.
 
