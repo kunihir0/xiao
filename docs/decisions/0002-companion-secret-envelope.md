@@ -1,5 +1,11 @@
 # ADR 0002: Rust+ companion secret envelope and key provider
 
+Amended by [ADR 0003](0003-hosted-companion-login.md):
+- The token can now arrive through the hosted `/login` flow instead of a file.
+- "Never persisted" now means: never stored in plaintext, and never stored in
+  any form that the database, its backups or the one-time URL can decrypt or
+  forge.
+
 ## Context
 
 Issue #16 persists long-lived bearer material in PostgreSQL: FCM check-in

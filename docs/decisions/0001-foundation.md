@@ -1,5 +1,7 @@
 # ADR 0001: Service foundation
 
+Amended by [ADR 0003](0003-hosted-companion-login.md): the separate `xiao-login` container is the single, narrowly scoped exception to "no web surface".
+
 ## Context
 
 The bot needs a maintainable Rust monorepo, clean boundaries around Discord/PostgreSQL/Rust+ integration, strong automated verification, and an agent-first GitHub workflow with minimal human coordination.

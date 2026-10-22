@@ -1,6 +1,6 @@
 # Discord Bot Monorepo
 
-Rust 2024 monorepo for a Discord bot integrating Rust+ and FCM/MCS without a web surface.
+Rust 2024 monorepo for a Discord bot integrating Rust+ and FCM/MCS. The only web surface is the one-time `/login` page of the separate `xiao-login` service ([ADR 0003](docs/decisions/0003-hosted-companion-login.md)).
 
 ## Local development
 
