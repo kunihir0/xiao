@@ -69,7 +69,9 @@ Built-ins: use `Explore` for broad read-only searches across many files, and `Pl
 ## Cloud environment notes
 
 - Available locally: Rust 1.99 toolchain (`cargo fmt`, `clippy`, `test`), Node 22, Playwright Chromium at `/opt/pw-browsers/chromium`, and the `claude` CLI.
-- Not installed: `cargo-nextest`, `cargo-deny`, `cargo-shear`, PostgreSQL. CI enforces those checks, so say "not run locally" rather than implying a pass.
+- Not installed: `cargo-nextest`, `cargo-deny`, `cargo-shear`. CI enforces those checks, so say "not run locally" rather than implying a pass.
+- PostgreSQL 16 server and client are in the image (CI runs 18.6), but `libpq-dev` is not. After `apt-get install -y libpq-dev`, the `bot` and `bot-db` test binaries link. Run the `#[ignore]` database tests against a scratch server (`initdb` + `pg_ctl` under the scratchpad) with `DATABASE_URL`, and still note "PG16 locally, CI is 18".
+- Disk is a fixed allowance shared by every worktree's `target/`. Build with `CARGO_INCREMENTAL=0` in worktrees, and delete a worktree's `target/` once its work has merged.
 - Verified on this host: agent `model:` frontmatter is honored (subagent requests go to the declared model), and `.claude/settings.json` `deny` rules apply. `allow` rules apply only once the workspace is trusted.
 - Work only on the session's designated `claude/*` branch. New cloud sessions clone the default branch, so changes under `.claude/` and `CLAUDE.md` take effect in future sessions only after they reach `main`.
 

@@ -1,6 +1,7 @@
 //! Use cases and ports; independent of infrastructure.
 
 mod companion;
+mod companion_supervisor;
 mod future;
 mod login;
 mod login_coordinator;
@@ -14,6 +15,10 @@ pub use companion::{
     MAX_REGISTRATION_TOKEN_BYTES, MAX_STEAM_AUTH_TOKEN_BYTES, PushCredential, PushCredentialStore,
     RegistrationError, SteamAuthToken, SteamAuthTokenSource, ensure_companion_registration,
     reregister_companion,
+};
+pub use companion_supervisor::{
+    CompanionSupervisor, LegacyAccount, PairingRuntime, RuntimeError, SupervisorError,
+    SupervisorPorts,
 };
 pub use future::BoxFuture;
 pub use login::{

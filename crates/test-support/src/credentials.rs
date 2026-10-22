@@ -6,11 +6,16 @@ use bot_application::{
 use bot_domain::SteamId;
 use tokio::sync::Mutex;
 
+use crate::{CallEvent, EventLog};
+
 #[derive(Default)]
 struct State {
     rows: Vec<PushCredential>,
     load_error: Option<StoreError>,
     list_error: Option<StoreError>,
+    retire_others_error: Option<StoreError>,
+    hide_from_load: bool,
+    log: Option<EventLog>,
     writes: usize,
 }
 
@@ -41,6 +46,20 @@ impl FakePushCredentialStore {
     pub async fn fail_list_active(&self, error: Option<StoreError>) {
         self.state.lock().await.list_error = error;
     }
+    /// Makes every subsequent `retire_other_accounts` fail with `error`
+    /// before changing anything, until cleared with `None`.
+    pub async fn fail_retire_other_accounts(&self, error: Option<StoreError>) {
+        self.state.lock().await.retire_others_error = error;
+    }
+    /// Makes `load_active` answer `Ok(None)` for every account while
+    /// `list_active` still lists them: the store and its listing disagree.
+    pub async fn hide_active_from_load(&self, hide: bool) {
+        self.state.lock().await.hide_from_load = hide;
+    }
+    /// Appends `load_active` and `retire_other_accounts` calls to `log`.
+    pub async fn record_calls_into(&self, log: &EventLog) {
+        self.state.lock().await.log = Some(log.clone());
+    }
     pub async fn rows(&self) -> Vec<PushCredential> {
         self.state.lock().await.rows.clone()
     }
@@ -59,8 +78,14 @@ impl PushCredentialStore for FakePushCredentialStore {
     ) -> BoxFuture<'a, Result<Option<PushCredential>, StoreError>> {
         Box::pin(async move {
             let state = self.state.lock().await;
+            if let Some(log) = &state.log {
+                log.push(CallEvent::LoadActive(steam_id));
+            }
             if let Some(error) = &state.load_error {
                 return Err(error.clone());
+            }
+            if state.hide_from_load {
+                return Ok(None);
             }
             Ok(state
                 .rows
@@ -153,6 +178,12 @@ impl PushCredentialStore for FakePushCredentialStore {
         Box::pin(async move {
             let mut state = self.state.lock().await;
             state.writes += 1;
+            if let Some(log) = &state.log {
+                log.push(CallEvent::RetireOtherAccounts(keep));
+            }
+            if let Some(error) = &state.retire_others_error {
+                return Err(error.clone());
+            }
             if !state
                 .rows
                 .iter()
@@ -192,6 +223,17 @@ mod tests {
         assert_eq!(store.list_active().await, Err(StoreError::Unavailable));
         store.fail_list_active(None).await;
         assert_eq!(store.list_active().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_active_can_be_hidden_while_list_active_still_lists() {
+        let row = credential(10, CredentialState::Active);
+        let store = FakePushCredentialStore::with_rows(vec![row.clone()]);
+        store.hide_active_from_load(true).await;
+        assert_eq!(store.load_active(row.steam_id).await, Ok(None));
+        assert_eq!(store.list_active().await.unwrap(), vec![row.steam_id]);
+        store.hide_active_from_load(false).await;
+        assert!(store.load_active(row.steam_id).await.unwrap().is_some());
     }
 
     #[tokio::test]

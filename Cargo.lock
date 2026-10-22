@@ -267,6 +267,7 @@ dependencies = [
  "bot-domain",
  "login-session",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
