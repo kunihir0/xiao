@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 struct State {
     rows: Vec<PushCredential>,
     load_error: Option<StoreError>,
+    list_error: Option<StoreError>,
     writes: usize,
 }
 
@@ -34,6 +35,11 @@ impl FakePushCredentialStore {
     /// Makes every subsequent `load_active` fail with `error`.
     pub async fn fail_load_active(&self, error: StoreError) {
         self.state.lock().await.load_error = Some(error);
+    }
+    /// Makes every subsequent `list_active` fail with `error` until cleared
+    /// with `None`.
+    pub async fn fail_list_active(&self, error: Option<StoreError>) {
+        self.state.lock().await.list_error = error;
     }
     pub async fn rows(&self) -> Vec<PushCredential> {
         self.state.lock().await.rows.clone()
@@ -126,6 +132,9 @@ impl PushCredentialStore for FakePushCredentialStore {
     fn list_active<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SteamId>, StoreError>> {
         Box::pin(async move {
             let state = self.state.lock().await;
+            if let Some(error) = &state.list_error {
+                return Err(error.clone());
+            }
             let mut ids: Vec<SteamId> = state
                 .rows
                 .iter()
@@ -173,6 +182,16 @@ mod tests {
             state,
             fcm: FcmSecrets::new(1, 2, "fcm-token".to_owned(), [1; 32], [2; 16]).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn list_active_failure_can_be_injected_and_cleared() {
+        let store =
+            FakePushCredentialStore::with_rows(vec![credential(10, CredentialState::Active)]);
+        store.fail_list_active(Some(StoreError::Unavailable)).await;
+        assert_eq!(store.list_active().await, Err(StoreError::Unavailable));
+        store.fail_list_active(None).await;
+        assert_eq!(store.list_active().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

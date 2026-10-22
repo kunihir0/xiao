@@ -198,6 +198,7 @@ dependencies = [
  "rustix",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
  "zeroize",
 ]

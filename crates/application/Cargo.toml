@@ -15,6 +15,7 @@ login-session = { version = "0.1.0", path = "../login-session" }
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
 tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 

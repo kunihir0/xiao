@@ -43,6 +43,9 @@ impl Row {
 struct SessionsState {
     rows: Vec<Row>,
     create_error: Option<StoreError>,
+    state_error: Option<StoreError>,
+    take_error: Option<StoreError>,
+    withhold_completed: bool,
 }
 
 impl SessionsState {
@@ -77,6 +80,51 @@ impl FakeLoginSessions {
     /// Makes every subsequent `create` fail with `error`.
     pub async fn fail_create(&self, error: StoreError) {
         self.state.lock().await.create_error = Some(error);
+    }
+
+    /// Makes every subsequent `state` fail with `error` until cleared with
+    /// `None`.
+    pub async fn fail_state(&self, error: Option<StoreError>) {
+        self.state.lock().await.state_error = error;
+    }
+
+    /// Makes every subsequent `take_completed` fail with `error` until
+    /// cleared with `None`. The row is left untouched.
+    pub async fn fail_take_completed(&self, error: Option<StoreError>) {
+        self.state.lock().await.take_error = error;
+    }
+
+    /// While set, `take_completed` answers `Ok(None)` without consuming the
+    /// row, as if another taker had won.
+    pub async fn withhold_completed(&self, withhold: bool) {
+        self.state.lock().await.withhold_completed = withhold;
+    }
+
+    /// Forces a row into `state`, bypassing the transition table (for
+    /// example a `consumed` row whose result the bot never received).
+    pub async fn force_state(
+        &self,
+        id: LoginSessionId,
+        state: LoginState,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.state.lock().await;
+        let row = inner
+            .rows
+            .iter_mut()
+            .find(|row| row.session.id == id)
+            .ok_or(StoreError::NotFound)?;
+        row.state = state;
+        row.sealed = None;
+        Ok(())
+    }
+
+    /// Removes a row entirely.
+    pub async fn delete(&self, id: LoginSessionId) {
+        self.state
+            .lock()
+            .await
+            .rows
+            .retain(|row| row.session.id != id);
     }
 
     /// `xiao-login`'s claim: `pending` to `claimed`.
@@ -190,6 +238,9 @@ impl LoginSessions for FakeLoginSessions {
     ) -> BoxFuture<'a, Result<Option<LoginStatus>, StoreError>> {
         Box::pin(async move {
             let mut state = self.state.lock().await;
+            if let Some(error) = &state.state_error {
+                return Err(error.clone());
+            }
             state.sweep_expired();
             Ok(state
                 .rows
@@ -208,6 +259,12 @@ impl LoginSessions for FakeLoginSessions {
     ) -> BoxFuture<'a, Result<Option<SealedResult>, StoreError>> {
         Box::pin(async move {
             let mut state = self.state.lock().await;
+            if let Some(error) = &state.take_error {
+                return Err(error.clone());
+            }
+            if state.withhold_completed {
+                return Ok(None);
+            }
             state.sweep_expired();
             let Some(row) = state.rows.iter_mut().find(|row| row.session.id == id) else {
                 return Ok(None);
@@ -252,6 +309,9 @@ pub enum AuditCall {
 struct AuditState {
     calls: Vec<AuditCall>,
     created_error: Option<StoreError>,
+    decided_error: Option<StoreError>,
+    finished_error: Option<StoreError>,
+    scrub_error: Option<StoreError>,
     scrub_result: u64,
 }
 
@@ -265,6 +325,21 @@ impl FakeLoginAudit {
     /// Makes every subsequent `created` fail, and record nothing.
     pub async fn fail_created(&self, error: StoreError) {
         self.state.lock().await.created_error = Some(error);
+    }
+    /// Makes every subsequent `decided` fail, and record nothing, until
+    /// cleared with `None`.
+    pub async fn fail_decided(&self, error: Option<StoreError>) {
+        self.state.lock().await.decided_error = error;
+    }
+    /// Makes every subsequent `finished` fail, and record nothing, until
+    /// cleared with `None`.
+    pub async fn fail_finished(&self, error: Option<StoreError>) {
+        self.state.lock().await.finished_error = error;
+    }
+    /// Makes every subsequent `scrub_older_than` fail, and record nothing,
+    /// until cleared with `None`.
+    pub async fn fail_scrub(&self, error: Option<StoreError>) {
+        self.state.lock().await.scrub_error = error;
     }
     /// Sets the row count `scrub_older_than` reports.
     pub async fn set_scrub_result(&self, rows: u64) {
@@ -297,11 +372,11 @@ impl LoginAudit for FakeLoginAudit {
         decision: Decision,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            self.state
-                .lock()
-                .await
-                .calls
-                .push(AuditCall::Decided(id, decision));
+            let mut state = self.state.lock().await;
+            if let Some(error) = &state.decided_error {
+                return Err(error.clone());
+            }
+            state.calls.push(AuditCall::Decided(id, decision));
             Ok(())
         })
     }
@@ -312,11 +387,11 @@ impl LoginAudit for FakeLoginAudit {
         outcome: &'a AuditOutcome,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            self.state
-                .lock()
-                .await
-                .calls
-                .push(AuditCall::Finished(id, *outcome));
+            let mut state = self.state.lock().await;
+            if let Some(error) = &state.finished_error {
+                return Err(error.clone());
+            }
+            state.calls.push(AuditCall::Finished(id, *outcome));
             Ok(())
         })
     }
@@ -324,6 +399,9 @@ impl LoginAudit for FakeLoginAudit {
     fn scrub_older_than<'a>(&'a self, age: Duration) -> BoxFuture<'a, Result<u64, StoreError>> {
         Box::pin(async move {
             let mut state = self.state.lock().await;
+            if let Some(error) = &state.scrub_error {
+                return Err(error.clone());
+            }
             state.calls.push(AuditCall::Scrubbed(age));
             Ok(state.scrub_result)
         })
@@ -569,6 +647,70 @@ mod tests {
         assert_eq!(sessions.take_completed(id).await.unwrap(), None);
         // An expired row frees the live slot.
         created(&sessions).await;
+    }
+
+    #[tokio::test]
+    async fn injected_session_failures_apply_until_cleared() {
+        let sessions = FakeLoginSessions::default();
+        let id = created(&sessions).await;
+        sessions.fail_state(Some(StoreError::Unavailable)).await;
+        assert_eq!(sessions.state(id).await, Err(StoreError::Unavailable));
+        sessions.fail_state(None).await;
+        assert!(sessions.state(id).await.unwrap().is_some());
+
+        sessions.claim(id).await.unwrap();
+        sessions.complete(id, sealed()).await.unwrap();
+        sessions
+            .fail_take_completed(Some(StoreError::Unavailable))
+            .await;
+        assert_eq!(
+            sessions.take_completed(id).await,
+            Err(StoreError::Unavailable)
+        );
+        sessions.fail_take_completed(None).await;
+        sessions.withhold_completed(true).await;
+        assert_eq!(sessions.take_completed(id).await.unwrap(), None);
+        assert!(sessions.holds_ciphertext(id).await);
+        sessions.withhold_completed(false).await;
+        assert_eq!(sessions.take_completed(id).await.unwrap(), Some(sealed()));
+    }
+
+    #[tokio::test]
+    async fn rows_can_be_forced_or_deleted() {
+        let sessions = FakeLoginSessions::default();
+        let id = created(&sessions).await;
+        sessions
+            .force_state(id, LoginState::Consumed)
+            .await
+            .unwrap();
+        assert_eq!(st(&sessions, id).await, Some(LoginState::Consumed));
+        sessions.delete(id).await;
+        assert_eq!(st(&sessions, id).await, None);
+        assert_eq!(
+            sessions.force_state(id, LoginState::Expired).await,
+            Err(StoreError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_failures_can_be_injected_per_call() {
+        let audit = FakeLoginAudit::default();
+        let id = LoginSessionId::generate();
+        let outcome = bot_application::LoginOutcome::Cancelled.audit();
+        audit.fail_decided(Some(StoreError::Unavailable)).await;
+        audit.fail_finished(Some(StoreError::Unavailable)).await;
+        audit.fail_scrub(Some(StoreError::Unavailable)).await;
+        assert!(audit.decided(id, Decision::Confirm).await.is_err());
+        assert!(audit.finished(id, &outcome).await.is_err());
+        assert!(audit.scrub_older_than(Duration::ZERO).await.is_err());
+        assert!(audit.calls().await.is_empty());
+        audit.fail_decided(None).await;
+        audit.fail_finished(None).await;
+        audit.fail_scrub(None).await;
+        audit.decided(id, Decision::Confirm).await.unwrap();
+        audit.finished(id, &outcome).await.unwrap();
+        audit.scrub_older_than(Duration::ZERO).await.unwrap();
+        assert_eq!(audit.calls().await.len(), 3);
     }
 
     #[tokio::test]
