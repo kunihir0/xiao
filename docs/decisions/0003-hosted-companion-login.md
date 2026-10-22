@@ -1,7 +1,9 @@
 # ADR 0003: Hosted Rust+ companion login service
 
 Status: accepted. Amends ADR 0001 (web surface) and ADR 0002 (token source).
-Implementation tracked in the issue linked from the PR that adds this ADR.
+Effective for implementation once `.omp/AGENTS.md` carries the `xiao-login`
+exception. Implementation is tracked in the issue linked from the PR that
+adds this ADR.
 
 ## Context
 
@@ -69,9 +71,15 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 
 1. **`/login start`** (and **`/login cancel`**) are Discord slash
    subcommands: ephemeral, deferred, and `owners_only`.
-   - "Owner" is exactly the Discord application's owner, or the team owner
-     for a team application. Poise is set to `initialized_team_roles:
-     Some(vec![])`, so no Admin or Developer team member qualifies.
+   - "Owner" is exactly one Discord user. The bot sets Poise
+     `initialize_owners = false` and fills the owner set itself at startup:
+     - with no team: `application_info.owner`;
+     - with a team: only `team.owner_user_id`. Serenity 0.12 has no Owner
+       team role, and for team apps `application_info.owner` is a team
+       placeholder.
+
+     No Admin or Developer team member qualifies. Changing the owner needs a
+     restart.
    - If the owner lookup fails at startup, the owner set is empty and `/login`
      denies everyone (fail closed).
    - Non-owners get an ephemeral denial from `on_framework_error`
@@ -112,7 +120,9 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      disclosure, plus a **Continue** button.
    - Continue sends a same-origin `POST /claim` with the secret in the body.
      The server:
-     - rejects a request without `Origin` / `Sec-Fetch-Site: same-origin`;
+     - requires `Origin` to equal exactly `https://<LOGIN_PUBLIC_HOST>` and
+       `Sec-Fetch-Site: same-origin`, and rejects the request if either is
+       absent or different;
      - strictly decodes the secret (exactly 43 base64url characters,
        canonical);
      - acquires the single browser slot **before** claiming (busy means try
@@ -128,19 +138,43 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
    (`chromiumoxide`):
    - **Profile:** a fresh per-session `user_data_dir` on tmpfs. The profile
      root is wiped at service start.
-   - **Sandbox:** Chromium's sandbox stays enabled, via the Chrome seccomp
-     profile or user namespaces. `--no-sandbox` would need an ADR amendment.
+   - **Sandbox:** Chromium's sandbox stays enabled, via a Chrome seccomp
+     profile shipped with the deployment, or user namespaces. `--no-sandbox`
+     would need an ADR amendment.
+   - **Arguments:** `disable_default_args(true)` with an explicit, reviewed
+     argument list.
+     - It omits chromiumoxide's default `NetworkServiceInProcess`, so the
+       network stack stays in a sandboxed utility process.
+     - It keeps `disable-breakpad`.
+     - It adds `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`.
    - **DevTools endpoint:** loopback only, on an ephemeral port. No
      `--remote-debugging-address` or `--remote-allow-origins`. Downloads are
      denied, service workers bypassed, and the `fetcher` feature is never
      enabled.
+   - **Process hygiene:**
+     - Chromium runs under the container's minimal init (tini).
+     - Teardown kills the whole Chromium process group, not just the child.
+     - Before each launch, the service asserts that no stray processes exist
+       in the container, and fails closed if any do. The unauthenticated
+       loopback DevTools port is reachable by any process in the container,
+       so a leftover process could otherwise attach to the next session.
+     - The container runs with a read-only rootfs, the profile tmpfs mounted
+       `noexec,nosuid`, `cap_drop: ALL`, and `no-new-privileges`.
    - **Request filtering:** `Fetch.enable` with pattern `*` on every
-     auto-attached target, popups included.
-     - Document and frame requests must be `https` to an exact allowlist of
-       Facepunch companion and Steam login hosts. Subresources must match an
-       explicit CDN allowlist.
-     - Private, loopback, link-local and Docker-network addresses are always
-       refused, as are `file:`, `chrome:` and `javascript:`.
+     auto-attached target: popups and dedicated and shared workers included.
+     - Document and frame requests must be `https` to an exact hostname
+       allowlist of the Facepunch companion and Steam login hosts.
+     - Subresources must match an explicit CDN allowlist. `blob:` and
+       `data:` subresources created by an allowlisted document are allowed.
+       That is how Steam renders the QR image.
+     - IP-literal hosts are refused, as are `file:`, `chrome:` and
+       `javascript:`. Fetch sees URLs, not resolved addresses, so protection
+       against reaching internal services comes from the exact-host
+       allowlist plus refusing IP literals. Address-level refusal would need
+       a network egress policy.
+     - Fetch does not intercept WebSocket or WebRTC. The WebRTC policy flag
+       above and the allowlisted documents and scripts are the controls for
+       those.
      - An unexpected top-level document fails the session.
    - **Bridge:** a per-session random binding name is registered through
      `Runtime.addBinding`. `Page.addScriptToEvaluateOnNewDocument` defines
@@ -152,7 +186,11 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      - it is the first such call;
      - the payload is at most 16 KiB.
 
-     Anything else fails the session.
+     Anything else fails the session. The payload is parsed into required,
+     strictly typed `SteamId` and `Token` fields. Unknown keys are ignored
+     rather than rejected: Facepunch's payload schema is undocumented, and
+     the payload's authenticity comes from the context checks above, not
+     from its shape.
    - **QR only:** the service clicks "Login with Steam" and shows the user
      only fresh element screenshots of Steam's QR image. No user input is
      ever forwarded to the headless page, so the Steam password form is
@@ -164,25 +202,41 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 4. **Capture and seal.**
    - The service validates `SteamId` (u64 > 0) and `Token` (1 byte to
      8 KiB, no whitespace or control characters).
-   - It seals `{steam_id, token}` to the session's recipient key:
-     ephemeral-static P-256 ECDH, then HKDF-SHA256 (salt = session ID, info
-     binding both public keys), then AES-256-GCM-SIV.
+   - It seals `{steam_id, token}` to the recipient key from the fragment,
+     after checking that it equals the database's key:
+     - ephemeral-static P-256 ECDH;
+     - then HKDF-SHA256 with ikm = ECDH shared secret || link secret,
+       salt = session ID, and info = `xiao.login.result.v1` plus both
+       public keys;
+     - then AES-256-GCM-SIV.
+
+     Reading the result needs the bot's private key. Forging a result needs
+     the link secret, which `xiao-login` holds (`Zeroizing`) only for the
+     session.
      - The nonce is random, 96-bit.
      - The AAD is canonical and length-prefixed: `xiao.login.result`, the
        table, session ID, format version and algorithm (ADR 0002 style).
    - It calls `login_complete(session_id, ephemeral_pub, nonce, ciphertext)`.
-   - It then performs Steam's own sign-out, so the Steam web session it
-     created is revoked server-side and not just deleted locally. After
-     that it kills Chromium and deletes the profile.
+   - It then performs Steam's own sign-out through an allowlisted request,
+     so the Steam web session it created is revoked server-side and not just
+     deleted locally. The response is checked. After that it kills Chromium
+     and deletes the profile.
+   - That server-side revocation is a live acceptance check: the session
+     must disappear from the account's Steam sessions and devices list. If
+     sign-out fails, the session ends with a distinct failure code. The
+     Discord outcome then tells the user to revoke the session in Steam.
    - Every failure path ends in `login_fail(session_id, code)` with the same
      sign-out (once the QR was approved) and cleanup.
 5. **Bot completion.**
    - The bot polls with a bounded interval until `expires_at`. On
      `completed` it atomically takes the result: the state becomes
      `consumed` and the ciphertext columns are nulled in the same `UPDATE`.
+   - It rejects an invalid or identity `ephemeral_pub` (uncompressed SEC1,
+     65 bytes only).
    - It decrypts in memory, then shows the invoking user **"Logged in as
-     SteamID64 N"** with Confirm and Cancel buttons that only that user can
-     press.
+     SteamID64 N"** with the account's
+     `https://steamcommunity.com/profiles/<N>` link and Confirm and Cancel
+     buttons that only that user can press.
    - Only Confirm proceeds. Cancel or a timeout zeroizes the token.
 6. **Enrollment** is serialized by one owned `companion-login` coordinator.
    It never runs as a startup component error path.
@@ -213,12 +267,17 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 7. **Rust+ supervisor.** The bot always registers a `rustplus-pairing`
    supervisor when the FCM sender, keyring and key ID are configured.
    - **Startup precedence**, using `PushCredentialStore::list_active()`
-     (SteamIDs only):
-     - exactly one active credential: use it;
-     - none: use the legacy `RUSTPLUS_STEAM_ID` if configured, otherwise idle
-       ("awaiting /login") with Discord up;
-     - more than one: use the legacy SteamID if it matches one of them,
-       otherwise fail closed.
+     (SteamIDs only). An active credential in the database always wins:
+     - Exactly one active credential: use it. If the legacy
+       `RUSTPLUS_STEAM_ID` differs, log a warning and never register the
+       legacy account. Otherwise leftover legacy config would silently
+       reverse an owner's `/login` replacement.
+     - None: use the legacy account if Group B is configured, otherwise idle
+       ("awaiting /login") with Discord up.
+     - More than one: fail closed.
+
+     After a replacement, the Discord outcome tells the operator to remove
+     Group B.
    - It handles `AccountSwitch` as sequenced in step 6. Only SteamIDs cross
      the channel, never credential material.
    - Restore failures at startup (decryption, an unreadable store) stay
@@ -278,9 +337,11 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 - **What the database holds:** the token reaches PostgreSQL only as
   ciphertext sealed to a key that exists only in bot memory, for at most the
   session lifetime. The ciphertext can persist in WAL, dead tuples and
-  backups, but neither the database, its backups, the URL, nor all three
-  together can open it. ADR 0002's "never persisted" now reads: never
-  persisted in plaintext or in any form the database can decrypt.
+  backups. An attacker with only the database, only backups, only the URL,
+  or the database plus the URL can neither open nor forge it. A database
+  writer cannot redirect it, because the fragment commits to the recipient
+  key. ADR 0002's "never persisted" now reads: never persisted in plaintext
+  or in any form the database can decrypt.
 
 ### HTTP surface
 
@@ -299,8 +360,13 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
   - `Cache-Control: no-store`, HSTS, `nosniff`.
 
   No third-party resources are loaded.
-- **Limits:** request body and header limits, read and header timeouts, a
-  connection cap, and a global in-process token bucket on `POST /claim`.
+- **Limits:** request body and header limits, read and header timeouts, and
+  a connection cap.
+  - `POST /claim` has a per-client-IP token bucket keyed on the address
+    Caddy records. Caddy overwrites `X-Forwarded-For`, and only Caddy can
+    reach `xiao-login`, so a client cannot spoof it.
+  - A global bucket is the backstop, so one client cannot drain the owner's
+    attempts.
 - **Logging:**
   - No request-URI tracing layer.
   - Caddy access logging is off; its error log never sees a secret, because
@@ -366,10 +432,18 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
   server's location.
   
   It cannot decrypt stored credentials, past results, or results of logins it
-  did not handle. Chromium shares the service's UID. A renderer compromise
-  still needs a sandbox escape to reach the database credential, and that
-  credential only allows the five functions. Moving Chromium to its own
-  container is the next isolation step if needed.
+  did not handle.
+- **Chromium shares the service's UID.** That is acceptable only together
+  with the conditions in step 3:
+  - the sandbox stays on and the network service runs out of process;
+  - the whole process group is killed at teardown, with a stray-process
+    check before each launch;
+  - the container is hardened.
+
+  A browser-process compromise could read the 0400 database credential, but
+  that credential only allows the five functions, and result forging needs
+  the link secret. Moving Chromium into its own container is the next
+  isolation step if needed.
 - **Fragile external behavior.** The flow depends on unofficial Facepunch and
   Steam behavior: the bridge, the QR image, the OpenID page, and tolerance
   of headless browsers. A change makes `/login` fail closed with a visible
