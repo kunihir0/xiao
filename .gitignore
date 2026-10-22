@@ -8,3 +8,4 @@
 infra/local/.data/
 coverage/
 *.profraw
+.claude/worktrees/
