@@ -18,8 +18,10 @@ Diesel migrations. Local database integration tests use `DATABASE_URL`:
 DATABASE_URL=postgres://bot:bot@127.0.0.1:5432/bot cargo test -p bot-db -- --include-ignored
 ```
 
-The baseline migration is intentionally empty of domain tables; future
-features add their own reversible migrations.
+The baseline migration is intentionally empty of domain tables. Features add
+their own reversible migrations, for example
+`00000000000001_rustplus_companion_secrets` for encrypted Rust+ companion
+credentials and pairings (see `docs/decisions/0002-companion-secret-envelope.md`).
 
 ## Discord startup
 
@@ -36,6 +38,8 @@ cover command metadata, token redaction, setup/startup failure propagation,
 terminal readiness, and bounded cancellation; invoking `/ping` against Discord
 remains a token-gated manual smoke check.
 
-Install the developer tools used by CI as needed: `cargo-nextest`, `cargo-deny`, `cargo-shear`, `cargo-llvm-cov`, and Lefthook. OMP project automation lives in `.omp/`; start with `/bootstrap` after GitHub authentication.
+Install the developer tools used by CI as needed: `cargo-nextest`, `cargo-deny`, `cargo-shear`, `cargo-llvm-cov`, and Lefthook.
 
-Dependencies are intentionally absent from the empty foundation. Add the latest compatible crate only in the slice that uses it, verify its current API with Context7, and commit `Cargo.lock`.
+Agent automation: OMP project automation lives in `.omp/` (start with `/bootstrap` after GitHub authentication). Claude Code uses `CLAUDE.md` and `.claude/` (subagents plus the `/work-issue` and `/review-pr` skills). Both follow the same contract in `.omp/AGENTS.md`.
+
+Add a dependency only in the slice that uses it. Resolve its latest compatible release and current API first (Context7 for OMP, `crate-researcher` for Claude Code), add it with `cargo add`, and commit `Cargo.lock`.
