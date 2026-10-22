@@ -67,11 +67,17 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 
 ### Flow
 
-1. **`/login`** is a Discord slash command: ephemeral, deferred, and
-   `owners_only`.
-   - "Owner" is the application owner, and only team members with the team
-     Owner role (`initialized_team_roles = [Owner]`). Non-owners get an
-     ephemeral denial.
+1. **`/login start`** (and **`/login cancel`**) are Discord slash
+   subcommands: ephemeral, deferred, and `owners_only`.
+   - "Owner" is exactly the Discord application's owner, or the team owner
+     for a team application. Poise is set to `initialized_team_roles:
+     Some(vec![])`, so no Admin or Developer team member qualifies.
+   - If the owner lookup fails at startup, the owner set is empty and `/login`
+     denies everyone (fail closed).
+   - Non-owners get an ephemeral denial from `on_framework_error`
+     (`NotAnOwner`).
+   - The command set is reconciled by name and shape at startup, so changed
+     options are updated, not skipped.
    - The bot generates:
      - a 32-byte random **link secret**, which authenticates the browser;
      - an ephemeral **P-256 key pair**, which receives the result.
@@ -83,11 +89,21 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      to the database's `now()` plus 10 minutes.
    - At most one live (`pending`/`claimed`) session exists at a time,
      enforced by a partial unique index. A new `/login` cancels the old one.
-   - The reply is `<https://<LOGIN_PUBLIC_HOST>/l#<base64url(secret)>>` with
-     embeds suppressed. It names the host and shows a 6-character **confirm
-     code**: HKDF(secret, info `xiao.login.confirm.v1`), from an alphabet
-     without look-alike characters. If sending the reply fails, the session
-     is cancelled.
+   - The reply is
+     `<https://<LOGIN_PUBLIC_HOST>/l#<base64url(secret)>.<base64url(recipient key)>>`
+     with embeds suppressed. The recipient key is the 33-byte compressed
+     recipient public key, so the fragment commits to it. `xiao-login`
+     seals to that key and refuses the session if the database's key
+     differs, which defeats a database writer who swaps it.
+   - The reply names the host and shows a 6-character **confirm code**:
+     - computed as the first 6 bytes of
+       HKDF-SHA256(ikm = secret, salt = empty, info = `xiao.login.confirm.v1`);
+     - each byte masked with `& 31`, then indexed into the 32-character
+       alphabet `23456789ABCDEFGHJKLMNPQRSTUVWXYZ`.
+
+     The bot computes it in Rust and the page computes it with WebCrypto. A
+     shared known-answer fixture pins both.
+   - If sending the reply fails, the session is cancelled.
 2. **Open and claim.**
    - `GET /l` is a static page. The secret sits in the URL fragment, so the
      server, proxy, crawlers and logs never see it.
@@ -104,7 +120,8 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      - calls `login_claim(lookup_hash)`.
    - On success it sets a fresh random 256-bit session cookie (`__Host-`,
      `Secure`, `HttpOnly`, `SameSite=Strict`), mapped in memory, and answers
-     `303 /session`.
+     `204`. The script then calls `location.assign('/session')`, a same-origin
+     navigation, so the Strict cookie is sent.
    - Expired, used, unknown and malformed links all get one byte-identical
      refusal page.
 3. **Browser.** `xiao-login` drives headless Chromium through CDP
@@ -177,23 +194,36 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
      This makes `/login` the re-enrollment path for an expired or rejected
      token.
    - **Different SteamID active, or configured:** the owner must explicitly
-     choose to replace it. Then the new account is registered, the old
-     credential is retired, and its pairings are purged, because they belong
-     to the old player.
+     choose to replace it. Replacement is sequenced so no pairing writer
+     races the purge:
+     1. The coordinator registers the new account (its credential becomes
+        `active`; the old one is untouched).
+     2. It sends the supervisor `AccountSwitch { to, replace_from }` with a
+        oneshot ack.
+     3. The supervisor cancels and awaits the old pairing task.
+     4. Only then does it call `PairingStore::clear()` and
+        `PushCredentialStore::retire_other_accounts(to)`. The old pairings
+        belong to the old player.
+     5. It restores the new connector and acks the result.
+
+     If restore fails, the state is "new credential active, no running
+     pairing". The failure is reported in Discord and is not fatal.
    - Registration failures (Facepunch 401/403, Expo outage, store errors)
      become a Discord outcome and never fail the bot.
 7. **Rust+ supervisor.** The bot always registers a `rustplus-pairing`
    supervisor when the FCM sender, keyring and key ID are configured.
-   - It is seeded from the single active credential in the DB, or from the
-     legacy `RUSTPLUS_STEAM_ID`. With neither, it idles ("awaiting /login"),
-     and Discord stays up.
-   - On an account change from the coordinator it cancels its child pairing
-     task, awaits it, and restores the connector from the store. Only a
-     `SteamId` crosses the channel.
+   - **Startup precedence**, using `PushCredentialStore::list_active()`
+     (SteamIDs only):
+     - exactly one active credential: use it;
+     - none: use the legacy `RUSTPLUS_STEAM_ID` if configured, otherwise idle
+       ("awaiting /login") with Discord up;
+     - more than one: use the legacy SteamID if it matches one of them,
+       otherwise fail closed.
+   - It handles `AccountSwitch` as sequenced in step 6. Only SteamIDs cross
+     the channel, never credential material.
    - Restore failures at startup (decryption, an unreadable store) stay
-     fatal, as today.
-   - More than one active credential with no configured SteamID fails
-     closed.
+     fatal, as today. Restore failures after a runtime switch are not
+     fatal.
    - `rewrap_secrets` moves to supervisor start-up.
 
 ### Data and privileges
@@ -214,22 +244,34 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 
   They are enforced in the database, and every expiry decision uses the
   database clock.
-- **`xiao_login` role:** a third role, with no default privileges. It may
-  `EXECUTE` only `login_claim`, `login_complete`, `login_fail` and
-  `login_state`. These are migrator-owned `SECURITY DEFINER` functions with a
-  fixed `search_path` that act only on unexpired rows in the right state.
-  The role cannot enumerate rows, read the Discord user ID, `INSERT`,
-  `DELETE`, or touch any other table. Grants live in the ops provisioning
-  SQL, like `xiao_app`'s, and are proven by a `db`-job test.
+- **`xiao_login` role:** a third role, with no default privileges.
+  - It may `EXECUTE` only five functions: `login_claim`, `login_complete`,
+    `login_fail`, `login_state` and `login_fail_orphans`.
+  - These are migrator-owned `SECURITY DEFINER` functions with a fixed
+    `search_path` that act only on unexpired rows in the right state.
+  - The migration runs `REVOKE EXECUTE ... FROM PUBLIC` on them.
+  - The role cannot enumerate rows, read the Discord user ID, `INSERT`,
+    `DELETE`, or touch any other table.
+  - `GRANT EXECUTE` lives in the ops provisioning SQL and is re-run after
+    every migration (no `ALTER DEFAULT PRIVILEGES ... ON FUNCTIONS`).
+  - A `db`-job test proves the role can execute exactly these functions.
+  - `xiao-login`'s readiness check calls `login_state`, not the migrations
+    table it cannot read.
 - **`rustplus_login_audit`:** a secret-free, durable record per `/login`.
   - Discord user ID and timestamps (created, claimed, terminal).
   - Outcome code and resulting SteamID64.
   - Confirm or cancel decision, and account-replacement flag.
+  - Writers: the bot (as `xiao_app`) writes creation, decision, outcome and
+    SteamID. The `login_*` functions write the claimed and terminal
+    timestamps from `xiao-login`'s side.
+  - If the audit insert fails when `/login` starts, the login is denied.
+  - Retention: 90 days, then the Discord user ID is nulled.
 - **Restart semantics:**
   - Bot start moves every `pending`, `claimed` or `completed` row to
     `expired` and nulls its ciphertext; the in-memory keys are gone.
-  - `xiao-login` start fails its `claimed` rows, kills orphaned Chromium,
-    and wipes the profile root.
+  - `xiao-login` start calls `login_fail_orphans()` to fail `claimed` rows,
+    kills orphaned Chromium, and wipes the profile root. This frees the
+    slot even when the bot is down.
   - `xiao-login` keeps cookies in memory, so it runs as a single replica.
   - `/login cancel` lets the owner free the slot early. `xiao-login` polls
     `login_state` and tears down on cancel.
@@ -273,8 +315,9 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
 - **Group B** (both or neither, requires A): the legacy `RUSTPLUS_STEAM_ID`
   plus `RUSTPLUS_STEAM_AUTH_TOKEN_FILE`. An account from `/login` takes
   precedence after an explicit replacement.
-- **Bot:** gains `LOGIN_PUBLIC_HOST`, validated as host-only and
-  https-only.
+- **Bot:** gains an optional `LOGIN_PUBLIC_HOST`, validated as host-only
+  and https-only. `/login` is enabled only when group A and the host are both
+  set. The supervisor needs only group A.
 - **`xiao-login`:** has its own `LoginConfig`:
   - `LOGIN_DATABASE_URL_FILE`, owner-only (0400), failing closed otherwise;
   - the same `DATABASE_TLS` policy as the bot;
@@ -313,7 +356,7 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
   - single-use 10-minute fragment links, owner-only `/login` with a confirm
     code and SteamID confirmation;
   - request interception and a sandboxed Chromium;
-  - one browser at a time, rate limits, and a database role confined to four
+  - one browser at a time, rate limits, and a database role confined to five
     functions.
 - **What a compromised `xiao-login` can do.** While compromised, it sees
   the Rust+ tokens and can hold onto the Steam web sessions of accounts that
@@ -325,7 +368,7 @@ login-session + bot-db[login-broker only] + config + telemetry <- apps/login
   It cannot decrypt stored credentials, past results, or results of logins it
   did not handle. Chromium shares the service's UID. A renderer compromise
   still needs a sandbox escape to reach the database credential, and that
-  credential only allows the four functions. Moving Chromium to its own
+  credential only allows the five functions. Moving Chromium to its own
   container is the next isolation step if needed.
 - **Fragile external behavior.** The flow depends on unofficial Facepunch and
   Steam behavior: the bridge, the QR image, the OpenID page, and tolerance
