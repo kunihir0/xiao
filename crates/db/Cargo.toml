@@ -9,18 +9,30 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = ["app", "login-broker"]
+# The bot's persistence: migrations aside, everything that needs the keyring,
+# the secret envelope or the application ports. `xiao-login` (ADR 0003)
+# depends on this crate with `default-features = false` and only
+# `login-broker`, so none of that is compiled into it.
+app = ["dep:bot-application", "dep:bot-domain", "dep:aes-gcm-siv", "dep:rand", "dep:zeroize"]
+# `LoginSessionBroker` over the five `login_*` database functions.
+login-broker = []
+
 [dependencies]
-bot-application = { version = "0.1.0", path = "../application" }
-bot-domain = { version = "0.1.0", path = "../domain" }
+bot-application = { version = "0.1.0", path = "../application", optional = true }
+bot-domain = { version = "0.1.0", path = "../domain", optional = true }
+login-session = { version = "0.1.0", path = "../login-session" }
 tokio = { version = "1.53.2", features = ["sync"] }
 deadpool = { version = "0.13.1", features = ["rt_tokio_1"] }
 diesel = { version = "2.3.13", features = ["postgres", "uuid"] }
 diesel-async = { version = "0.9.2", features = ["postgres", "migrations", "deadpool"] }
 diesel_migrations = "2.3.2"
-aes-gcm-siv.workspace = true
-rand.workspace = true
+aes-gcm-siv = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 uuid.workspace = true
-zeroize.workspace = true
+zeroize = { workspace = true, optional = true }
+tracing.workspace = true
 thiserror.workspace = true
 tokio-postgres = "0.7.18"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
@@ -30,3 +42,14 @@ futures-util = "0.3.34"
 [dev-dependencies]
 tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1.27.0", features = ["v4"] }
+
+# The Postgres integration tests need the bot's persistence, and the login
+# tests also the broker. With these, `--no-default-features --features
+# login-broker --all-targets` builds without them instead of failing.
+[[test]]
+name = "login_postgres"
+required-features = ["app", "login-broker"]
+
+[[test]]
+name = "secrets_postgres"
+required-features = ["app"]

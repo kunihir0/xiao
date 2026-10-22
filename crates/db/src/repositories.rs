@@ -468,13 +468,13 @@ fn secret_error(error: secrets::SecretError) -> StoreError {
         _ => StoreError::Decryption,
     }
 }
-fn map_write_error(error: DieselError) -> StoreError {
+pub(crate) fn map_write_error(error: DieselError) -> StoreError {
     match error {
         DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _) => StoreError::Conflict,
         _ => StoreError::Unavailable,
     }
 }
-trait OptionalResult<T> {
+pub(crate) trait OptionalResult<T> {
     fn optional(self) -> Result<Option<T>, DieselError>;
 }
 impl<T> OptionalResult<T> for Result<T, DieselError> {
